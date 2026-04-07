@@ -1,0 +1,7 @@
+[package]
+name = "cc-plugins"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cc-core.workspace = true

@@ -1,0 +1,24 @@
+# Rust build artifacts
+rust/target/
+
+# Node / TS
+node_modules/
+dist/
+*.js.map
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Claude local session data
+.claude/projects/

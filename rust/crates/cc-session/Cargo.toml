@@ -1,0 +1,15 @@
+[package]
+name = "cc-session"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cc-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

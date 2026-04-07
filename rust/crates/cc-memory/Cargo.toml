@@ -1,0 +1,9 @@
+[package]
+name = "cc-memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cc-core.workspace = true
+dirs.workspace = true
+tracing.workspace = true

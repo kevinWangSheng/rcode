@@ -1,0 +1,28 @@
+[package]
+name = "claude-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "claude"
+path = "src/main.rs"
+
+[dependencies]
+cc-core.workspace = true
+cc-config.workspace = true
+cc-analytics.workspace = true
+cc-auth.workspace = true
+cc-api.workspace = true
+cc-tools.workspace = true
+cc-permissions.workspace = true
+cc-hooks.workspace = true
+cc-session.workspace = true
+cc-git.workspace = true
+cc-memory.workspace = true
+cc-query.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

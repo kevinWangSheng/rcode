@@ -1,0 +1,90 @@
+use async_trait::async_trait;
+use cc_core::{CcError, CcResult};
+use serde_json::{json, Value};
+use std::path::Path;
+
+use crate::{Tool, ToolResult};
+
+pub struct GlobTool;
+
+#[async_trait]
+impl Tool for GlobTool {
+    fn name(&self) -> &str {
+        "Glob"
+    }
+
+    fn description(&self) -> &str {
+        "Fast file pattern matching. Supports glob patterns like '**/*.rs' or 'src/**/*.ts'. \
+         Returns matching file paths sorted by modification time."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match files against"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search in (defaults to current directory)"
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+        let pattern = input["pattern"]
+            .as_str()
+            .ok_or_else(|| CcError::Tool("missing 'pattern' field".into()))?;
+
+        let base_dir = input["path"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+        // Build full pattern relative to base_dir
+        let full_pattern = if Path::new(pattern).is_absolute() {
+            pattern.to_string()
+        } else {
+            format!("{}/{}", base_dir.trim_end_matches('/'), pattern)
+        };
+
+        let mut matches: Vec<(std::time::SystemTime, String)> = Vec::new();
+
+        for entry in glob::glob(&full_pattern)
+            .map_err(|e| CcError::Tool(format!("invalid glob pattern: {e}")))?
+            .flatten()
+        {
+            if entry.is_file() {
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                let path_str = entry.to_string_lossy().to_string();
+                matches.push((mtime, path_str));
+            }
+        }
+
+        // Sort by modification time (newest first)
+        matches.sort_by(|a, b| b.0.cmp(&a.0));
+
+        if matches.is_empty() {
+            return Ok(ToolResult::ok("No files matched the pattern."));
+        }
+
+        let paths: Vec<String> = matches.into_iter().map(|(_, p)| p).collect();
+        Ok(ToolResult::ok(paths.join("\n")))
+    }
+}
