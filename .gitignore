@@ -22,3 +22,6 @@ dist/
 
 # Claude local session data
 .claude/projects/
+
+# Internal planning doc
+RUST_REWRITE_PLAN.md
