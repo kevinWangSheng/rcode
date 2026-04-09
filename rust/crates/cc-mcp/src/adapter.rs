@@ -8,10 +8,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cc_core::CcResult;
+use cc_core::{CcResult, ToolInputSchema};
 use cc_tools::{Tool, ToolResult};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::{McpClient, McpHttpClient};
 
@@ -65,11 +66,16 @@ impl Tool for McpToolAdapter {
         &self.description
     }
 
-    fn input_schema(&self) -> Value {
-        self.input_schema.clone()
+    fn input_schema(&self) -> ToolInputSchema {
+        serde_json::from_value(self.input_schema.clone()).unwrap_or(ToolInputSchema {
+            kind: "object".into(),
+            properties: None,
+            required: None,
+            additional_properties: None,
+        })
     }
 
-    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
         let result = match &*self.transport {
             McpTransport::Stdio(client) => {
                 let mut guard = client.lock().await;

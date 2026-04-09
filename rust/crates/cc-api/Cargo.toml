@@ -5,11 +5,13 @@ edition.workspace = true
 
 [dependencies]
 cc-core.workspace = true
+cc-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }
 eventsource-stream.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

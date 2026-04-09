@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 
-use crate::{Tool, ToolResult};
+use crate::{Tool, ToolResult, ToolInputSchema};
+use tokio_util::sync::CancellationToken;
 
 const MAX_RESPONSE_BYTES: usize = 1_000_000; // 1 MB
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -35,8 +36,8 @@ impl Tool for WebFetchTool {
          Response bodies are capped at 1 MB; only http and https URLs are allowed."
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
+    fn input_schema(&self) -> ToolInputSchema {
+        serde_json::from_value(json!({
             "type": "object",
             "properties": {
                 "url": {
@@ -49,14 +50,14 @@ impl Tool for WebFetchTool {
                 }
             },
             "required": ["url"]
-        })
+        })).unwrap()
     }
 
     fn is_read_only(&self) -> bool {
         true
     }
 
-    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
         let url = input["url"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'url' field"))?
@@ -188,8 +189,9 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_file_url() {
         let tool = WebFetchTool;
+        let cancel = CancellationToken::new();
         let result = tool
-            .execute(json!({"url": "file:///etc/passwd"}))
+            .execute(json!({"url": "file:///etc/passwd"}), &cancel)
             .await
             .unwrap();
         assert!(result.is_error);
@@ -199,7 +201,8 @@ mod tests {
     #[tokio::test]
     async fn execute_missing_url_errors() {
         let tool = WebFetchTool;
-        let err = tool.execute(json!({})).await.unwrap_err();
+        let cancel = CancellationToken::new();
+        let err = tool.execute(json!({}), &cancel).await.unwrap_err();
         assert!(err.to_string().contains("url"));
     }
 }

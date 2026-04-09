@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use cc_api::ApiClient;
+use cc_api::{ApiClient, AuthCredential};
 use cc_bridge::{run_once, BridgeRequest};
 use cc_hooks::HookRunner;
 use cc_permissions::PermissionEngine;
@@ -89,7 +89,7 @@ async fn print_mode_streams_text_through_bridge() {
         std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
     }
 
-    let api = ApiClient::with_api_key("sk-ant-test-key").expect("api client");
+    let api = ApiClient::new(reqwest::Client::new(), AuthCredential::ApiKey("sk-ant-test-key".into()));
 
     let req = BridgeRequest {
         api,

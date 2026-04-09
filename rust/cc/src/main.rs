@@ -4,11 +4,11 @@ use clap::{Parser, ValueEnum};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
-use cc_api::ApiClient;
+use cc_api::{ApiClient, AuthCredential};
 use cc_auth::{resolve_credentials, Credentials};
 use cc_config::{load_settings, resolve_model};
 use cc_core::{MessageParam, SystemBlock};
-use cc_hooks::{HookRunner, HooksConfig};
+use cc_hooks::{HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryOptions},
@@ -192,12 +192,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .get("hooks")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let hooks_config: HooksConfig = if hooks_raw.is_null() {
-        HooksConfig::new()
+    let hooks_config: HooksSettings = if hooks_raw.is_null() {
+        HooksSettings::new()
     } else {
         serde_json::from_value(hooks_raw).unwrap_or_default()
     };
-    let hook_runner = HookRunner::new(hooks_config);
+    let http_config = cc_http::HttpClientConfig::from_env();
+    let http = cc_http::build_client(&http_config).unwrap_or_default();
+    let hook_runner = HookRunner::new(&hooks_config, http.clone());
 
     // Build tools (built-in + MCP servers from settings.json `mcpServers`).
     let mut tools = default_tools();
@@ -222,10 +224,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build API client
-    let api = match credentials {
-        Credentials::ApiKey(k) => ApiClient::with_api_key(k)?,
-        Credentials::OAuthToken(t) => ApiClient::with_oauth_token(t)?,
+    let auth = match credentials {
+        Credentials::ApiKey(k) => AuthCredential::ApiKey(k),
+        Credentials::OAuthToken(t) => AuthCredential::OAuthToken(t),
     };
+    let api = ApiClient::new(http, auth);
 
     // SDK / --print path — runs through cc-bridge.
     if let Some(_print) = &print_text {

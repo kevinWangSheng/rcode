@@ -6,7 +6,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::{Tool, ToolResult};
+use crate::{Tool, ToolResult, ToolInputSchema};
+use tokio_util::sync::CancellationToken;
 
 const MAX_RESULTS: usize = 250;
 
@@ -24,8 +25,8 @@ impl Tool for GrepTool {
          Supports glob filtering and recursive search."
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
+    fn input_schema(&self) -> ToolInputSchema {
+        serde_json::from_value(json!({
             "type": "object",
             "properties": {
                 "pattern": {
@@ -51,14 +52,14 @@ impl Tool for GrepTool {
                 }
             },
             "required": ["pattern"]
-        })
+        })).unwrap()
     }
 
     fn is_read_only(&self) -> bool {
         true
     }
 
-    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
         let pattern_str = input["pattern"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;

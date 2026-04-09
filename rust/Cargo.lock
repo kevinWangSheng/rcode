@@ -166,6 +166,7 @@ name = "cc-api"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "cc-http",
  "eventsource-stream",
  "futures",
  "reqwest",
@@ -173,6 +174,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -199,6 +201,7 @@ dependencies = [
  "cc-query",
  "cc-session",
  "cc-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -249,11 +252,14 @@ name = "cc-hooks"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -322,6 +328,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -356,6 +363,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "walkdir",
 ]

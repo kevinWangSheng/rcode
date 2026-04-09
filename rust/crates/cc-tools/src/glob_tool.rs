@@ -3,7 +3,8 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolResult};
+use crate::{Tool, ToolResult, ToolInputSchema};
+use tokio_util::sync::CancellationToken;
 
 pub struct GlobTool;
 
@@ -18,8 +19,8 @@ impl Tool for GlobTool {
          Returns matching file paths sorted by modification time."
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
+    fn input_schema(&self) -> ToolInputSchema {
+        serde_json::from_value(json!({
             "type": "object",
             "properties": {
                 "pattern": {
@@ -32,14 +33,14 @@ impl Tool for GlobTool {
                 }
             },
             "required": ["pattern"]
-        })
+        })).unwrap()
     }
 
     fn is_read_only(&self) -> bool {
         true
     }
 
-    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
         let pattern = input["pattern"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;

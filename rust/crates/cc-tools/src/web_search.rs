@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 
-use crate::{Tool, ToolResult};
+use crate::{Tool, ToolResult, ToolInputSchema};
+use tokio_util::sync::CancellationToken;
 
 const BRAVE_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -38,8 +39,8 @@ impl Tool for WebSearchTool {
          Backed by the Brave Search API; requires BRAVE_SEARCH_API_KEY in the environment."
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
+    fn input_schema(&self) -> ToolInputSchema {
+        serde_json::from_value(json!({
             "type": "object",
             "properties": {
                 "query": {
@@ -52,14 +53,14 @@ impl Tool for WebSearchTool {
                 }
             },
             "required": ["query"]
-        })
+        })).unwrap()
     }
 
     fn is_read_only(&self) -> bool {
         true
     }
 
-    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
         let query = input["query"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'query' field"))?
@@ -162,14 +163,16 @@ mod tests {
     #[tokio::test]
     async fn execute_missing_query_errors() {
         let tool = WebSearchTool;
-        let err = tool.execute(json!({})).await.unwrap_err();
+        let cancel = CancellationToken::new();
+        let err = tool.execute(json!({}), &cancel).await.unwrap_err();
         assert!(err.to_string().contains("query"));
     }
 
     #[tokio::test]
     async fn execute_empty_query_returns_error_result() {
+        let cancel = CancellationToken::new();
         let tool = WebSearchTool;
-        let result = tool.execute(json!({"query": "   "})).await.unwrap();
+        let result = tool.execute(json!({"query": "   "}), &cancel).await.unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("empty"));
     }
@@ -179,9 +182,10 @@ mod tests {
         // SAFETY: tests run sequentially within a process for env var manipulation;
         // this set/remove pair is contained in this test.
         std::env::remove_var("BRAVE_SEARCH_API_KEY");
+        let cancel = CancellationToken::new();
         let tool = WebSearchTool;
         let result = tool
-            .execute(json!({"query": "rust async"}))
+            .execute(json!({"query": "rust async"}), &cancel)
             .await
             .unwrap();
         assert!(result.is_error);

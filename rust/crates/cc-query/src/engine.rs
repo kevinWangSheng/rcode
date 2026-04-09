@@ -1,14 +1,15 @@
-use cc_api::{ApiClient, CreateMessageRequest};
+use cc_api::{ApiClient, CreateMessageRequest, StreamDelta};
 use cc_core::{
     CcError, CcResult, ContentBlock, MessageContent, MessageParam, Role, StopReason,
     SystemBlock, ToolResultBlock, ToolUseBlock,
 };
-use cc_hooks::{HookInput, HookOutcome, HookRunner};
+use cc_hooks::{HookInput, HookRunner};
 use cc_permissions::PermissionEngine;
 use cc_session::Session;
-use cc_tools::{tool_definition, Tool, ToolResult};
+use cc_tools::{Tool, ToolResult};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::permission_prompt::PromptDecision;
@@ -129,7 +130,7 @@ impl QueryEngine {
         messages.push(user_msg);
 
         // 2. Build tool definitions for the API
-        let tool_defs: Vec<_> = self.tools.iter().map(|t| tool_definition(t.as_ref())).collect();
+        let tool_defs: Vec<_> = self.tools.iter().map(|t| t.to_definition()).collect();
 
         let mut final_text = String::new();
         let mut turns = 0;
@@ -158,16 +159,19 @@ impl QueryEngine {
             // 4. Stream response
             let mut text_buf = String::new();
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
+            let cancel = CancellationToken::new();
 
-            let message = self
+            let (message, usage) = self
                 .api
                 .complete_message(req, |delta| {
-                    text_buf.push_str(delta);
-                    on_text(delta);
-                })
+                    if let StreamDelta::Text(ref text) = delta {
+                        text_buf.push_str(text);
+                        on_text(text);
+                    }
+                }, &cancel)
                 .await?;
 
-            let input_tokens = message.usage.input_tokens;
+            let input_tokens = usage.input_tokens;
             let stop_reason = message.stop_reason.clone();
 
             // Collect tool_use blocks from the response
@@ -254,19 +258,32 @@ impl QueryEngine {
 
         // --- PreToolUse hook ---
         let hook_input = HookInput {
-            event: "PreToolUse",
-            tool_name,
-            tool_input: input,
-            session_id: Some(&self.session.id),
+            session_id: self.session.id.clone(),
+            transcript_path: None,
+            cwd: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            hook_event_name: "PreToolUse".into(),
+            tool_name: Some(tool_name.clone()),
+            tool_input: Some(input.clone()),
+            tool_use_id: Some(tu.id.clone()),
+            tool_response: None,
+            source: None,
+            model: None,
+            message: None,
+            agent_id: None,
         };
-        match self.hooks.run("PreToolUse", &hook_input).await {
-            HookOutcome::Block(msg) => {
-                return tool_result_error(&tu.id, format!("Blocked by hook: {msg}"));
-            }
-            HookOutcome::Failed(e) => {
-                debug!("PreToolUse hook failed (non-blocking): {e}");
-            }
-            HookOutcome::Ok => {}
+        let cancel = CancellationToken::new();
+        let hook_result = self.hooks.run("PreToolUse", &hook_input, &cancel).await;
+        if hook_result.blocked {
+            let msg = hook_result
+                .block_message
+                .unwrap_or_else(|| "blocked by hook".into());
+            return tool_result_error(&tu.id, format!("Blocked by hook: {msg}"));
+        }
+        for failure in &hook_result.failures {
+            debug!("PreToolUse hook failed (non-blocking): {failure}");
         }
 
         // --- Permission check ---
@@ -305,7 +322,8 @@ impl QueryEngine {
         match tool {
             None => tool_result_error(&tu.id, format!("Unknown tool: {tool_name}")),
             Some(t) => {
-                let result: ToolResult = match t.execute(input.clone()).await {
+                let cancel = CancellationToken::new();
+                let result: ToolResult = match t.execute(input.clone(), &cancel).await {
                     Ok(r) => r,
                     Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
                 };

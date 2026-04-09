@@ -3,7 +3,8 @@ use cc_core::CcResult;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use crate::{Tool, ToolResult};
+use crate::{Tool, ToolResult, ToolInputSchema};
+use tokio_util::sync::CancellationToken;
 
 pub struct BashTool;
 
@@ -19,8 +20,8 @@ impl Tool for BashTool {
          Use for file operations, running scripts, and system commands."
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
+    fn input_schema(&self) -> ToolInputSchema {
+        serde_json::from_value(json!({
             "type": "object",
             "properties": {
                 "command": {
@@ -37,14 +38,14 @@ impl Tool for BashTool {
                 }
             },
             "required": ["command"]
-        })
+        })).unwrap()
     }
 
     fn is_read_only(&self) -> bool {
         false
     }
 
-    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
         let command = input["command"]
             .as_str()
             .ok_or_else(|| cc_core::CcError::tool("tool", "missing 'command' field"))?

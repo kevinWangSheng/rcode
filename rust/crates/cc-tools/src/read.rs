@@ -3,7 +3,8 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolResult};
+use crate::{Tool, ToolResult, ToolInputSchema};
+use tokio_util::sync::CancellationToken;
 
 const MAX_LINES_DEFAULT: usize = 2000;
 
@@ -21,8 +22,8 @@ impl Tool for ReadTool {
          Use offset/limit to read specific portions of large files."
     }
 
-    fn input_schema(&self) -> Value {
-        json!({
+    fn input_schema(&self) -> ToolInputSchema {
+        serde_json::from_value(json!({
             "type": "object",
             "properties": {
                 "file_path": {
@@ -39,14 +40,14 @@ impl Tool for ReadTool {
                 }
             },
             "required": ["file_path"]
-        })
+        })).unwrap()
     }
 
     fn is_read_only(&self) -> bool {
         true
     }
 
-    async fn execute(&self, input: Value) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
