@@ -59,6 +59,21 @@ pub struct TaskStateBase {
     pub output_tail: Vec<String>,
 }
 
+impl TaskStateBase {
+    pub fn new(kind: TaskKind, description: String) -> Self {
+        Self {
+            id: TaskId::new(),
+            kind,
+            status: TaskStatus::Running,
+            description,
+            is_backgrounded: true,
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+            output_tail: Vec::new(),
+        }
+    }
+}
+
 /// Task notification sent to the parent agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskNotification {

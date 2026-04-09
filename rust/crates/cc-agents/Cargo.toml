@@ -5,3 +5,6 @@ edition.workspace = true
 
 [dependencies]
 cc-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true

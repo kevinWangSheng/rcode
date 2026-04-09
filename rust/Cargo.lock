@@ -159,6 +159,9 @@ name = "cc-agents"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
