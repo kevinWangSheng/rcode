@@ -1,33 +1,30 @@
-use cc_permissions::PermissionEngine;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 /// Result of an interactive permission prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptDecision {
     /// Allow this once.
     Allow,
-    /// Allow always for this tool (adds session rule).
+    /// Allow always for this tool (engine adds session rule).
     AllowAlways,
     /// Deny this call.
     Deny,
 }
 
-/// Show a permission prompt on stderr/stdin for headless mode.
-/// Returns `Deny` on Ctrl+C (SIGINT) or if stdin is not a tty.
+/// Stdin/stderr prompt — used by the headless `StdinPrompter`.
 ///
-/// Behavior contract: Ctrl+C during permission prompt → `is_error: true` tool_result.
-pub async fn prompt_for_permission(
+/// Returns `Deny` on Ctrl+C (SIGINT) or in non-interactive mode. The engine
+/// is responsible for upgrading `AllowAlways` into a session permission rule.
+pub async fn stdin_prompt(
     tool_name: &str,
     input: &Value,
-    engine: &mut PermissionEngine,
     non_interactive: bool,
 ) -> PromptDecision {
     if non_interactive {
-        // Non-interactive sessions auto-deny
         return PromptDecision::Deny;
     }
 
-    // Print a brief prompt to stderr
     let preview = summarize_input(tool_name, input);
     let mut stderr = tokio::io::stderr();
     let _ = stderr
@@ -40,15 +37,11 @@ pub async fn prompt_for_permission(
         .await;
     let _ = stderr.flush().await;
 
-    // Read one line from stdin with SIGINT handling
-    let decision = read_with_sigint().await;
+    let line = read_with_sigint().await;
 
-    match decision.trim().to_lowercase().as_str() {
+    match line.trim().to_lowercase().as_str() {
         "y" | "yes" => PromptDecision::Allow,
-        "a" | "always" => {
-            engine.add_session_allow(tool_name);
-            PromptDecision::AllowAlways
-        }
+        "a" | "always" => PromptDecision::AllowAlways,
         _ => PromptDecision::Deny,
     }
 }
@@ -67,13 +60,13 @@ async fn read_with_sigint() -> String {
             line
         } => result,
         _ = tokio::signal::ctrl_c() => {
-            // Ctrl+C → deny
             String::new()
         }
     }
 }
 
-fn summarize_input(tool_name: &str, input: &Value) -> String {
+/// Format a one-line summary of the tool input for the permission prompt.
+pub fn summarize_input(tool_name: &str, input: &Value) -> String {
     match tool_name {
         "Bash" => input["command"]
             .as_str()

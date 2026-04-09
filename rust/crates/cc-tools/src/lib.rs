@@ -3,6 +3,8 @@ pub mod edit;
 pub mod glob_tool;
 pub mod grep;
 pub mod read;
+pub mod web_fetch;
+pub mod web_search;
 pub mod write;
 
 use async_trait::async_trait;
@@ -75,5 +77,7 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(edit::EditTool),
         Arc::new(glob_tool::GlobTool),
         Arc::new(grep::GrepTool),
+        Arc::new(web_fetch::WebFetchTool),
+        Arc::new(web_search::WebSearchTool),
     ]
 }

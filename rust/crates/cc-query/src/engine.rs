@@ -11,7 +11,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::permission_prompt::{prompt_for_permission, PromptDecision};
+use crate::permission_prompt::PromptDecision;
+use crate::prompter::{PermissionPrompter, StdinPrompter};
 
 /// Context window token threshold for auto-compact.
 /// When `input_tokens` exceeds this, old messages are trimmed.
@@ -51,6 +52,11 @@ pub struct QueryEngine {
     session: Session,
     system_blocks: Vec<SystemBlock>,
     options: QueryOptions,
+    prompter: Arc<dyn PermissionPrompter>,
+    /// Set to `true` when auto-compact fires inside the most recent `run_turn`.
+    /// The TUI reads this on `EngineDone` to render a compaction boundary in
+    /// the transcript. Cleared at the start of every `run_turn`.
+    compacted_last_turn: bool,
 }
 
 impl QueryEngine {
@@ -63,6 +69,7 @@ impl QueryEngine {
         system_blocks: Vec<SystemBlock>,
         options: QueryOptions,
     ) -> Self {
+        let non_interactive = options.non_interactive;
         QueryEngine {
             api,
             tools,
@@ -71,11 +78,38 @@ impl QueryEngine {
             session,
             system_blocks,
             options,
+            prompter: Arc::new(StdinPrompter::new(non_interactive)),
+            compacted_last_turn: false,
         }
+    }
+
+    /// Whether auto-compact fired during the most recently completed
+    /// `run_turn`. Reset at the start of the next turn.
+    pub fn compacted_last_turn(&self) -> bool {
+        self.compacted_last_turn
+    }
+
+    /// Override the permission prompter (e.g. inject a TUI dialog prompter).
+    pub fn with_prompter(mut self, prompter: Arc<dyn PermissionPrompter>) -> Self {
+        self.prompter = prompter;
+        self
     }
 
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Read-only view of the active model id. Used by the TUI to render
+    /// `/model` and `/config` without having to track it separately.
+    pub fn model(&self) -> &str {
+        &self.options.model
+    }
+
+    /// Switch the active model in place. The next `run_turn` call uses the new
+    /// id; in-flight turns are not affected. Caller is responsible for passing
+    /// a fully-qualified model id (use `cc_config::expand_model_alias`).
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.options.model = model.into();
     }
 
     /// Run a complete conversation turn: add user message, loop until end_turn.
@@ -86,6 +120,9 @@ impl QueryEngine {
         mut on_text: impl FnMut(&str),
         messages: &mut Vec<MessageParam>,
     ) -> CcResult<String> {
+        // Clear per-turn flags before anything else.
+        self.compacted_last_turn = false;
+
         // 1. Add user message
         let user_msg = MessageParam::user(user_text.into());
         self.session.append(&user_msg)?;
@@ -178,6 +215,7 @@ impl QueryEngine {
                             "auto-compact triggered: input_tokens={input_tokens} > threshold={AUTO_COMPACT_TOKEN_THRESHOLD}"
                         );
                         compact_messages(messages);
+                        self.compacted_last_turn = true;
                     }
 
                     // Continue loop
@@ -243,13 +281,7 @@ impl QueryEngine {
                     );
                 }
                 PermissionBehavior::Ask => {
-                    let decision = prompt_for_permission(
-                        tool_name,
-                        input,
-                        &mut self.permissions,
-                        self.options.non_interactive,
-                    )
-                    .await;
+                    let decision = self.prompter.prompt(tool_name, input).await;
                     match decision {
                         PromptDecision::Deny => {
                             return tool_result_error(
@@ -257,7 +289,10 @@ impl QueryEngine {
                                 format!("Permission denied for tool '{tool_name}'"),
                             );
                         }
-                        PromptDecision::Allow | PromptDecision::AllowAlways => {}
+                        PromptDecision::AllowAlways => {
+                            self.permissions.add_session_allow(tool_name);
+                        }
+                        PromptDecision::Allow => {}
                     }
                 }
                 PermissionBehavior::Allow => {}
@@ -293,9 +328,11 @@ fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResul
     }
 }
 
-/// Simple auto-compact: keep only the first user message and the last N messages.
-/// This is a basic implementation that satisfies the exit criterion.
-fn compact_messages(messages: &mut Vec<MessageParam>) {
+/// Simple compaction: keep only the first user message and the last N messages.
+/// Used both by the engine's auto-compact path (when input tokens cross
+/// `AUTO_COMPACT_TOKEN_THRESHOLD`) and by the `/compact` slash command in the
+/// TUI host. This is a basic implementation that satisfies the exit criterion.
+pub fn compact_messages(messages: &mut Vec<MessageParam>) {
     const KEEP_RECENT: usize = 20;
     if messages.len() <= KEEP_RECENT + 1 {
         return;
@@ -317,4 +354,55 @@ fn compact_messages(messages: &mut Vec<MessageParam>) {
     ));
 
     messages.extend(recent);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: Role, text: &str) -> MessageParam {
+        MessageParam {
+            role,
+            content: MessageContent::Text(text.to_string()),
+        }
+    }
+
+    #[test]
+    fn compact_messages_keeps_first_and_last_n() {
+        // 50 messages → should collapse to: first + boundary marker + last 20.
+        let mut msgs: Vec<MessageParam> = (0..50)
+            .map(|i| {
+                let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+                msg(role, &format!("m{i}"))
+            })
+            .collect();
+        compact_messages(&mut msgs);
+        assert_eq!(msgs.len(), 22, "first + boundary + last 20 = 22");
+        // First message preserved.
+        if let MessageContent::Text(t) = &msgs[0].content {
+            assert_eq!(t, "m0");
+        } else {
+            panic!("expected text content for first message");
+        }
+        // Second slot is the "[Context compacted: ...]" marker.
+        if let MessageContent::Text(t) = &msgs[1].content {
+            assert!(t.contains("Context compacted"), "marker text present");
+        } else {
+            panic!("expected text content for marker");
+        }
+        // Last message is the original last.
+        if let MessageContent::Text(t) = &msgs[msgs.len() - 1].content {
+            assert_eq!(t, "m49");
+        } else {
+            panic!("expected text content for last message");
+        }
+    }
+
+    #[test]
+    fn compact_messages_noop_when_short() {
+        let mut msgs: Vec<MessageParam> = (0..10).map(|i| msg(Role::User, &format!("m{i}"))).collect();
+        let before = msgs.clone();
+        compact_messages(&mut msgs);
+        assert_eq!(msgs.len(), before.len(), "no compaction when ≤ KEEP_RECENT + 1");
+    }
 }

@@ -127,3 +127,56 @@ pub fn memories_to_system_text(memories: &[MemoryFile]) -> Option<String> {
 
     Some(format!("# Memory\n\n{}", parts.join("\n\n")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_memory_with_full_frontmatter() {
+        let content = "---\nname: pref\ndescription: prefers concise output\ntype: feedback\n---\nBe concise.\n";
+        let mem = parse_memory_file(content, &PathBuf::from("/tmp/pref.md"));
+        assert_eq!(mem.name, "pref");
+        assert_eq!(mem.memory_type, "feedback");
+        assert_eq!(mem.description, "prefers concise output");
+        assert_eq!(mem.body.trim(), "Be concise.");
+    }
+
+    #[test]
+    fn parse_memory_without_frontmatter_uses_filename() {
+        let mem = parse_memory_file("plain body", &PathBuf::from("/tmp/old.md"));
+        assert_eq!(mem.name, "old");
+        assert_eq!(mem.memory_type, "user");
+        assert_eq!(mem.body, "plain body");
+    }
+
+    #[test]
+    fn memories_to_system_text_aggregates_blocks() {
+        let memories = vec![
+            MemoryFile {
+                name: "a".into(),
+                description: "".into(),
+                memory_type: "user".into(),
+                body: "first".into(),
+            },
+            MemoryFile {
+                name: "b".into(),
+                description: "".into(),
+                memory_type: "feedback".into(),
+                body: "second".into(),
+            },
+        ];
+        let text = memories_to_system_text(&memories).expect("some text");
+        assert!(text.contains("# Memory"));
+        assert!(text.contains("## a"));
+        assert!(text.contains("first"));
+        assert!(text.contains("## b"));
+        assert!(text.contains("second"));
+    }
+
+    #[test]
+    fn empty_memories_return_none() {
+        assert!(memories_to_system_text(&[]).is_none());
+    }
+}

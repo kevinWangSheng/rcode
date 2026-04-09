@@ -134,7 +134,13 @@ Standard Anthropic API SDK conventions apply. Beta flags must be sent correctly.
 
 ## Category 6: MCP Protocol
 
-**Source:** `src/services/mcp/client.ts`, `src/utils/mcpWebSocketTransport.ts`
+> **Corrected 2026-04-08.** The previous version of this section listed 4
+> transport types. Code review of `src/services/mcp/client.ts:619-868` found
+> **9 transport types**, and mTLS is orthogonal to transport (applies to all
+> HTTP-based transports, not just WebSocket). Scope markers per Decision 5 of
+> `.claude/plan/phase2-entry.md` have been added.
+
+**Source:** `src/services/mcp/client.ts`, `src/utils/mcpWebSocketTransport.ts`, `src/utils/mtls.ts`
 
 **JSON-RPC version:** 2.0 (from `@modelcontextprotocol/sdk/types.js`)
 
@@ -148,15 +154,42 @@ Standard Anthropic API SDK conventions apply. Beta flags must be sent correctly.
 **Error codes:**
 - `-32001`: Session not found / expired (detected via HTTP 404 + JSON-RPC code)
 
-**Transport types:**
-- `StdioClientTransport`: for `serverCommand` entries (local MCP servers)
-- `SSEClientTransport`: for `serverUrl` entries (remote HTTP servers)
-- `StreamableHTTPClientTransport`: streaming HTTP variant
-- `WebSocketTransport` (custom): `wss://` with TLS/mTLS support
+**Transport types (9 total in TS):**
 
-**Compatibility requirement:** MUST MATCH EXACTLY
-Rust MCP client must interoperate with existing MCP servers.
-JSON-RPC 2.0 envelope must be preserved. All four transport types needed.
+| `serverRef.type` | Transport | Source line | Phase 2 scope |
+|---|---|---|---|
+| `stdio` (default) | `StdioClientTransport` — local MCP server subprocess | `client.ts:944` | **IN SCOPE** |
+| `sse` | `SSEClientTransport` — remote HTTP SSE | `client.ts:619` | **IN SCOPE** |
+| `http` | `StreamableHTTPClientTransport` — Streamable HTTP (current MCP spec) | `client.ts:784` | **IN SCOPE** |
+| `ws` | `WebSocketTransport` (custom wrapper) — `wss://` | `client.ts:735` | DEFERRED |
+| `ws-ide` | WebSocket variant for IDE integration | `client.ts:708` | DEFERRED |
+| `sse-ide` | SSE variant for IDE integration | `client.ts:678` | DEFERRED |
+| `sdk` | In-process SDK direct transport | `client.ts:866` | DEFERRED |
+| `claudeai-proxy` | claude.ai login-state proxy | `client.ts:868` | DEFERRED |
+
+**mTLS (cross-cutting — applies to HTTP-based transports):**
+
+`src/utils/mtls.ts` provides three consumers, used by `sse`, `http`, `ws`, and `ws-ide`:
+- `getMTLSAgent()` → `HttpsAgent` for Node HTTP/HTTPS clients
+- `getWebSocketTLSOptions()` → `tls.ConnectionOptions` for WebSocket
+- `getFetchOptions()` → undici fetch options
+
+**Env vars driving mTLS (MUST MATCH EXACTLY):**
+- `CLAUDE_CODE_CLIENT_CERT` — path to client cert (PEM)
+- `CLAUDE_CODE_CLIENT_KEY` — path to client key (PEM)
+- `CLAUDE_CODE_CLIENT_KEY_PASSPHRASE` — key passphrase
+- `NODE_EXTRA_CA_CERTS` — extra CA certs (Node-specific; Rust replaces with `SSL_CERT_FILE` which is the OpenSSL/rustls-native-certs convention)
+
+**Phase 2 scope per Decision 5:**
+- Transports: `stdio` + `sse` + `http` (3 of 9)
+- mTLS: IN SCOPE, applies to `sse` + `http` (the HTTP-based transports that are themselves in scope)
+- All deferred transports require a future mini-RFC before inclusion; "quietly adding later" is not sanctioned
+
+**Compatibility requirement for in-scope items:** MUST MATCH EXACTLY
+- JSON-RPC 2.0 envelope preserved
+- `serverRef.type` string values (`stdio`, `sse`, `http`) must be accepted unchanged in settings files written by the TS version
+- mTLS env var names must be honored unchanged
+- For the 6 deferred transport types: settings files that reference them must **parse without error** and produce a clear "transport X not supported in this build — see docs" message, not a crash or silent drop
 
 ---
 

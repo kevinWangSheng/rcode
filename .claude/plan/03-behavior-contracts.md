@@ -111,9 +111,17 @@ Continuability after interrupt is a core usability feature.
 
 **Evidence:** `src/services/compact/autoCompact.ts:32-90`, `src/query.ts:453-470`
 
-**Classification:** MUST REPLICATE EXACTLY
-Auto-compact prevents API errors from context overflow. The threshold formula must match
-to ensure consistent behavior. Env var overrides must be preserved.
+**Classification:** MUST REPLICATE EXACTLY (threshold formula and env vars) / MUST REPLICATE APPROACH (token counting method)
+
+> **Reclassified 2026-04-09 per Decision 7:** The threshold formula itself
+> (constants, env var overrides) remains MUST REPLICATE EXACTLY. The **token
+> counting method** is reclassified from MUST EXACT to **MUST REPLICATE
+> APPROACH**: the TS version uses `usage.input_tokens` from the last API
+> response + a rough character-length heuristic (`content.length / 4`) for the
+> delta — not an exact tokenizer. The Rust version must use the same hybrid
+> approach (API usage anchor + rough delta estimate). Acceptable variance: ±10%
+> on the delta, absorbed by the 13,000-token buffer.
+> See `.claude/plan/phase2-entry.md` §Decision 7 for full analysis.
 
 ---
 

@@ -100,3 +100,39 @@ impl GitContext {
         Some(parts.join("\n"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_context_produces_no_text() {
+        let ctx = GitContext::default();
+        assert!(ctx.to_system_text().is_none());
+    }
+
+    #[test]
+    fn populated_context_includes_branch_and_commits() {
+        let ctx = GitContext {
+            branch: Some("main".into()),
+            repo_root: Some("/tmp/repo".into()),
+            recent_commits: vec!["abc123 Fix bug".into(), "def456 Add feature".into()],
+        };
+        let text = ctx.to_system_text().expect("some text");
+        assert!(text.contains("Current git branch: main"));
+        assert!(text.contains("/tmp/repo"));
+        assert!(text.contains("abc123 Fix bug"));
+        assert!(text.contains("def456 Add feature"));
+    }
+
+    #[tokio::test]
+    async fn collect_outside_git_repo_is_safe() {
+        // /tmp is virtually never a git repo on macOS / Linux build hosts.
+        let ctx = GitContext::collect(std::path::Path::new("/tmp")).await;
+        // Either it's truly not a git repo (no branch) OR — on the off chance
+        // /tmp happens to be inside one — `to_system_text` still returns valid
+        // strings. Both outcomes are acceptable; the only thing we promise is
+        // no panic and no crash.
+        let _ = ctx.to_system_text();
+    }
+}

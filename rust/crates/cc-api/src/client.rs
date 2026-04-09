@@ -144,6 +144,23 @@ impl ApiClient {
                         {
                             continue;
                         }
+                        // The API may emit an error event in-band (e.g. overloaded_error
+                        // mid-stream) with a 200 HTTP status. Surface it as a hard error
+                        // instead of letting the StreamEvent parse silently fall into the
+                        // `Unknown` catch-all and the stream terminate cleanly — that made
+                        // `--print` return empty output with exit=0, hiding real failures.
+                        //
+                        // Detect by the SSE `event: error` name *or* by the JSON payload
+                        // having `"type":"error"` at the top level, since
+                        // `eventsource_stream` does not always populate `event.event`.
+                        if event.event == "error" || is_error_payload(&event.data) {
+                            let msg = parse_in_stream_error(&event.data)
+                                .unwrap_or_else(|| event.data.clone());
+                            let _ = tx
+                                .send(Err(CcError::Api(format!("stream error: {msg}"))))
+                                .await;
+                            break;
+                        }
                         match serde_json::from_str::<StreamEvent>(&event.data) {
                             Ok(se) => {
                                 if tx.send(Ok(se)).await.is_err() {
@@ -213,5 +230,71 @@ impl ApiClient {
                 cache_read_input_tokens: None,
             },
         })
+    }
+}
+
+/// Check whether an SSE `data:` payload is an error envelope.
+/// Matches `{"type":"error", ...}` at the top level.
+fn is_error_payload(data: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return false;
+    };
+    value.get("type").and_then(|v| v.as_str()) == Some("error")
+}
+
+/// Extract a human-readable message from an in-stream `event: error` payload.
+/// The Anthropic API uses two shapes depending on the failure:
+///   - `{"type":"error","error":{"type":"...","message":"..."}}`
+///   - `{"error":{"type":"...","message":"..."}}`
+///
+/// Returns `Some("<type>: <message>")` on either, or `None` if it can't parse.
+fn parse_in_stream_error(data: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let err = value.get("error")?;
+    let kind = err.get("type").and_then(|v| v.as_str()).unwrap_or("error");
+    let msg = err
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no message)");
+    Some(format!("{kind}: {msg}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_stream_error_wrapped_type_field() {
+        let data = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        assert_eq!(
+            parse_in_stream_error(data).as_deref(),
+            Some("overloaded_error: Overloaded")
+        );
+    }
+
+    #[test]
+    fn in_stream_error_bare_error_field() {
+        let data = r#"{"error":{"type":"rate_limit","message":"slow down"}}"#;
+        assert_eq!(
+            parse_in_stream_error(data).as_deref(),
+            Some("rate_limit: slow down")
+        );
+    }
+
+    #[test]
+    fn in_stream_error_malformed_returns_none() {
+        assert_eq!(parse_in_stream_error("not json"), None);
+        assert_eq!(parse_in_stream_error(r#"{"foo":1}"#), None);
+    }
+
+    #[test]
+    fn is_error_payload_detects_top_level_type() {
+        assert!(is_error_payload(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"x"}}"#
+        ));
+        assert!(!is_error_payload(
+            r#"{"type":"message_start","message":{}}"#
+        ));
+        assert!(!is_error_payload("not json"));
     }
 }

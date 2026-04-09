@@ -200,7 +200,19 @@ dependencies = [
 name = "cc-bridge"
 version = "0.1.0"
 dependencies = [
+ "cc-api",
  "cc-core",
+ "cc-hooks",
+ "cc-permissions",
+ "cc-query",
+ "cc-session",
+ "cc-tools",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -208,6 +220,12 @@ name = "cc-commands"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "cc-memory",
+ "cc-plugins",
+ "cc-session",
+ "cc-skills",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]
@@ -218,6 +236,7 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -244,6 +263,7 @@ name = "cc-hooks"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -257,7 +277,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cc-core",
+ "cc-tools",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -289,12 +311,20 @@ name = "cc-plugins"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "cc-skills",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
 name = "cc-query"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "cc-api",
  "cc-core",
  "cc-hooks",
@@ -317,6 +347,7 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -328,6 +359,11 @@ name = "cc-skills"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "dirs",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -346,8 +382,10 @@ dependencies = [
  "cc-core",
  "glob",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -358,7 +396,26 @@ dependencies = [
 name = "cc-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "cc-api",
+ "cc-commands",
+ "cc-config",
  "cc-core",
+ "cc-hooks",
+ "cc-memory",
+ "cc-permissions",
+ "cc-query",
+ "cc-session",
+ "cc-tools",
+ "crossterm",
+ "dirs",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -428,15 +485,18 @@ dependencies = [
  "cc-analytics",
  "cc-api",
  "cc-auth",
+ "cc-bridge",
  "cc-config",
  "cc-core",
  "cc-git",
  "cc-hooks",
+ "cc-mcp",
  "cc-memory",
  "cc-permissions",
  "cc-query",
  "cc-session",
  "cc-tools",
+ "cc-tui",
  "clap",
  "serde",
  "serde_json",

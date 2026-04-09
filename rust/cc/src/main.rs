@@ -6,15 +6,16 @@ use tracing_subscriber::EnvFilter;
 
 use cc_api::ApiClient;
 use cc_auth::{resolve_credentials, Credentials};
-use cc_config::load_settings;
-use cc_core::{models, MessageParam, SystemBlock};
+use cc_config::{load_settings, resolve_model};
+use cc_core::{MessageParam, SystemBlock};
 use cc_hooks::{HookRunner, HooksConfig};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryOptions},
 };
-use cc_session::Session;
+use cc_session::{list_sessions, Session};
 use cc_tools::default_tools;
+use cc_tui::TuiConfig;
 
 /// Claude Code — Rust implementation (Milestone 2: Tool Execution + Session)
 #[derive(Debug, Parser)]
@@ -29,9 +30,18 @@ struct Cli {
     #[arg(short, long, value_name = "TEXT")]
     message: Option<String>,
 
+    /// SDK / non-interactive mode: send a single prompt, print the response,
+    /// exit with code 0. Equivalent to `--message <TEXT> --no-tui --non-interactive`.
+    #[arg(long, value_name = "TEXT")]
+    print: Option<String>,
+
     /// Resume a previous session by ID.
     #[arg(long, value_name = "SESSION_ID")]
     resume: Option<String>,
+
+    /// Resume the most recent session (mutually exclusive with --resume).
+    #[arg(long)]
+    r#continue: bool,
 
     /// Model override (default: claude-sonnet-4-6).
     #[arg(long, value_name = "MODEL")]
@@ -93,31 +103,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     tracing::debug!("using credentials from {key_source}");
 
     let settings = load_settings(None)?;
-    let model = cli
-        .model
-        .or_else(|| settings.model.clone())
-        .unwrap_or_else(|| models::DEFAULT.to_string());
+    let model = resolve_model(cli.model.as_deref(), &settings);
 
-    // Get user input
-    let user_text = match &cli.message {
-        Some(text) => text.clone(),
-        None => {
-            if atty_is_stdin() && cli.resume.is_none() {
-                return Err("no message provided — use --message or pipe text via stdin".into());
-            }
-            if cli.resume.is_some() && cli.message.is_none() {
-                // Resume without a new message just restores; still need input for next turn
-                // For now require --message with --resume
-                return Err("--resume requires --message to provide the next turn's input".into());
-            }
-            let mut buf = String::new();
-            io::stdin().read_line(&mut buf)?;
-            buf.trim().to_string()
+    // Decide mode: interactive TUI vs headless one-shot vs SDK --print.
+    // --print is the SDK mode: highest precedence, never opens a TUI, always
+    // non-interactive (auto-deny permission prompts).
+    let print_text: Option<String> = cli.print.clone();
+
+    // TUI mode is used when:
+    //   - no --message AND no --print AND
+    //   - --no-tui is NOT set AND
+    //   - stdin is a tty (so we have a real terminal to talk to)
+    let interactive_tui =
+        cli.message.is_none() && cli.print.is_none() && !cli.no_tui && atty_is_stdin();
+
+    // Resolve --continue → most recent session id.
+    let resume_id: Option<String> = if let Some(id) = cli.resume.clone() {
+        Some(id)
+    } else if cli.r#continue {
+        match list_sessions().into_iter().max() {
+            Some(id) => Some(id),
+            None => return Err("--continue: no saved sessions found".into()),
         }
+    } else {
+        None
     };
 
     // Build session (new or resumed)
-    let (session, mut messages) = if let Some(session_id) = &cli.resume {
+    let (session, mut messages) = if let Some(session_id) = &resume_id {
         let (s, msgs) = Session::resume(session_id)?;
         eprintln!("Resumed session {} ({} messages)", session_id, msgs.len());
         (s, msgs)
@@ -128,6 +141,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!("Session: {}", session.id);
+
+    // For headless mode we still need a user message; gather it before
+    // building heavy components so we can fail fast on bad input.
+    // --print supplies its own text and never reads stdin.
+    let headless_user_text: Option<String> = if let Some(p) = &print_text {
+        Some(p.clone())
+    } else if !interactive_tui {
+        let text = match &cli.message {
+            Some(text) => text.clone(),
+            None => {
+                if atty_is_stdin() && resume_id.is_none() {
+                    return Err(
+                        "no message provided — use --message or pipe text via stdin".into(),
+                    );
+                }
+                if resume_id.is_some() && cli.message.is_none() {
+                    return Err(
+                        "--resume/--continue without TUI requires --message for the next turn".into(),
+                    );
+                }
+                let mut buf = String::new();
+                io::stdin().read_line(&mut buf)?;
+                buf.trim().to_string()
+            }
+        };
+        Some(text)
+    } else {
+        None
+    };
 
     // Build system prompt blocks
     let system_blocks = build_system_blocks(&model).await;
@@ -157,8 +199,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let hook_runner = HookRunner::new(hooks_config);
 
-    // Build tools
-    let tools = default_tools();
+    // Build tools (built-in + MCP servers from settings.json `mcpServers`).
+    let mut tools = default_tools();
+    if let Some(mcp_servers) = settings.extra.get("mcpServers") {
+        let (mcp_tools, errors) = cc_mcp::load_mcp_tools_from_config(mcp_servers).await;
+        for err in &errors {
+            eprintln!("warning: {err}");
+        }
+        if !mcp_tools.is_empty() {
+            tracing::debug!("loaded {} MCP tool(s)", mcp_tools.len());
+        }
+        tools.extend(mcp_tools);
+    }
 
     // Build query options
     let non_interactive = cli.non_interactive || !atty_is_stdin();
@@ -175,9 +227,71 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Credentials::OAuthToken(t) => ApiClient::with_oauth_token(t)?,
     };
 
-    // Short-circuit: if no tools needed (simple query mode without tool loop)
-    // For --output json or when tools aren't needed, could use simple path.
-    // But for M2, always use the query engine.
+    // SDK / --print path — runs through cc-bridge.
+    if let Some(_print) = &print_text {
+        let user_text = headless_user_text
+            .clone()
+            .expect("--print supplies headless_user_text — checked above");
+
+        let req = cc_bridge::BridgeRequest {
+            api,
+            tools,
+            permissions: permission_engine,
+            hooks: hook_runner,
+            session,
+            system_blocks,
+            initial_messages: messages,
+            user_text,
+            model: model.clone(),
+            max_tokens: cli.max_tokens,
+            non_interactive: true,
+            bypass_permissions: cli.bypass_permissions,
+        };
+
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let response = cc_bridge::run_once(req, |delta| {
+            let _ = out.write_all(delta.as_bytes());
+            let _ = out.flush();
+        })
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        writeln!(out)?;
+        tracing::debug!("--print done, session={}", response.session_id);
+        return Ok(());
+    }
+
+    if interactive_tui {
+        // Extract MCP server names from settings so the TUI can render /mcp
+        // and /config without having to re-parse the config itself.
+        let mcp_server_names: Vec<String> = settings
+            .extra
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // TUI path — hand everything to cc-tui and let it own the run loop.
+        let cfg = TuiConfig {
+            api,
+            tools,
+            permissions: permission_engine,
+            hooks: hook_runner,
+            session,
+            initial_messages: messages,
+            system_blocks,
+            options,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            mcp_server_names,
+            project_root: std::env::current_dir().ok(),
+        };
+        cc_tui::run_tui(cfg).await?;
+        return Ok(());
+    }
+
+    // Headless one-shot path — same as M2 behavior.
+    let user_text = headless_user_text.expect("headless mode without user text — checked above");
+
     let mut engine = QueryEngine::new(
         api,
         tools,

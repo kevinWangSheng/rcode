@@ -71,6 +71,45 @@ fn load_file(path: &Path) -> Result<Option<Settings>, CcError> {
     Ok(Some(settings))
 }
 
+/// Expand short model aliases (e.g. `opus`, `sonnet`, `haiku`) to fully-qualified
+/// model IDs accepted by the Anthropic API. Unknown inputs are returned as-is
+/// so fully-qualified IDs pass through unchanged.
+///
+/// Matches the TS Claude Code CLI's alias behavior — users commonly write
+/// `"model": "opus"` in `~/.claude/settings.json` and expect it to resolve to
+/// the latest Opus ID.
+pub fn expand_model_alias(input: &str) -> String {
+    use cc_core::models;
+    match input {
+        "opus" | "claude-opus" => models::CLAUDE_OPUS_4_6.to_string(),
+        "sonnet" | "claude-sonnet" | "default" => models::CLAUDE_SONNET_4_6.to_string(),
+        "haiku" | "claude-haiku" => models::CLAUDE_HAIKU_4_5.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolve the effective model for a session, applying the precedence:
+///   1. `--model` CLI override (if `Some`)
+///   2. `model` from merged settings (if `Some`)
+///   3. compiled-in `models::DEFAULT`
+///
+/// After selecting a source, short aliases are expanded to full model IDs.
+///
+/// Pulled out of `main.rs` so it can be unit-tested without spawning a binary.
+pub fn resolve_model(cli_model: Option<&str>, settings: &Settings) -> String {
+    if let Some(m) = cli_model {
+        if !m.is_empty() {
+            return expand_model_alias(m);
+        }
+    }
+    if let Some(m) = settings.model.as_deref() {
+        if !m.is_empty() {
+            return expand_model_alias(m);
+        }
+    }
+    cc_core::models::DEFAULT.to_string()
+}
+
 /// Load and merge settings in priority order (lowest → highest):
 ///   global (`~/.claude/settings.json`)
 ///   → project (`.claude/settings.json`)
@@ -110,6 +149,58 @@ mod tests {
         };
         let merged = base.merge(overlay);
         assert_eq!(merged.model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn resolve_model_precedence_cli_over_settings_over_default() {
+        // 1. CLI wins over settings.
+        let s = Settings {
+            model: Some("claude-from-settings".into()),
+            ..Default::default()
+        };
+        let m = resolve_model(Some("claude-cli-override"), &s);
+        assert_eq!(m, "claude-cli-override");
+
+        // 2. Settings wins when CLI is None.
+        let m = resolve_model(None, &s);
+        assert_eq!(m, "claude-from-settings");
+
+        // 3. Default kicks in when both are absent / empty.
+        let s = Settings::default();
+        let m = resolve_model(None, &s);
+        assert_eq!(m, cc_core::models::DEFAULT);
+
+        // 4. Empty CLI string is treated as "not set".
+        let m = resolve_model(Some(""), &s);
+        assert_eq!(m, cc_core::models::DEFAULT);
+    }
+
+    #[test]
+    fn expand_model_alias_maps_short_names() {
+        assert_eq!(expand_model_alias("opus"), cc_core::models::CLAUDE_OPUS_4_6);
+        assert_eq!(expand_model_alias("sonnet"), cc_core::models::CLAUDE_SONNET_4_6);
+        assert_eq!(expand_model_alias("haiku"), cc_core::models::CLAUDE_HAIKU_4_5);
+        assert_eq!(expand_model_alias("default"), cc_core::models::CLAUDE_SONNET_4_6);
+        // Unknown / already-qualified values pass through.
+        assert_eq!(expand_model_alias("claude-opus-4-6"), "claude-opus-4-6");
+        assert_eq!(expand_model_alias("custom-finetune"), "custom-finetune");
+    }
+
+    #[test]
+    fn resolve_model_expands_alias_from_settings() {
+        // Regression: settings.json with `"model": "opus"` must be expanded
+        // before being sent to the API — the raw alias is not a valid ID.
+        let s = Settings {
+            model: Some("opus".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_model(None, &s), cc_core::models::CLAUDE_OPUS_4_6);
+
+        // CLI alias also expands.
+        assert_eq!(
+            resolve_model(Some("sonnet"), &Settings::default()),
+            cc_core::models::CLAUDE_SONNET_4_6
+        );
     }
 
     #[test]

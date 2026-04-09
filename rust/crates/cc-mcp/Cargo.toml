@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cc-core.workspace = true
+cc-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -13,3 +14,7 @@ futures.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

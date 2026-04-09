@@ -15,3 +15,7 @@ glob.workspace = true
 walkdir.workspace = true
 regex.workspace = true
 anyhow.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -189,18 +189,71 @@ TS version with identical conversation histories. Test compaction round-trip (co
 
 ---
 
-## Risk 10: Multi-Agent Coordination — UDS Socket IPC in Rust
+## Risk 10: Multi-Agent / Task Subsystem — Heterogeneous Concurrency Model
 
-**Context:** The TS version uses Unix Domain Sockets for inter-agent communication (background agents
-reporting to parent). Rust has `tokio::net::UnixListener`. The protocol and framing need design.
+> **Rewritten 2026-04-08.** The previous version of this risk claimed "The TS
+> version uses Unix Domain Sockets for inter-agent communication." **This was
+> factually wrong.** A full-source search (`UnixListener`, `UnixStream`,
+> `.sock`, `socketPath`, `net.createServer.*unix`) found **no UDS IPC anywhere
+> in the TS codebase**. The real architecture is documented in Decision 6 of
+> `.claude/plan/phase2-entry.md`. This risk entry has been rewritten to reflect
+> the actual TS design and the Phase 2 in-scope subset.
+
+**Context:** The TS multi-agent / task subsystem is multi-modal, not UDS-based:
+
+- `local_bash` — background subprocess (pipe)
+- `local_agent` — **in-process** sub-agent, independent query loop, same address space
+- `in_process_teammate` — **in-process** multi-teammate via shared `AppState`
+- `remote_agent` — **HTTP polling** of Anthropic-side remote session API
+
+Plus 3 feature-flagged experimental task types (`local_workflow`, `monitor_mcp`, `dream`) — **deferred per Decision 6**.
+
+The real risk is not "designing an IPC protocol" (there isn't one) but **mapping a JS single-threaded event-loop concurrency model with shared `AppState` onto Rust's ownership + `Send`/`Sync` rules.** In TS, the main session, teammates, and local agents all read and mutate the same `AppState` object; in Rust this has to become some combination of `Arc<RwLock<...>>` / message-passing / actor model — and the wrong choice propagates through `cc-query` and `cc-tui`.
 
 | Dimension | Score | Reasoning |
 |-----------|-------|-----------|
-| Unknownness (U) | 2 | UDS in Tokio is well-documented. The challenge is designing the framing protocol and message types |
-| Blast Radius (B) | 1 | Isolated to `cc-agent`; other crates communicate via traits |
-| Reversibility (R) | 1 | Protocol can be changed without affecting other crates |
+| Unknownness (U) | 3 | No clear Rust-idiomatic mapping of "many in-process actors sharing mutable state." Choice between `Arc<Mutex<AppState>>`, tokio channels, or an actor framework (e.g. `ractor`) is non-obvious and reversibility is low once chosen |
+| Blast Radius (B) | 3 | Touches `cc-query` (task spawn + abort), `cc-session` (state persistence), `cc-tui` (teammate display), and whatever swarm crate Decision 3 adopts |
+| Reversibility (R) | 2 | Concurrency model bakes into traits and `async fn` signatures; changing mid-project is expensive but not impossible behind a state-access trait |
 
-**Score: 2 × 1 × 1 = 2 — LOW**
+**Score: 3 × 3 × 2 = 18 — HIGH**
+
+**Mitigations (for Phase 2 detailed design):**
+1. Pick the concurrency model in Decision 1 (async runtime) + a follow-up sub-decision for state-access pattern, **before** writing A1 contracts.
+2. Add a small spike (*not* the old M0–M4 spikes — a new targeted one) for `in_process_teammate`: 2 teammates sharing a `RwLock<AppState>`, one reads while the other writes, measuring contention.
+3. Make `AppState` access go through a trait from day one, so the underlying concurrency primitive can be swapped.
+
+**Remote-agent-specific risks:** HTTP polling against `api.anthropic.com` (or the relevant remote session API) has its own sub-risks:
+- Rate limits on long polling
+- Partial event delivery / cursor recovery on network failure
+- Authentication reuse (the remote agent needs the same OAuth/API key auth as the main session)
+
+These sub-risks are inherited from Risk 2 (Streaming API) and Risk 5 (OAuth) — no new mitigation needed beyond what those entries already specify.
+
+---
+
+## Risk 11: Tokenizer Parity — Token Counting for Auto-Compact
+
+> Added 2026-04-09 per Decision 7 (phase2-entry.md).
+
+**Context:** Phase 1 originally classified this as a blocking concern: "Anthropic
+doesn't publish a tokenizer, and `tiktoken-rs` is for OpenAI models." However,
+source analysis (Decision 7) revealed the TS version **does not use an exact
+tokenizer** for auto-compact threshold checks. It uses `usage.input_tokens` from
+the last API response + a rough character-length heuristic (`content.length / 4`)
+for the delta. This approach is trivially replicable in Rust.
+
+| Dimension | Score | Reasoning |
+|-----------|-------|-----------|
+| Unknownness (U) | 1 | TS approach fully analyzed; Rust implementation is straightforward arithmetic |
+| Blast Radius (B) | 1 | Contained to `cc-query` compaction check + `cc-api` usage extraction |
+| Reversibility (R) | 1 | Estimation constants can be tuned without architectural change |
+
+**Score: 1 × 1 × 1 = 1 — LOW**
+
+**Mitigations:** None needed. Implement the same hybrid approach as TS:
+store `usage` from API responses, add `content.len() / 4` delta estimation.
+The 13,000-token buffer absorbs estimation error.
 
 ---
 
@@ -217,7 +270,12 @@ reporting to parent). Rust has `tokio::net::UnixListener`. The protocol and fram
 | 7 | Terminal Input (crossterm) | 2 | 2 | 2 | 8 | MEDIUM |
 | 8 | Large Output Rendering | 2 | 2 | 2 | 8 | MEDIUM |
 | 9 | Session Compaction | 2 | 2 | 2 | 8 | MEDIUM |
-| 10 | Multi-Agent IPC (UDS) | 2 | 1 | 1 | 2 | LOW |
+| 10 | Multi-Agent / Task Subsystem (rewritten 2026-04-08) | 3 | 3 | 2 | **18** | **HIGH** |
+| 11 | Tokenizer Parity (added 2026-04-09) | 1 | 1 | 1 | 1 | LOW |
 
-**HIGH risks requiring Spike: Risk 1 (TUI)**
+**HIGH risks requiring Spike: Risk 1 (TUI), Risk 10 (Multi-Agent — new targeted spike needed)**
 **MEDIUM risks requiring mitigation: Risks 2, 7, 8, 9**
+**LOW risks (no action): Risks 3, 4, 5, 6, 11**
+
+> **Note (2026-04-08):** Risk 10 was upgraded from LOW (score 2) to HIGH (score 18) after correcting the factual premise. See Risk 10 entry for the rewrite rationale.
+> **Note (2026-04-09):** Risk 11 added per Decision 7. Scored LOW because the original concern was based on a false premise — the TS version uses a rough heuristic, not an exact tokenizer.
