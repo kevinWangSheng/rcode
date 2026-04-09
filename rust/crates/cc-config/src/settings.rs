@@ -110,13 +110,38 @@ pub fn resolve_model(cli_model: Option<&str>, settings: &Settings) -> String {
     cc_core::models::DEFAULT.to_string()
 }
 
+/// Dangerous keys that must be stripped from project settings (security).
+const DANGEROUS_PROJECT_KEYS: &[&str] = &[
+    "skipDangerousModePermissionPrompt",
+    "skipAutoPermissionPrompt",
+    "useAutoModeDuringPlan",
+    "autoMode",
+];
+
+/// Strip dangerous keys from project-level settings.
+fn sanitize_project_settings(mut settings: Settings) -> Settings {
+    for key in DANGEROUS_PROJECT_KEYS {
+        settings.extra.remove(*key);
+    }
+    settings
+}
+
 /// Load and merge settings in priority order (lowest → highest):
-///   global (`~/.claude/settings.json`)
-///   → project (`.claude/settings.json`)
-///   → local (`.claude/settings.local.json`)
+///   1. global (`~/.claude/settings.json`)
+///   2. project (`.claude/settings.json`) — sanitized
+///   3. local (`.claude/settings.local.json`)
+///   4. CLI/SDK override (if provided)
 ///
 /// `cwd` defaults to the current working directory if `None`.
 pub fn load_settings(cwd: Option<&Path>) -> Result<Settings, CcError> {
+    load_settings_with_override(cwd, None)
+}
+
+/// Load settings with an optional CLI/SDK override layer.
+pub fn load_settings_with_override(
+    cwd: Option<&Path>,
+    cli_override: Option<&Path>,
+) -> Result<Settings, CcError> {
     let cwd_buf;
     let cwd = match cwd {
         Some(p) => p,
@@ -128,9 +153,50 @@ pub fn load_settings(cwd: Option<&Path>) -> Result<Settings, CcError> {
 
     let global = load_file(&ConfigPaths::global_settings())?.unwrap_or_default();
     let project = load_file(&ConfigPaths::project_settings(cwd))?.unwrap_or_default();
+    let project = sanitize_project_settings(project);
     let local = load_file(&ConfigPaths::local_settings(cwd))?.unwrap_or_default();
 
-    Ok(global.merge(project).merge(local))
+    let mut merged = global.merge(project).merge(local);
+
+    // Layer 4: CLI/SDK override file
+    if let Some(override_path) = cli_override {
+        if let Some(override_settings) = load_file(override_path)? {
+            merged = merged.merge(override_settings);
+        }
+    }
+
+    Ok(merged)
+}
+
+/// Resolved configuration — combines project context + merged settings.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub project: crate::project::ProjectContext,
+    pub model: String,
+    pub max_tokens: u32,
+    pub settings: Settings,
+}
+
+impl ResolvedConfig {
+    /// Build a fully resolved config from CLI args and discovered project.
+    pub fn resolve(
+        project: crate::project::ProjectContext,
+        cli_model: Option<&str>,
+        cli_max_tokens: u32,
+        cli_settings_path: Option<&Path>,
+    ) -> Result<Self, CcError> {
+        let settings = load_settings_with_override(
+            Some(&project.original_cwd),
+            cli_settings_path,
+        )?;
+        let model = resolve_model(cli_model, &settings);
+        Ok(Self {
+            project,
+            model,
+            max_tokens: cli_max_tokens,
+            settings,
+        })
+    }
 }
 
 #[cfg(test)]
