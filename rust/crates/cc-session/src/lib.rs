@@ -6,11 +6,27 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use cc_core::Usage;
+
 /// A single entry in the JSONL transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptEntry {
     pub message: MessageParam,
     pub timestamp: String,
+    /// Token usage for this turn (only set on assistant messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// If true, marks a compaction boundary in the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_boundary: Option<bool>,
+}
+
+/// Session metadata for listing.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: String,
+    pub started_at: Option<String>,
+    pub message_count: usize,
 }
 
 /// Manages a conversation session: ID, transcript path, and in-memory messages.
@@ -79,9 +95,30 @@ impl Session {
 
     /// Append a message to the JSONL transcript file.
     pub fn append(&self, message: &MessageParam) -> CcResult<()> {
+        self.append_entry(message, None, None)
+    }
+
+    /// Append a message with optional usage and compaction boundary.
+    pub fn append_with_usage(
+        &self,
+        message: &MessageParam,
+        usage: Option<Usage>,
+        compact_boundary: Option<bool>,
+    ) -> CcResult<()> {
+        self.append_entry(message, usage, compact_boundary)
+    }
+
+    fn append_entry(
+        &self,
+        message: &MessageParam,
+        usage: Option<Usage>,
+        compact_boundary: Option<bool>,
+    ) -> CcResult<()> {
         let entry = TranscriptEntry {
             message: message.clone(),
             timestamp: Utc::now().to_rfc3339(),
+            usage,
+            compact_boundary,
         };
         let line = serde_json::to_string(&entry).map_err(CcError::Json)?;
 
@@ -234,6 +271,48 @@ fn load_ts_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
     }
 
     Ok(messages)
+}
+
+/// List session infos with metadata.
+pub fn list_session_infos() -> Vec<SessionInfo> {
+    let base = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("sessions");
+
+    if !base.exists() {
+        return Vec::new();
+    }
+
+    fs::read_dir(&base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| {
+            let id = e.file_name().to_string_lossy().to_string();
+            let transcript = e.path().join("transcript.jsonl");
+            let message_count = if transcript.exists() {
+                fs::read_to_string(&transcript)
+                    .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let started_at = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.created().ok())
+                .map(|t| {
+                    chrono::DateTime::<Utc>::from(t).to_rfc3339()
+                });
+            SessionInfo {
+                id,
+                started_at,
+                message_count,
+            }
+        })
+        .collect()
 }
 
 /// List all session IDs (directory names under `~/.claude/sessions/`).
