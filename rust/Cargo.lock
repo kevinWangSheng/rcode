@@ -375,7 +375,19 @@ dependencies = [
 name = "cc-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "cc-core",
+ "cc-memory",
+ "cc-query",
+ "cc-session",
+ "crossterm",
+ "dirs",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

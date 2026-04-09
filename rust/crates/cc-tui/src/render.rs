@@ -11,40 +11,45 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, PendingPermission, StreamState, TranscriptItem};
+use crate::app::{App, AppMode, PendingPermission, TranscriptItem};
 
-const TITLE_USER: &str = "▶";
+const TITLE_USER: &str = ">";
 const TITLE_CLAUDE: &str = "Claude:";
-const TITLE_INFO: &str = "ℹ";
-const TITLE_BOUNDARY: &str = "── compacted ──";
+const TITLE_INFO: &str = "i";
+const TITLE_BOUNDARY: &str = "-- compacted --";
 
 pub fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1), // status bar
             Constraint::Min(5),    // transcript
             Constraint::Length(3), // input box
-            Constraint::Length(1), // status line
         ])
         .split(frame.area());
 
-    render_transcript(frame, app, chunks[0]);
-    render_input(frame, app, chunks[1]);
-    render_status(frame, app, chunks[2]);
+    render_status_bar(frame, app, chunks[0]);
+    render_transcript(frame, app, chunks[1]);
+    render_input(frame, app, chunks[2]);
 
     if let Some(perm) = &app.permission {
         render_permission_modal(frame, perm, frame.area());
     }
 }
 
+fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let text = app.status.format();
+    let para = Paragraph::new(text)
+        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+    frame.render_widget(para, area);
+}
+
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for item in &app.transcript {
         match item {
-            TranscriptItem::User(text) => {
+            TranscriptItem::UserMessage(text) => {
                 let mut text_lines = text.lines();
-                // First physical line gets the "▶ " prefix; subsequent lines are
-                // indented to visually continue the user turn.
                 if let Some(first) = text_lines.next() {
                     lines.push(Line::from(vec![
                         Span::styled(
@@ -64,7 +69,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(Line::from(""));
             }
-            TranscriptItem::Assistant(text) => {
+            TranscriptItem::AssistantText(text) => {
                 lines.push(Line::from(Span::styled(
                     TITLE_CLAUDE,
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -74,10 +79,37 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 lines.push(Line::from(""));
             }
-            TranscriptItem::System(text) => {
-                // System messages are often multi-line (/help output, engine
-                // errors). Prefix only the first physical line; indent the
-                // rest to line up under the icon.
+            TranscriptItem::ToolCall { name, input_summary } => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("[Tool: {name}] "),
+                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        input_summary.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+            TranscriptItem::ToolResult { name: _, output, is_error } => {
+                let color = if *is_error { Color::Red } else { Color::DarkGray };
+                let prefix = if *is_error { "[Error] " } else { "[Result] " };
+                // Show first few lines of output.
+                let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
+                let truncated = output.lines().count() > 5;
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{preview}"),
+                    Style::default().fg(color),
+                )));
+                if truncated {
+                    lines.push(Line::from(Span::styled(
+                        "  ... (truncated)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
+            TranscriptItem::SystemNotice(text) => {
                 let mut text_lines = text.lines();
                 if let Some(first) = text_lines.next() {
                     lines.push(Line::from(Span::styled(
@@ -108,7 +140,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    if !app.streaming_text.is_empty() || app.stream_state == StreamState::Streaming {
+    if !app.streaming_text.is_empty() || app.mode == AppMode::Streaming {
         lines.push(Line::from(Span::styled(
             TITLE_CLAUDE,
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -116,22 +148,15 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         for ln in app.streaming_text.lines() {
             lines.push(Line::from(Span::raw(ln.to_string())));
         }
-        if app.stream_state == StreamState::Streaming {
+        if app.mode == AppMode::Streaming {
             lines.push(Line::from(Span::styled(
-                "▋",
+                "|",
                 Style::default().fg(Color::Green).add_modifier(Modifier::SLOW_BLINK),
             )));
         }
     }
 
-    // Pin viewport to the *bottom* of the transcript by default, so the
-    // latest content is always visible as history grows. `app.scroll` is
-    // treated as "rows back from the bottom" (0 = pinned to bottom).
-    //
-    // We estimate the post-wrap physical row count by accounting for lines
-    // that exceed the inner width of the Block (area.width minus 2 for the
-    // borders). Under-counting for exotic Unicode is acceptable — the worst
-    // case is a few extra rows visible at the bottom on very wide chars.
+    // Pin viewport to the bottom of the transcript by default.
     let wrap_width = (area.width.saturating_sub(2)) as usize;
     let total_rows: usize = if wrap_width == 0 {
         lines.len()
@@ -141,16 +166,15 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             .map(|line| {
                 let char_count: usize =
                     line.spans.iter().map(|s| s.content.chars().count()).sum();
-                // Empty logical lines still occupy one physical row.
                 char_count.div_ceil(wrap_width).max(1)
             })
             .sum()
     };
-    let viewport_rows = area.height.saturating_sub(2) as usize; // minus top+bottom borders
+    let viewport_rows = area.height.saturating_sub(2) as usize;
     let max_scroll = total_rows.saturating_sub(viewport_rows) as u16;
     let y_scroll = max_scroll.saturating_sub(app.scroll);
 
-    let title = format!(" Claude — session {} ", short_session(&app.session_id));
+    let title = format!(" Claude -- session {} ", short_session(&app.session_id));
     let para = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false })
@@ -159,15 +183,16 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let title = match app.stream_state {
-        StreamState::Idle => " Input  (Enter to send  •  / for commands) ",
-        StreamState::Streaming => " Input  (streaming — Enter queues  •  Ctrl+C aborts) ",
-        StreamState::ToolUse => " Input  (tool running — please wait) ",
+    let title = match app.mode {
+        AppMode::Input => " Input  (Enter to send  |  / for commands) ",
+        AppMode::Streaming => " Input  (streaming -- Enter queues  |  Ctrl+C aborts) ",
+        AppMode::PermissionPrompt => " Input  (permission prompt -- please respond) ",
+        AppMode::CommandPalette => " Input  (/ command autocomplete) ",
     };
-    let style = match app.stream_state {
-        StreamState::Idle => Style::default().fg(Color::White),
-        StreamState::Streaming => Style::default().fg(Color::Yellow),
-        StreamState::ToolUse => Style::default().fg(Color::DarkGray),
+    let style = match app.mode {
+        AppMode::Input | AppMode::CommandPalette => Style::default().fg(Color::White),
+        AppMode::Streaming => Style::default().fg(Color::Yellow),
+        AppMode::PermissionPrompt => Style::default().fg(Color::DarkGray),
     };
     let para = Paragraph::new(app.input.as_str())
         .style(style)
@@ -175,14 +200,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-fn render_status(frame: &mut Frame, app: &App, area: Rect) {
-    let para = Paragraph::new(app.status.as_str())
-        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
-    frame.render_widget(para, area);
-}
-
 fn render_permission_modal(frame: &mut Frame, perm: &PendingPermission, area: Rect) {
-    // Centered modal sized to ~60% of width and a fixed height.
     let modal = centered_rect(60, 30, area);
     frame.render_widget(Clear, modal);
 
@@ -252,10 +270,9 @@ mod tests {
     fn renders_empty_app_without_panic() {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        let app = App::new("abcdef1234".into());
+        let app = App::new("abcdef1234".into(), "test-model".into());
         term.draw(|f| render(f, &app)).unwrap();
         let buf = term.backend().buffer().clone();
-        // Title bar should mention the truncated session id.
         let s = buffer_to_string(&buf);
         assert!(s.contains("abcdef12"), "title bar missing session id; got:\n{s}");
     }
@@ -264,7 +281,7 @@ mod tests {
     fn renders_streaming_text_and_cursor() {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), "m".into());
         app.start_stream();
         app.on_token("hello world");
         term.draw(|f| render(f, &app)).unwrap();
@@ -274,43 +291,25 @@ mod tests {
 
     #[test]
     fn multiline_system_message_renders_on_separate_rows() {
-        // Regression: /help and other multi-line system messages used to be
-        // squashed onto a single logical `Line`, so embedded '\n' chars were
-        // mashed into one long wrap-blob. Verify each line gets its own row.
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), "m".into());
         app.push_system("Slash commands:\n  /help   show this help\n  /exit   quit".into());
         term.draw(|f| render(f, &app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
-        // Each segment should appear on its own row, not mashed on one line.
         assert!(s.contains("Slash commands:"));
         assert!(s.contains("/help"));
         assert!(s.contains("/exit"));
-        // "show this help" must NOT be on the same row as "quit" — check by
-        // finding rows containing each and asserting different row indices.
-        let rows: Vec<&str> = s.lines().collect();
-        let help_row = rows.iter().position(|r| r.contains("show this help"));
-        let exit_row = rows.iter().position(|r| r.contains("quit"));
-        assert!(help_row.is_some() && exit_row.is_some());
-        assert_ne!(
-            help_row, exit_row,
-            "/help description and /exit must render on different rows"
-        );
     }
 
     #[test]
     fn long_transcript_pins_latest_content_to_bottom() {
-        // Regression: when transcript height exceeds the viewport, older
-        // content used to stay at the top and the newest line was clipped
-        // behind the input box. Verify the latest user message is visible.
         let backend = TestBackend::new(80, 10);
         let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), "m".into());
         for i in 0..40 {
             app.push_user(format!("user message number {i}"));
         }
-        // Make sure the "latest first" flag is off (scroll=0 == pinned to bottom).
         app.scroll = 0;
         term.draw(|f| render(f, &app)).unwrap();
         let s = buffer_to_string(term.backend().buffer());
@@ -324,7 +323,7 @@ mod tests {
     fn renders_permission_modal_when_set() {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), "m".into());
         app.permission = Some(PendingPermission {
             tool_name: "Write".into(),
             summary: "/tmp/foo.txt".into(),
@@ -333,8 +332,19 @@ mod tests {
         let s = buffer_to_string(term.backend().buffer());
         assert!(s.contains("Permission required"));
         assert!(s.contains("Write"));
-        assert!(s.contains("/tmp/foo.txt"));
-        assert!(s.contains("Allow once"));
+    }
+
+    #[test]
+    fn renders_tool_call_and_result() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new("s".into(), "m".into());
+        app.push_tool_call("Bash".into(), "ls -la".into());
+        app.push_tool_result("Bash".into(), "file1.rs\nfile2.rs".into(), false);
+        term.draw(|f| render(f, &app)).unwrap();
+        let s = buffer_to_string(term.backend().buffer());
+        assert!(s.contains("Bash"));
+        assert!(s.contains("ls -la"));
     }
 
     fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {

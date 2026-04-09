@@ -9,6 +9,7 @@ use crossterm::event::KeyEvent;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use cc_core::Usage;
 use cc_query::PromptDecision;
 
 /// Events delivered to the main loop on a single mpsc channel.
@@ -18,8 +19,14 @@ pub enum AppEvent {
     Key(KeyEvent),
     /// One streaming text delta from the engine.
     Token(String),
-    /// The current engine turn finished naturally — `Ok` carries the final assistant text.
+    /// Tool execution started.
+    ToolStart { name: String, input_summary: String },
+    /// Tool execution finished.
+    ToolEnd { name: String, output: String, is_error: bool },
+    /// The current engine turn finished naturally.
     EngineDone(Result<String, String>),
+    /// Turn completed with usage data.
+    TurnComplete { usage: Usage },
     /// The engine asked for permission. The TUI must respond on `reply`.
     PermissionRequest {
         tool_name: String,
@@ -32,4 +39,6 @@ pub enum AppEvent {
     Quit,
     /// Periodic tick — used to refresh time-sensitive UI elements.
     Tick,
+    /// Compact boundary marker from engine.
+    CompactBoundary,
 }

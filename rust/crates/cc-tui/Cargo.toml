@@ -5,3 +5,17 @@ edition.workspace = true
 
 [dependencies]
 cc-core.workspace = true
+cc-memory.workspace = true
+cc-session.workspace = true
+cc-query.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -268,6 +268,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // TUI path — will be fully implemented in Phase 3 Layer 6.
         let cfg = TuiConfig {
             model: model.clone(),
+            session_id: session.id.clone(),
         };
         cc_tui::run_tui(cfg).await?;
         return Ok(());
