@@ -26,7 +26,7 @@ impl Session {
         let id = Uuid::new_v4().to_string();
         let path = transcript_path(&id);
         fs::create_dir_all(path.parent().unwrap())
-            .map_err(|e| CcError::Io(format!("failed to create session dir: {e}")))?;
+            .map_err(|e| CcError::io(format!("failed to create session dir: {e}")))?;
         Ok(Session {
             id,
             transcript_path: path,
@@ -89,10 +89,10 @@ impl Session {
             .create(true)
             .append(true)
             .open(&self.transcript_path)
-            .map_err(|e| CcError::Io(format!("failed to open transcript: {e}")))?;
+            .map_err(|e| CcError::io(format!("failed to open transcript: {e}")))?;
 
         writeln!(file, "{line}")
-            .map_err(|e| CcError::Io(format!("failed to write transcript: {e}")))?;
+            .map_err(|e| CcError::io(format!("failed to write transcript: {e}")))?;
 
         Ok(())
     }
@@ -125,14 +125,14 @@ fn transcript_path(id: &str) -> PathBuf {
 
 fn load_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
     let file = File::open(path)
-        .map_err(|e| CcError::Io(format!("failed to open transcript {}: {e}", path.display())))?;
+        .map_err(|e| CcError::io(format!("failed to open transcript {}: {e}", path.display())))?;
 
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line
-            .map_err(|e| CcError::Io(format!("failed to read transcript line {line_num}: {e}")))?;
+            .map_err(|e| CcError::io(format!("failed to read transcript line {line_num}: {e}")))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -178,13 +178,13 @@ fn find_ts_session(id: &str) -> Option<PathBuf> {
 /// refusing to resume.
 fn load_ts_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
     let file = File::open(path)
-        .map_err(|e| CcError::Io(format!("failed to open ts transcript {}: {e}", path.display())))?;
+        .map_err(|e| CcError::io(format!("failed to open ts transcript {}: {e}", path.display())))?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| {
-            CcError::Io(format!("failed to read ts transcript line {line_num}: {e}"))
+            CcError::io(format!("failed to read ts transcript line {line_num}: {e}"))
         })?;
         if line.trim().is_empty() {
             continue;

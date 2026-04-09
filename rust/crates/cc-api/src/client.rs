@@ -53,7 +53,7 @@ impl ApiClient {
     fn new(auth: Auth) -> CcResult<Self> {
         let http = reqwest::Client::builder()
             .build()
-            .map_err(|e| CcError::Api(e.to_string()))?;
+            .map_err(|e| CcError::api(e.to_string()))?;
 
         Ok(ApiClient {
             http,
@@ -119,7 +119,7 @@ impl ApiClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| CcError::Api(e.to_string()))?;
+            .map_err(|e| CcError::api(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -127,7 +127,7 @@ impl ApiClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<unreadable body>".into());
-            return Err(CcError::Api(format!("HTTP {status}: {text}")));
+            return Err(CcError::api(format!("HTTP {status}: {text}")));
         }
 
         let (tx, rx) = mpsc::channel::<CcResult<StreamEvent>>(64);
@@ -157,7 +157,7 @@ impl ApiClient {
                             let msg = parse_in_stream_error(&event.data)
                                 .unwrap_or_else(|| event.data.clone());
                             let _ = tx
-                                .send(Err(CcError::Api(format!("stream error: {msg}"))))
+                                .send(Err(CcError::api(format!("stream error: {msg}"))))
                                 .await;
                             break;
                         }
@@ -173,7 +173,7 @@ impl ApiClient {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(CcError::Api(e.to_string()))).await;
+                        let _ = tx.send(Err(CcError::api(e.to_string()))).await;
                         break;
                     }
                 }

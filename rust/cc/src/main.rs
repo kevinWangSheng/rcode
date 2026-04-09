@@ -262,28 +262,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if interactive_tui {
-        // Extract MCP server names from settings so the TUI can render /mcp
-        // and /config without having to re-parse the config itself.
-        let mcp_server_names: Vec<String> = settings
-            .extra
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
-
-        // TUI path — hand everything to cc-tui and let it own the run loop.
+        // TUI path — will be fully implemented in Phase 3 Layer 6.
         let cfg = TuiConfig {
-            api,
-            tools,
-            permissions: permission_engine,
-            hooks: hook_runner,
-            session,
-            initial_messages: messages,
-            system_blocks,
-            options,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            mcp_server_names,
-            project_root: std::env::current_dir().ok(),
+            model: model.clone(),
         };
         cc_tui::run_tui(cfg).await?;
         return Ok(());

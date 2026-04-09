@@ -59,6 +59,7 @@ pub fn tool_definition(tool: &dyn Tool) -> ToolDefinition {
         kind: "object".into(),
         properties: None,
         required: None,
+        additional_properties: None,
     });
     ToolDefinition {
         name: tool.name().to_string(),

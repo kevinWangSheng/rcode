@@ -39,21 +39,21 @@ impl Tool for WriteTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'file_path' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
         let content = input["content"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'content' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'content' field"))?;
 
         let path = Path::new(file_path);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| CcError::Tool(format!("failed to create dirs for {file_path}: {e}")))?;
+                .map_err(|e| CcError::tool("tool", format!("failed to create dirs for {file_path}: {e}")))?;
         }
 
         tokio::fs::write(path, content)
             .await
-            .map_err(|e| CcError::Tool(format!("failed to write {file_path}: {e}")))?;
+            .map_err(|e| CcError::tool("tool", format!("failed to write {file_path}: {e}")))?;
 
         Ok(ToolResult::ok(format!("File written successfully to {file_path}")))
     }

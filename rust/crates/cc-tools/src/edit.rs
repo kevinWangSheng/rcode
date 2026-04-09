@@ -47,13 +47,13 @@ impl Tool for EditTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'file_path' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
         let old_string = input["old_string"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'old_string' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'old_string' field"))?;
         let new_string = input["new_string"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'new_string' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'new_string' field"))?;
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
 
         let path = Path::new(file_path);
@@ -63,7 +63,7 @@ impl Tool for EditTool {
 
         let content = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| CcError::Tool(format!("failed to read {file_path}: {e}")))?;
+            .map_err(|e| CcError::tool("tool", format!("failed to read {file_path}: {e}")))?;
 
         let occurrences = content.matches(old_string).count();
         if occurrences == 0 {
@@ -86,7 +86,7 @@ impl Tool for EditTool {
 
         tokio::fs::write(path, &new_content)
             .await
-            .map_err(|e| CcError::Tool(format!("failed to write {file_path}: {e}")))?;
+            .map_err(|e| CcError::tool("tool", format!("failed to write {file_path}: {e}")))?;
 
         let count = if replace_all { occurrences } else { 1 };
         Ok(ToolResult::ok(format!(

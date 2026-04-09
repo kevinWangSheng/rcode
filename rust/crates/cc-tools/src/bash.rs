@@ -47,7 +47,7 @@ impl Tool for BashTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let command = input["command"]
             .as_str()
-            .ok_or_else(|| cc_core::CcError::Tool("missing 'command' field".into()))?
+            .ok_or_else(|| cc_core::CcError::tool("tool", "missing 'command' field"))?
             .to_string();
 
         let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000);
@@ -61,8 +61,8 @@ impl Tool for BashTool {
                 .output(),
         )
         .await
-        .map_err(|_| cc_core::CcError::Tool(format!("command timed out after {timeout_ms}ms")))?
-        .map_err(|e| cc_core::CcError::Tool(format!("failed to spawn bash: {e}")))?;
+        .map_err(|_| cc_core::CcError::tool("tool", format!("command timed out after {timeout_ms}ms")))?
+        .map_err(|e| cc_core::CcError::tool("tool", format!("failed to spawn bash: {e}")))?;
 
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();

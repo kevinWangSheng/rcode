@@ -62,7 +62,7 @@ impl Tool for WebSearchTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let query = input["query"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'query' field".into()))?
+            .ok_or_else(|| CcError::tool("tool", "missing 'query' field"))?
             .to_string();
 
         if query.trim().is_empty() {
@@ -89,7 +89,7 @@ impl Tool for WebSearchTool {
             .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .user_agent("claude-code-rust/0.1")
             .build()
-            .map_err(|e| CcError::Tool(format!("failed to build http client: {e}")))?;
+            .map_err(|e| CcError::tool("tool", format!("failed to build http client: {e}")))?;
 
         let response = match client
             .get(BRAVE_SEARCH_URL)

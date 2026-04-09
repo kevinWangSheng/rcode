@@ -59,7 +59,7 @@ impl Tool for WebFetchTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let url = input["url"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'url' field".into()))?
+            .ok_or_else(|| CcError::tool("tool", "missing 'url' field"))?
             .to_string();
 
         if !is_allowed_url(&url) {
@@ -72,7 +72,7 @@ impl Tool for WebFetchTool {
             .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .user_agent("claude-code-rust/0.1")
             .build()
-            .map_err(|e| CcError::Tool(format!("failed to build http client: {e}")))?;
+            .map_err(|e| CcError::tool("tool", format!("failed to build http client: {e}")))?;
 
         let response = match client.get(&url).send().await {
             Ok(r) => r,

@@ -49,7 +49,7 @@ impl Tool for ReadTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'file_path' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
 
         let path = Path::new(file_path);
         if !path.exists() {
@@ -61,7 +61,7 @@ impl Tool for ReadTool {
 
         let content = tokio::fs::read_to_string(path)
             .await
-            .map_err(|e| CcError::Tool(format!("failed to read {file_path}: {e}")))?;
+            .map_err(|e| CcError::tool("tool", format!("failed to read {file_path}: {e}")))?;
 
         let offset = input["offset"].as_u64().map(|n| n as usize).unwrap_or(1);
         let limit = input["limit"]

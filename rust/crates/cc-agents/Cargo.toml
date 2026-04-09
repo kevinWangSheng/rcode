@@ -1,5 +1,5 @@
 [package]
-name = "cc-tui"
+name = "cc-agents"
 version.workspace = true
 edition.workspace = true
 

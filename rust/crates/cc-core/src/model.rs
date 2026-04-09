@@ -6,4 +6,7 @@ pub mod models {
 
     /// Default model used when none is specified.
     pub const DEFAULT: &str = CLAUDE_SONNET_4_6;
+
+    /// Default context window size.
+    pub const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
 }

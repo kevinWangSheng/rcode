@@ -42,7 +42,7 @@ impl Tool for GlobTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let pattern = input["pattern"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'pattern' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;
 
         let base_dir = input["path"]
             .as_str()
@@ -64,7 +64,7 @@ impl Tool for GlobTool {
         let mut matches: Vec<(std::time::SystemTime, String)> = Vec::new();
 
         for entry in glob::glob(&full_pattern)
-            .map_err(|e| CcError::Tool(format!("invalid glob pattern: {e}")))?
+            .map_err(|e| CcError::tool("tool", format!("invalid glob pattern: {e}")))?
             .flatten()
         {
             if entry.is_file() {

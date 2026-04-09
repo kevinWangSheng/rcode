@@ -2,25 +2,21 @@
 members = [
     "cc",
     "crates/cc-core",
+    "crates/cc-http",
     "crates/cc-config",
-    "crates/cc-analytics",
     "crates/cc-auth",
-    "crates/cc-api",
     "crates/cc-permissions",
-    "crates/cc-memory",
     "crates/cc-git",
+    "crates/cc-memory",
+    "crates/cc-api",
     "crates/cc-tools",
     "crates/cc-hooks",
     "crates/cc-mcp",
     "crates/cc-session",
-    "crates/cc-agent",
-    "crates/cc-tasks",
-    "crates/cc-skills",
-    "crates/cc-plugins",
-    "crates/cc-commands",
+    "crates/cc-agents",
     "crates/cc-query",
-    "crates/cc-bridge",
     "crates/cc-tui",
+    "crates/cc-bridge",
     "spikes/tui",
 ]
 resolver = "2"
@@ -41,7 +37,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 eventsource-stream = "0.2"
 
 # CLI
@@ -59,6 +55,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 glob = "0.3"
 walkdir = "2"
+tempfile = "3"
 
 # Async trait
 async-trait = "0.1"
@@ -81,8 +78,8 @@ crossterm = "0.28"
 
 # Internal crates
 cc-core = { path = "crates/cc-core" }
+cc-http = { path = "crates/cc-http" }
 cc-config = { path = "crates/cc-config" }
-cc-analytics = { path = "crates/cc-analytics" }
 cc-auth = { path = "crates/cc-auth" }
 cc-api = { path = "crates/cc-api" }
 cc-permissions = { path = "crates/cc-permissions" }
@@ -92,11 +89,7 @@ cc-tools = { path = "crates/cc-tools" }
 cc-hooks = { path = "crates/cc-hooks" }
 cc-mcp = { path = "crates/cc-mcp" }
 cc-session = { path = "crates/cc-session" }
-cc-agent = { path = "crates/cc-agent" }
-cc-tasks = { path = "crates/cc-tasks" }
-cc-skills = { path = "crates/cc-skills" }
-cc-plugins = { path = "crates/cc-plugins" }
-cc-commands = { path = "crates/cc-commands" }
+cc-agents = { path = "crates/cc-agents" }
 cc-query = { path = "crates/cc-query" }
 cc-bridge = { path = "crates/cc-bridge" }
 cc-tui = { path = "crates/cc-tui" }

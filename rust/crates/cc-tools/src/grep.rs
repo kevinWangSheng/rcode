@@ -61,7 +61,7 @@ impl Tool for GrepTool {
     async fn execute(&self, input: Value) -> CcResult<ToolResult> {
         let pattern_str = input["pattern"]
             .as_str()
-            .ok_or_else(|| CcError::Tool("missing 'pattern' field".into()))?;
+            .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;
 
         let case_insensitive = input["-i"].as_bool().unwrap_or(false);
         let re = if case_insensitive {
@@ -69,7 +69,7 @@ impl Tool for GrepTool {
         } else {
             Regex::new(pattern_str)
         }
-        .map_err(|e| CcError::Tool(format!("invalid regex pattern: {e}")))?;
+        .map_err(|e| CcError::tool("tool", format!("invalid regex pattern: {e}")))?;
 
         let search_path = input["path"]
             .as_str()

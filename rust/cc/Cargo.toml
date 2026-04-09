@@ -9,8 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 cc-core.workspace = true
+cc-http.workspace = true
 cc-config.workspace = true
-cc-analytics.workspace = true
 cc-auth.workspace = true
 cc-api.workspace = true
 cc-tools.workspace = true
@@ -20,6 +20,7 @@ cc-mcp.workspace = true
 cc-session.workspace = true
 cc-git.workspace = true
 cc-memory.workspace = true
+cc-agents.workspace = true
 cc-query.workspace = true
 cc-tui.workspace = true
 cc-bridge.workspace = true
