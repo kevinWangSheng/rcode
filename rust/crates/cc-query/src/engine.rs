@@ -172,7 +172,7 @@ impl QueryEngine {
                 .await?;
 
             let input_tokens = usage.input_tokens;
-            let stop_reason = message.stop_reason.clone();
+            let stop_reason = message.stop_reason;
 
             // Collect tool_use blocks from the response
             for block in &message.content {

@@ -131,7 +131,7 @@ impl StreamAccumulator {
                 }
             }
             StreamEvent::MessageDelta { delta, usage } => {
-                self.stop_reason = delta.stop_reason.clone();
+                self.stop_reason = delta.stop_reason;
                 self.output_tokens = usage.output_tokens;
             }
             _ => {}

@@ -185,12 +185,12 @@ fn parse_include_directive(line: &str) -> Option<&str> {
 
 /// Resolve an include path relative to the including file's directory.
 fn resolve_include_path(path_ref: &str, base_dir: &Path) -> Option<PathBuf> {
-    if path_ref.starts_with("~/") {
-        dirs::home_dir().map(|h| h.join(&path_ref[2..]))
+    if let Some(rest) = path_ref.strip_prefix("~/") {
+        dirs::home_dir().map(|h| h.join(rest))
     } else if path_ref.starts_with('/') {
         Some(PathBuf::from(path_ref))
-    } else if path_ref.starts_with("./") {
-        Some(base_dir.join(&path_ref[2..]))
+    } else if let Some(rest) = path_ref.strip_prefix("./") {
+        Some(base_dir.join(rest))
     } else {
         Some(base_dir.join(path_ref))
     }
@@ -288,8 +288,8 @@ fn extract_yaml_list(frontmatter: &str, field: &str) -> Option<Vec<String>> {
         }
         if found {
             let trimmed = line.trim();
-            if trimmed.starts_with("- ") {
-                items.push(trimmed[2..].trim().to_string());
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                items.push(rest.trim().to_string());
             } else {
                 break;
             }

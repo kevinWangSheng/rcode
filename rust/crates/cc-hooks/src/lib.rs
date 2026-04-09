@@ -273,7 +273,7 @@ impl HookRunner {
                         _ = cancel.cancelled() => HookOutcome::Failed("cancelled".into()),
                         result = tokio::time::timeout(
                             timeout,
-                            execute_one_hook(&h, &input_json, &http, env_path.as_deref()),
+                            execute_one_hook(h, &input_json, &http, env_path.as_deref()),
                         ) => {
                             match result {
                                 Ok(outcome) => outcome,

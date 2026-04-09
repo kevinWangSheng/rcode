@@ -230,7 +230,7 @@ impl ApiClient {
 
         let id = acc.message_id.clone();
         let model = acc.model.clone();
-        let stop_reason = acc.stop_reason.clone();
+        let stop_reason = acc.stop_reason;
         let usage = Usage {
             input_tokens: acc.input_tokens,
             output_tokens: acc.output_tokens,
