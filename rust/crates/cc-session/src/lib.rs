@@ -21,6 +21,17 @@ pub struct TranscriptEntry {
     pub compact_boundary: Option<bool>,
 }
 
+/// Session metadata stored in metadata.json alongside the transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub model: String,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
 /// Session metadata for listing.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -142,6 +153,34 @@ impl Session {
     /// Path to the transcript file.
     pub fn transcript_path(&self) -> &Path {
         &self.transcript_path
+    }
+
+    /// Path to the session directory.
+    fn session_dir(&self) -> Option<&Path> {
+        self.transcript_path.parent()
+    }
+
+    /// Write session metadata alongside the transcript.
+    pub fn write_metadata(&self, metadata: &SessionMetadata) -> CcResult<()> {
+        let Some(dir) = self.session_dir() else {
+            return Err(CcError::io("no session directory"));
+        };
+        let path = dir.join("metadata.json");
+        let json = serde_json::to_string_pretty(metadata).map_err(CcError::Json)?;
+        fs::write(&path, json)
+            .map_err(|e| CcError::io(format!("failed to write metadata: {e}")))?;
+        Ok(())
+    }
+
+    /// Load session metadata.
+    pub fn load_metadata(&self) -> CcResult<SessionMetadata> {
+        let Some(dir) = self.session_dir() else {
+            return Err(CcError::io("no session directory"));
+        };
+        let path = dir.join("metadata.json");
+        let content = fs::read_to_string(&path)
+            .map_err(|e| CcError::io(format!("failed to read metadata: {e}")))?;
+        serde_json::from_str(&content).map_err(CcError::Json)
     }
 }
 
@@ -388,6 +427,26 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text == "answer"));
         assert!(matches!(&blocks[1], ContentBlock::ToolUse(_)));
+    }
+
+    #[test]
+    fn metadata_roundtrip() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let session = Session {
+            id: "test-meta".into(),
+            transcript_path: transcript,
+        };
+        let meta = SessionMetadata {
+            model: "claude-sonnet-4-6".into(),
+            started_at: "2026-04-09T12:00:00Z".into(),
+            project_path: Some("/home/user/project".into()),
+            cwd: None,
+        };
+        session.write_metadata(&meta).unwrap();
+        let loaded = session.load_metadata().unwrap();
+        assert_eq!(loaded.model, "claude-sonnet-4-6");
+        assert_eq!(loaded.project_path.as_deref(), Some("/home/user/project"));
     }
 
     #[test]
