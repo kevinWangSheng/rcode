@@ -24,6 +24,7 @@ cc-agents.workspace = true
 cc-query.workspace = true
 cc-tui.workspace = true
 cc-bridge.workspace = true
+chrono.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true

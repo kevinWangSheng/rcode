@@ -94,7 +94,7 @@ async fn print_mode_streams_text_through_bridge() {
     let req = BridgeRequest {
         api,
         tools: Vec::new(),
-        permissions: PermissionEngine::from_settings(Vec::<String>::new(), Vec::<String>::new()),
+        permissions: PermissionEngine::from_settings(Vec::<serde_json::Value>::new(), Vec::<serde_json::Value>::new()),
         hooks: HookRunner::empty(),
         session: Session::new().expect("session"),
         system_blocks: Vec::new(),

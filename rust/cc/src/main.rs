@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use serde_json::json;
@@ -12,8 +13,9 @@ use cc_hooks::{HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryOptions},
+    ToolRegistry,
 };
-use cc_session::{list_sessions, Session};
+use cc_session::{list_sessions, Session, SessionMetadata};
 use cc_tools::default_tools;
 use cc_tui::TuiConfig;
 
@@ -141,6 +143,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!("Session: {}", session.id);
+
+    // Write session metadata
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let metadata = SessionMetadata {
+        model: model.clone(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        project_path: Some(cwd.to_string_lossy().to_string()),
+        cwd: Some(cwd.to_string_lossy().to_string()),
+    };
+    if let Err(e) = session.write_metadata(&metadata) {
+        tracing::warn!("failed to write session metadata: {e}");
+    }
 
     // For headless mode we still need a user message; gather it before
     // building heavy components so we can fail fast on bad input.
@@ -277,9 +291,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Headless one-shot path — same as M2 behavior.
     let user_text = headless_user_text.expect("headless mode without user text — checked above");
 
+    let mut tool_registry = ToolRegistry::new();
+    for tool in tools {
+        tool_registry.register(tool);
+    }
+
     let mut engine = QueryEngine::new(
         api,
-        tools,
+        Arc::new(tool_registry),
         permission_engine,
         hook_runner,
         session,
@@ -310,6 +329,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             let output = json!({
                 "session_id": engine.session().id,
+                "model": engine.model(),
                 "content": final_text,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
