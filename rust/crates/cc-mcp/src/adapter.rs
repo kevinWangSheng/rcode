@@ -1,35 +1,22 @@
-//! Adapter that exposes an MCP tool (over stdio or HTTP) as a `cc_tools::Tool`,
+//! Adapter that exposes an MCP tool as a `cc_tools::Tool`,
 //! so the query engine can call MCP tools through the same path as built-in tools.
-//!
-//! Each adapter holds a shared handle to a transport (stdio child or HTTP client)
-//! plus the tool's metadata. Calls are dispatched through `Mutex` because the
-//! underlying transports are not internally cloneable.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use cc_core::{CcResult, ToolInputSchema};
 use cc_tools::{Tool, ToolResult};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::transport::McpTransport;
 use crate::{McpClient, McpHttpClient};
 
-/// One of the supported MCP transports. The Stdio variant carries a child
-/// process handle (large), so it is boxed to keep the enum small per
-/// `clippy::large_enum_variant`. The transport itself lives behind an
-/// `Arc<Mutex<...>>` so multiple tool adapters from one server share the
-/// same connection.
-pub enum McpTransport {
-    Stdio(Box<Mutex<McpClient>>),
-    Http(Mutex<McpHttpClient>),
-}
-
 /// A single MCP tool surfaced as a `cc_tools::Tool`. Multiple adapters can share
-/// the same `Arc<McpTransport>` when they came from the same server.
+/// the same `Arc<dyn McpTransport>` when they came from the same server.
 pub struct McpToolAdapter {
-    transport: Arc<McpTransport>,
+    transport: Arc<dyn McpTransport>,
     /// Public name as the model sees it: `mcp__<server>__<tool>`.
     api_name: String,
     /// Original (unprefixed) tool name; what we send back to the MCP server.
@@ -40,7 +27,7 @@ pub struct McpToolAdapter {
 
 impl McpToolAdapter {
     pub fn new(
-        transport: Arc<McpTransport>,
+        transport: Arc<dyn McpTransport>,
         api_name: impl Into<String>,
         inner_name: impl Into<String>,
         description: impl Into<String>,
@@ -75,40 +62,55 @@ impl Tool for McpToolAdapter {
         })
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
-        let result = match &*self.transport {
-            McpTransport::Stdio(client) => {
-                let mut guard = client.lock().await;
-                guard.call_tool(&self.inner_name, input).await
-            }
-            McpTransport::Http(client) => {
-                let mut guard = client.lock().await;
-                guard.call_tool(&self.inner_name, input).await
-            }
-        };
+    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+        let result = self
+            .transport
+            .request(
+                "tools/call",
+                Some(json!({ "name": self.inner_name, "arguments": input })),
+                cancel,
+            )
+            .await;
 
-        if result.is_error {
-            Ok(ToolResult::error(result.content))
-        } else {
-            Ok(ToolResult::ok(result.content))
+        match result {
+            Ok(value) => {
+                let is_error = value
+                    .get("isError")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let content =
+                    if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
+                        arr.iter()
+                            .filter_map(|block| {
+                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    block
+                                        .get("text")
+                                        .and_then(|t| t.as_str())
+                                        .map(|s| s.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        value.to_string()
+                    };
+
+                if is_error {
+                    Ok(ToolResult::error(content))
+                } else {
+                    Ok(ToolResult::ok(content))
+                }
+            }
+            Err(e) => Ok(ToolResult::error(format!("MCP call failed: {e}"))),
         }
     }
 }
 
 /// Helper used by `main.rs` (and tests) to convert raw `mcpServers` JSON from
-/// settings.json into a vector of connected `Tool` adapters. Returns a tuple of
-/// `(adapters, errors)` — failures connecting to any single server are reported
-/// in `errors` and do not prevent the rest from loading.
-///
-/// `mcpServers` shape (matches the TS schema):
-/// ```jsonc
-/// {
-///   "mcpServers": {
-///     "filesystem": { "command": "npx", "args": ["@mcp/filesystem"] },
-///     "remote":     { "url": "https://mcp.example.com/sse" }
-///   }
-/// }
-/// ```
+/// settings.json into a vector of connected `Tool` adapters.
 pub async fn load_mcp_tools_from_config(
     mcp_servers: &Value,
 ) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
@@ -131,15 +133,14 @@ pub async fn load_mcp_tools_from_config(
 }
 
 async fn connect_one_server(server_name: &str, cfg: &Value) -> Result<Vec<Arc<dyn Tool>>, String> {
-    // Decide transport: presence of `url` → HTTP, presence of `command` → stdio.
     let url = cfg.get("url").and_then(|v| v.as_str());
     let command = cfg.get("command").and_then(|v| v.as_str());
 
-    let (transport, mcp_tools) = match (url, command) {
+    let (transport, mcp_tools): (Arc<dyn McpTransport>, _) = match (url, command) {
         (Some(url), _) => {
             let mut client = McpHttpClient::connect(server_name, url).await?;
             let tools = client.list_tools().await?;
-            (Arc::new(McpTransport::Http(Mutex::new(client))), tools)
+            (Arc::new(Mutex::new(client)), tools)
         }
         (None, Some(command)) => {
             let args: Vec<String> = cfg
@@ -154,10 +155,7 @@ async fn connect_one_server(server_name: &str, cfg: &Value) -> Result<Vec<Arc<dy
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let mut client = McpClient::connect(server_name, command, &arg_refs).await?;
             let tools = client.list_tools().await?;
-            (
-                Arc::new(McpTransport::Stdio(Box::new(Mutex::new(client)))),
-                tools,
-            )
+            (Arc::new(Mutex::new(client)), tools)
         }
         (None, None) => {
             return Err("server config has neither `url` nor `command`".to_string());
@@ -199,7 +197,6 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_server_records_error_without_panicking() {
-        // Bogus URL → HTTP connect should fail and surface as an error string.
         let cfg = json!({
             "broken": { "url": "http://127.0.0.1:1" }
         });

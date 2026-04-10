@@ -1,9 +1,13 @@
+use crate::transport::McpTransport;
 use crate::types::{JsonRpcRequest, JsonRpcResponse, McpTool, McpToolResult};
+use async_trait::async_trait;
+use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -210,6 +214,42 @@ impl McpClient {
             .map_err(|e| format!("write error: {e}"))?;
         stdin.flush().await.map_err(|e| format!("flush error: {e}"))?;
 
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransport for Mutex<McpClient> {
+    async fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        _cancel: &CancellationToken,
+    ) -> CcResult<Value> {
+        let mut guard = self.lock().await;
+        let resp = guard
+            .send_request(method, params)
+            .await
+            .map_err(CcError::Other)?;
+        if let Some(err) = resp.error {
+            return Err(CcError::Other(format!(
+                "MCP error {}: {}",
+                err.code, err.message
+            )));
+        }
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) -> CcResult<()> {
+        let mut guard = self.lock().await;
+        guard
+            .send_notification(method, params)
+            .await
+            .map_err(CcError::Other)
+    }
+
+    async fn close(&self) -> CcResult<()> {
+        // Child process will be killed when dropped
         Ok(())
     }
 }

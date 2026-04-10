@@ -17,10 +17,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use cc_core::{CcError, CcResult};
 use reqwest::{header, Client};
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::transport::McpTransport;
 use crate::types::{JsonRpcRequest, JsonRpcResponse, McpTool, McpToolResult};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -210,6 +215,41 @@ impl McpHttpClient {
         if !resp.status().is_success() && resp.status().as_u16() != 202 {
             return Err(format!("http {}", resp.status()));
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransport for Mutex<McpHttpClient> {
+    async fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        _cancel: &CancellationToken,
+    ) -> CcResult<Value> {
+        let guard = self.lock().await;
+        let resp = guard
+            .send_request(method, params)
+            .await
+            .map_err(CcError::Other)?;
+        if let Some(err) = resp.error {
+            return Err(CcError::Other(format!(
+                "MCP error {}: {}",
+                err.code, err.message
+            )));
+        }
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) -> CcResult<()> {
+        let guard = self.lock().await;
+        guard
+            .send_notification(method, params)
+            .await
+            .map_err(CcError::Other)
+    }
+
+    async fn close(&self) -> CcResult<()> {
         Ok(())
     }
 }
