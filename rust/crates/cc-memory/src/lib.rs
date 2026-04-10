@@ -303,6 +303,33 @@ fn extract_yaml_list(frontmatter: &str, field: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Load all memory files for the current project (all 6 types).
+pub fn load_memory_files(
+    cwd: &Path,
+    root: &Path,
+    sources: &cc_config::SettingsSourcesEnabled,
+) -> Vec<MemoryFile> {
+    let mut files = Vec::new();
+
+    // 1. Managed (policy path) — currently no managed policy path implemented
+    // files.extend(load_managed_memory());
+
+    // 2. User (~/.claude/memory/*.md)
+    if sources.user {
+        files.extend(load_memories());
+    }
+
+    // 3 + 4. Project (CLAUDE.md walk-up) + Local (CLAUDE.local.md walk-up)
+    if sources.project || sources.local {
+        files.extend(load_claudemd_walk_up(cwd, root));
+    }
+
+    // 5. AutoMem — loaded separately by the auto-memory system
+    // 6. TeamMem — loaded separately by the team system
+
+    files
+}
+
 /// Format loaded memories as a system prompt block.
 pub fn memories_to_system_text(memories: &[MemoryFile]) -> Option<String> {
     if memories.is_empty() {

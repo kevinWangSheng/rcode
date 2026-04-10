@@ -4,6 +4,7 @@
 //! spawned into the TaskRegistry.
 
 use cc_core::{CcError, CcResult};
+use serde_json::json;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -70,15 +71,45 @@ pub async fn run_in_process_teammate(
     ))
 }
 
-/// Placeholder for remote_agent task type.
+/// Remote agent task type: delegate to a remote Claude Code instance via HTTP API.
 pub async fn run_remote_agent(
-    _prompt: String,
-    _endpoint: String,
-    _cancel: CancellationToken,
+    prompt: String,
+    endpoint: String,
+    http: reqwest::Client,
+    cancel: CancellationToken,
 ) -> CcResult<TaskOutput> {
-    Err(CcError::Other(
-        "remote_agent not yet implemented".to_string(),
-    ))
+    let body = json!({
+        "prompt": prompt,
+    });
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            Err(CcError::Cancelled)
+        }
+        result = http.post(&endpoint)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send() => {
+            let response = result
+                .map_err(|e| CcError::Other(format!("remote agent request failed: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(CcError::Other(format!(
+                    "remote agent returned status {}",
+                    response.status()
+                )));
+            }
+
+            let text = response.text().await
+                .map_err(|e| CcError::Other(format!("remote agent response read failed: {e}")))?;
+
+            Ok(TaskOutput {
+                summary: "remote agent completed".into(),
+                content: text,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
