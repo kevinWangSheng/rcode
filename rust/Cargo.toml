@@ -74,7 +74,7 @@ keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
 
 # TUI
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Internal crates
 cc-core = { path = "crates/cc-core" }

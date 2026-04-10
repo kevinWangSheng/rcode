@@ -3,6 +3,9 @@
 
 use std::collections::VecDeque;
 
+use cc_query::PromptDecision;
+use tokio::sync::oneshot;
+
 /// One transcript entry. Tool calls and assistant text are flattened into a flat
 /// list so we can render them in order without recovering structure from the
 /// underlying `MessageParam` blocks. This is intentionally a UI-only model;
@@ -104,6 +107,8 @@ pub struct App {
     pub queued: VecDeque<String>,
     /// Session ID, displayed in the title bar.
     pub session_id: String,
+    /// Reply channel for the current permission prompt.
+    pub pending_reply: Option<oneshot::Sender<PromptDecision>>,
 }
 
 impl App {
@@ -119,6 +124,7 @@ impl App {
             scroll: 0,
             queued: VecDeque::new(),
             session_id,
+            pending_reply: None,
         }
     }
 

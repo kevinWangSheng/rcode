@@ -159,6 +159,9 @@ name = "cc-agents"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
@@ -297,6 +300,7 @@ dependencies = [
 name = "cc-memory"
 version = "0.1.0"
 dependencies = [
+ "cc-config",
  "cc-core",
  "dirs",
  "serde",
@@ -327,6 +331,7 @@ dependencies = [
  "cc-permissions",
  "cc-session",
  "cc-tools",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -382,6 +387,7 @@ dependencies = [
  "cc-session",
  "crossterm",
  "dirs",
+ "futures",
  "ratatui",
  "serde",
  "serde_json",
@@ -476,6 +482,7 @@ dependencies = [
  "cc-session",
  "cc-tools",
  "cc-tui",
+ "chrono",
  "clap",
  "serde",
  "serde_json",
@@ -538,6 +545,7 @@ checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags",
  "crossterm_winapi",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix 0.38.44",
