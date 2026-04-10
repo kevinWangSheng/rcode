@@ -6,7 +6,7 @@ use cc_core::{
 use cc_hooks::{HookInput, HookRunner};
 use cc_permissions::PermissionEngine;
 use cc_session::Session;
-use cc_tools::{Tool, ToolResult};
+use cc_tools::ToolResult;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -14,10 +14,7 @@ use tracing::debug;
 
 use crate::permission_prompt::PromptDecision;
 use crate::prompter::{PermissionPrompter, StdinPrompter};
-
-/// Context window token threshold for auto-compact.
-/// When `input_tokens` exceeds this, old messages are trimmed.
-const AUTO_COMPACT_TOKEN_THRESHOLD: u32 = 80_000;
+use crate::tool_registry::ToolRegistry;
 
 /// Maximum turns in a single `run_conversation` call.
 const MAX_TURNS: usize = 50;
@@ -47,7 +44,7 @@ impl Default for QueryOptions {
 /// The main agentic query engine.
 pub struct QueryEngine {
     api: ApiClient,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Arc<ToolRegistry>,
     permissions: PermissionEngine,
     hooks: HookRunner,
     session: Session,
@@ -63,7 +60,7 @@ pub struct QueryEngine {
 impl QueryEngine {
     pub fn new(
         api: ApiClient,
-        tools: Vec<Arc<dyn Tool>>,
+        tools: Arc<ToolRegistry>,
         permissions: PermissionEngine,
         hooks: HookRunner,
         session: Session,
@@ -130,7 +127,7 @@ impl QueryEngine {
         messages.push(user_msg);
 
         // 2. Build tool definitions for the API
-        let tool_defs: Vec<_> = self.tools.iter().map(|t| t.to_definition()).collect();
+        let tool_defs = self.tools.definitions();
 
         let mut final_text = String::new();
         let mut turns = 0;
@@ -213,10 +210,11 @@ impl QueryEngine {
                     self.session.append(&result_msg)?;
                     messages.push(result_msg);
 
-                    // Auto-compact check
-                    if input_tokens > AUTO_COMPACT_TOKEN_THRESHOLD {
+                    // Auto-compact check (§4.5: threshold = context_window - 13,000)
+                    let threshold = compact_threshold();
+                    if input_tokens > threshold {
                         debug!(
-                            "auto-compact triggered: input_tokens={input_tokens} > threshold={AUTO_COMPACT_TOKEN_THRESHOLD}"
+                            "auto-compact triggered: input_tokens={input_tokens} > threshold={threshold}"
                         );
                         compact_messages(messages);
                         self.compacted_last_turn = true;
@@ -235,26 +233,79 @@ impl QueryEngine {
     }
 
     /// Execute a batch of tool_use blocks, returning tool_result blocks.
+    /// Read-only tools run concurrently; mutating tools run sequentially (§4.3).
     async fn execute_tools(
         &mut self,
         tool_use_blocks: &[ToolUseBlock],
         _messages: &[MessageParam],
     ) -> CcResult<Vec<ToolResultBlock>> {
-        let mut results = Vec::new();
+        // Partition into read-only and mutating
+        let (read_only, mutating): (Vec<_>, Vec<_>) = tool_use_blocks.iter().partition(|tu| {
+            self.tools
+                .get(&tu.name)
+                .is_some_and(|t| t.is_read_only())
+        });
 
-        for tu in tool_use_blocks {
-            let result = self.execute_one_tool(tu).await;
-            results.push(result);
+        let mut results = Vec::with_capacity(tool_use_blocks.len());
+
+        // Run read-only tools concurrently — pre-check permissions sequentially,
+        // then execute the actual tool calls in parallel.
+        if !read_only.is_empty() {
+            let mut authorized: Vec<(&ToolUseBlock, Arc<dyn cc_tools::Tool>)> = Vec::new();
+            for tu in &read_only {
+                match self.check_tool_permissions(tu).await {
+                    Ok(tool) => authorized.push((tu, tool)),
+                    Err(result) => results.push(result),
+                }
+            }
+
+            if !authorized.is_empty() {
+                let futures: Vec<_> = authorized
+                    .into_iter()
+                    .map(|(tu, tool)| {
+                        let cancel = CancellationToken::new();
+                        async move {
+                            let result: ToolResult =
+                                match tool.execute(tu.input.clone(), &cancel).await {
+                                    Ok(r) => r,
+                                    Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
+                                };
+                            ToolResultBlock {
+                                tool_use_id: tu.id.clone(),
+                                content: Some(Value::String(result.content)),
+                                is_error: if result.is_error { Some(true) } else { None },
+                            }
+                        }
+                    })
+                    .collect();
+                results.extend(futures::future::join_all(futures).await);
+            }
         }
+
+        // Run mutating tools sequentially
+        for tu in &mutating {
+            results.push(self.execute_one_tool(tu).await);
+        }
+
+        // Re-sort to match original tool_use order
+        results.sort_by_key(|r| {
+            tool_use_blocks
+                .iter()
+                .position(|tu| tu.id == r.tool_use_id)
+                .unwrap_or(usize::MAX)
+        });
 
         Ok(results)
     }
 
-    async fn execute_one_tool(&mut self, tu: &ToolUseBlock) -> ToolResultBlock {
+    /// Check hooks and permissions for a tool. Returns the tool Arc on success,
+    /// or a ToolResultBlock error on failure.
+    async fn check_tool_permissions(
+        &mut self,
+        tu: &ToolUseBlock,
+    ) -> Result<Arc<dyn cc_tools::Tool>, ToolResultBlock> {
         let tool_name = &tu.name;
         let input = &tu.input;
-
-        debug!("tool_use: {tool_name}");
 
         // --- PreToolUse hook ---
         let hook_input = HookInput {
@@ -264,6 +315,7 @@ impl QueryEngine {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string(),
+            permission_mode: None,
             hook_event_name: "PreToolUse".into(),
             tool_name: Some(tool_name.clone()),
             tool_input: Some(input.clone()),
@@ -280,31 +332,28 @@ impl QueryEngine {
             let msg = hook_result
                 .block_message
                 .unwrap_or_else(|| "blocked by hook".into());
-            return tool_result_error(&tu.id, format!("Blocked by hook: {msg}"));
-        }
-        for failure in &hook_result.failures {
-            debug!("PreToolUse hook failed (non-blocking): {failure}");
+            return Err(tool_result_error(&tu.id, format!("Blocked by hook: {msg}")));
         }
 
         // --- Permission check ---
         if !self.options.bypass_permissions {
-            let behavior = self.permissions.check(tool_name, input);
+            let result = self.permissions.check(tool_name, input);
             use cc_core::PermissionBehavior;
-            match behavior {
+            match result.behavior {
                 PermissionBehavior::Deny => {
-                    return tool_result_error(
+                    return Err(tool_result_error(
                         &tu.id,
                         format!("Permission denied for tool '{tool_name}'"),
-                    );
+                    ));
                 }
                 PermissionBehavior::Ask => {
                     let decision = self.prompter.prompt(tool_name, input).await;
                     match decision {
                         PromptDecision::Deny => {
-                            return tool_result_error(
+                            return Err(tool_result_error(
                                 &tu.id,
                                 format!("Permission denied for tool '{tool_name}'"),
-                            );
+                            ));
                         }
                         PromptDecision::AllowAlways => {
                             self.permissions.add_session_allow(tool_name);
@@ -316,24 +365,31 @@ impl QueryEngine {
             }
         }
 
-        // --- Find and execute tool ---
-        let tool = self.tools.iter().find(|t| t.name() == tool_name).cloned();
+        // --- Find tool ---
+        self.tools
+            .get_arc(tool_name)
+            .cloned()
+            .ok_or_else(|| tool_result_error(&tu.id, format!("Unknown tool: {tool_name}")))
+    }
 
-        match tool {
-            None => tool_result_error(&tu.id, format!("Unknown tool: {tool_name}")),
-            Some(t) => {
-                let cancel = CancellationToken::new();
-                let result: ToolResult = match t.execute(input.clone(), &cancel).await {
-                    Ok(r) => r,
-                    Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
-                };
+    async fn execute_one_tool(&mut self, tu: &ToolUseBlock) -> ToolResultBlock {
+        debug!("tool_use: {}", tu.name);
 
-                ToolResultBlock {
-                    tool_use_id: tu.id.clone(),
-                    content: Some(Value::String(result.content)),
-                    is_error: if result.is_error { Some(true) } else { None },
-                }
-            }
+        let tool = match self.check_tool_permissions(tu).await {
+            Ok(t) => t,
+            Err(result) => return result,
+        };
+
+        let cancel = CancellationToken::new();
+        let result: ToolResult = match tool.execute(tu.input.clone(), &cancel).await {
+            Ok(r) => r,
+            Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
+        };
+
+        ToolResultBlock {
+            tool_use_id: tu.id.clone(),
+            content: Some(Value::String(result.content)),
+            is_error: if result.is_error { Some(true) } else { None },
         }
     }
 }
@@ -344,6 +400,17 @@ fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResul
         content: Some(Value::String(message.into())),
         is_error: Some(true),
     }
+}
+
+/// Auto-compact threshold (§4.5).
+/// = effective_context_window - 13,000
+/// Default effective_context_window = 200,000 (claude-sonnet-4-6).
+fn compact_threshold() -> u32 {
+    let context_window: u32 = std::env::var("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    context_window.saturating_sub(13_000)
 }
 
 /// Simple compaction: keep only the first user message and the last N messages.
