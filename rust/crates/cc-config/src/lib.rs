@@ -6,6 +6,7 @@ pub mod settings;
 pub use paths::ConfigPaths;
 pub use project::ProjectContext;
 pub use settings::{
-    expand_model_alias, load_settings, load_settings_with_override, resolve_model, ResolvedConfig,
-    Settings,
+    discover_sources, expand_model_alias, load_settings, load_settings_with_override,
+    merge_sources, resolve_model, PermissionsConfig, ResolvedConfig, Settings, SettingsSources,
+    SettingsSourcesEnabled,
 };

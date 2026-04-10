@@ -2,9 +2,6 @@
 //!
 //! Confirms the order claimed in `Section 3 / Compatibility Contracts`:
 //!   global → project → local (lowest to highest priority).
-//!
-//! This duplicates what `load_settings` does internally so we can run it
-//! without touching the user's real `~/.claude` directory.
 
 use cc_config::Settings;
 use serde_json::json;
@@ -62,14 +59,14 @@ fn local_overrides_project_overrides_global() {
     assert_eq!(merged.model.as_deref(), Some("local-model"));
 
     // Permissions: local doesn't override permissions, so project's value wins
-    // over global's. (`allow` is wholly replaced because it's a non-object Vec.)
+    // over global's. (`allow` is wholly replaced because it's an array.)
     let allow = merged
         .permissions
         .as_ref()
         .and_then(|p| p.allow.as_ref())
         .cloned()
         .unwrap_or_default();
-    assert_eq!(allow, vec!["Bash(grep:*)".to_string()]);
+    assert_eq!(allow, vec![json!("Bash(grep:*)")]);
 
     // Unknown fields from each layer are preserved.
     assert_eq!(merged.extra.get("extra_global_only"), Some(&json!("g")));
@@ -84,6 +81,9 @@ fn missing_layers_fall_through_to_lower_layer() {
         model: Some("only-global".into()),
         ..Default::default()
     };
-    let merged = global.clone().merge(Settings::default()).merge(Settings::default());
+    let merged = global
+        .clone()
+        .merge(Settings::default())
+        .merge(Settings::default());
     assert_eq!(merged.model.as_deref(), Some("only-global"));
 }

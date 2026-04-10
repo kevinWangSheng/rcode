@@ -13,3 +13,6 @@ tokio-util.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

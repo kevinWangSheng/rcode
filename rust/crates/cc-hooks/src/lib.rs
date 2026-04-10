@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -98,6 +98,8 @@ pub struct HookInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     pub hook_event_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -168,32 +170,39 @@ impl HookRunResult {
     }
 }
 
-/// Deduplication key.
+/// Deduplication key (§5.2: command_or_url, if_condition, namespace).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HookKey {
     command_or_url: String,
     if_condition: Option<String>,
+    namespace: Option<String>,
 }
 
 /// Runs hooks registered for events.
 pub struct HookRunner {
     /// Frozen snapshot of hook configuration (taken at session start).
     config_snapshot: HooksSettings,
+    /// Session-scoped hooks (added at runtime, e.g. by function hooks).
+    session_hooks: RwLock<HooksSettings>,
     /// Set of hooks that have already fired (for `once: true`).
     fired_once: Mutex<HashSet<HookKey>>,
     /// HTTP client.
     http: reqwest::Client,
+    /// If true, only managed (policy-path) hooks are allowed.
+    managed_only: bool,
     /// Whether hooks are disabled entirely.
     disabled: bool,
 }
 
 impl HookRunner {
-    /// Snapshot the config at session start.
+    /// Snapshot the config at session start (prevents race with settings changes).
     pub fn new(settings: &HooksSettings, http: reqwest::Client) -> Self {
         Self {
             config_snapshot: settings.clone(),
+            session_hooks: RwLock::new(HooksSettings::new()),
             fired_once: Mutex::new(HashSet::new()),
             http,
+            managed_only: false,
             disabled: false,
         }
     }
@@ -201,10 +210,23 @@ impl HookRunner {
     pub fn empty() -> Self {
         Self {
             config_snapshot: HooksSettings::new(),
+            session_hooks: RwLock::new(HooksSettings::new()),
             fired_once: Mutex::new(HashSet::new()),
             http: reqwest::Client::new(),
+            managed_only: false,
             disabled: true,
         }
+    }
+
+    /// Set managed-only mode (only policy-path hooks are allowed).
+    pub fn set_managed_only(&mut self, managed_only: bool) {
+        self.managed_only = managed_only;
+    }
+
+    /// Add a session-scoped hook at runtime (e.g. from function hooks).
+    pub fn add_session_hook(&self, event: &str, group: HookMatcherGroup) {
+        let mut hooks = self.session_hooks.write().unwrap();
+        hooks.entry(event.to_string()).or_default().push(group);
     }
 
     /// List all hook event names with at least one handler.
@@ -231,10 +253,20 @@ impl HookRunner {
             return HookRunResult::empty();
         }
 
-        let groups = match self.config_snapshot.get(event) {
-            Some(g) if !g.is_empty() => g,
-            _ => return HookRunResult::empty(),
-        };
+        let snapshot_groups = self.config_snapshot.get(event);
+
+        // Clone session-scoped hooks out of the RwLock before borrowing
+        let session_groups_owned: Vec<HookMatcherGroup> = self
+            .session_hooks
+            .read()
+            .ok()
+            .and_then(|s| s.get(event).cloned())
+            .unwrap_or_default();
+
+        let has_snapshot = snapshot_groups.is_some_and(|g| !g.is_empty());
+        if !has_snapshot && session_groups_owned.is_empty() {
+            return HookRunResult::empty();
+        }
 
         let input_json = match serde_json::to_string(input) {
             Ok(j) => j,
@@ -246,8 +278,13 @@ impl HookRunner {
             }
         };
 
-        // Collect matching hooks
-        let hooks = self.collect_matching_hooks(groups, input);
+        // Collect matching hooks from snapshot + session
+        let empty_groups = Vec::new();
+        let groups = snapshot_groups.unwrap_or(&empty_groups);
+        let mut hooks = self.collect_matching_hooks(groups, input);
+        if !session_groups_owned.is_empty() {
+            hooks.extend(self.collect_matching_hooks(&session_groups_owned, input));
+        }
 
         // Deduplicate
         let hooks = self.deduplicate(hooks);
@@ -349,10 +386,7 @@ impl HookRunner {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         for h in hooks {
-            let key = HookKey {
-                command_or_url: h.command.clone().or_else(|| h.url.clone()).unwrap_or_default(),
-                if_condition: h.if_condition.clone(),
-            };
+            let key = hook_key(h);
             if seen.insert(key) {
                 result.push(h);
             }
@@ -366,15 +400,7 @@ impl HookRunner {
             .into_iter()
             .filter(|h| {
                 if h.once {
-                    let key = HookKey {
-                        command_or_url: h
-                            .command
-                            .clone()
-                            .or_else(|| h.url.clone())
-                            .unwrap_or_default(),
-                        if_condition: h.if_condition.clone(),
-                    };
-                    fired.insert(key)
+                    fired.insert(hook_key(h))
                 } else {
                     true
                 }
@@ -522,6 +548,15 @@ async fn run_http_hook(
     HookOutcome::Ok
 }
 
+/// Build a deduplication key for a hook config.
+fn hook_key(h: &HookConfig) -> HookKey {
+    HookKey {
+        command_or_url: h.command.clone().or_else(|| h.url.clone()).unwrap_or_default(),
+        if_condition: h.if_condition.clone(),
+        namespace: h.extra.get("namespace").and_then(|v| v.as_str()).map(String::from),
+    }
+}
+
 /// Simple glob matching (supports * wildcard only).
 fn matches_glob(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
@@ -635,6 +670,7 @@ mod tests {
             session_id: "test".into(),
             transcript_path: None,
             cwd: "/tmp".into(),
+            permission_mode: None,
             hook_event_name: "PreToolUse".into(),
             tool_name: None,
             tool_input: None,
@@ -662,6 +698,7 @@ mod tests {
             session_id: "test".into(),
             transcript_path: None,
             cwd: "/tmp".into(),
+            permission_mode: None,
             hook_event_name: "PreToolUse".into(),
             tool_name: None,
             tool_input: None,
@@ -689,6 +726,7 @@ mod tests {
             session_id: "test".into(),
             transcript_path: None,
             cwd: "/tmp".into(),
+            permission_mode: None,
             hook_event_name: "PreToolUse".into(),
             tool_name: None,
             tool_input: None,
@@ -717,6 +755,7 @@ mod tests {
             session_id: "test".into(),
             transcript_path: None,
             cwd: "/tmp".into(),
+            permission_mode: None,
             hook_event_name: "PreToolUse".into(),
             tool_name: None,
             tool_input: None,
@@ -730,5 +769,44 @@ mod tests {
         let cancel = CancellationToken::new();
         let result = runner.run("PreToolUse", &input, &cancel).await;
         assert!(!result.blocked);
+    }
+
+    #[tokio::test]
+    async fn session_hooks_are_merged() {
+        // Start with no config hooks
+        let runner = HookRunner::new(&HooksSettings::new(), reqwest::Client::new());
+
+        // Add a session-scoped blocking hook
+        runner.add_session_hook(
+            "PreToolUse",
+            HookMatcherGroup {
+                matcher: None,
+                hooks: vec![HookConfig {
+                    kind: HookKind::Prompt,
+                    prompt: Some("session block".into()),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let input = HookInput {
+            session_id: "test".into(),
+            transcript_path: None,
+            cwd: "/tmp".into(),
+            permission_mode: None,
+            hook_event_name: "PreToolUse".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_response: None,
+            source: None,
+            model: None,
+            message: None,
+            agent_id: None,
+        };
+        let cancel = CancellationToken::new();
+        let result = runner.run("PreToolUse", &input, &cancel).await;
+        assert!(result.blocked);
+        assert_eq!(result.block_message.as_deref(), Some("session block"));
     }
 }

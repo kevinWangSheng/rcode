@@ -4,9 +4,10 @@ use crate::task::{TaskId, TaskNotification};
 use crate::tool::ToolResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 /// Events sent from engine/hooks/tasks to the TUI.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum AppEvent {
     // Streaming
     StreamDelta(String),
@@ -18,15 +19,13 @@ pub enum AppEvent {
     ToolStart { name: String, input: Value },
     ToolEnd { name: String, result: ToolResult },
 
-    // Permission
+    // Permission — engine sends request with a oneshot channel;
+    // TUI renders dialog and sends decision back through `response_tx`.
     PermissionRequest {
         id: u64,
         tool_name: String,
         tool_input: Value,
-    },
-    PermissionResponse {
-        id: u64,
-        decision: PromptDecision,
+        response_tx: oneshot::Sender<PromptDecision>,
     },
 
     // Session
