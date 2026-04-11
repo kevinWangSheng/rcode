@@ -4,9 +4,10 @@ use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::request::CreateMessageRequest;
+use crate::retry::RetryPolicy;
 use crate::stream::{ContentBlockDelta, StreamAccumulator, StreamEvent};
 
 /// Anthropic API base URL.
@@ -46,6 +47,7 @@ pub struct ApiClient {
     http: reqwest::Client,
     auth: AuthCredential,
     base_url: String,
+    retry: RetryPolicy,
 }
 
 impl ApiClient {
@@ -57,7 +59,14 @@ impl ApiClient {
             http,
             auth,
             base_url,
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// Set a custom retry policy.
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     fn headers(&self) -> CcResult<HeaderMap> {
@@ -93,48 +102,80 @@ impl ApiClient {
         Ok(headers)
     }
 
+    /// Send the HTTP request with retry on transient failures.
+    /// Returns the successful response or the last error.
+    async fn send_with_retry(
+        &self,
+        request: &CreateMessageRequest,
+        cancel: &CancellationToken,
+    ) -> CcResult<reqwest::Response> {
+        let url = format!("{}/v1/messages", self.base_url);
+        let headers = self.headers()?;
+        let body = serde_json::to_value(request).map_err(CcError::Json)?;
+
+        let mut attempt = 0u32;
+        loop {
+            debug!(model = %request.model, attempt, "sending streaming request");
+
+            let response = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(CcError::Cancelled),
+                result = self.http.post(&url).headers(headers.clone()).json(&body).send() => {
+                    result.map_err(|e| CcError::api(e.to_string()))?
+                }
+            };
+
+            if response.status().is_success() {
+                return Ok(response);
+            }
+
+            let status = response.status();
+            let status_code = status.as_u16();
+
+            // Parse Retry-After header before consuming the body
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable body>".into());
+
+            let err = if status_code == 429 {
+                CcError::RateLimited { retry_after }
+            } else if status_code >= 500 {
+                CcError::api_retryable(format!("HTTP {status}: {text}"), status_code)
+            } else {
+                return Err(CcError::api(format!("HTTP {status}: {text}")));
+            };
+
+            // Check retry policy
+            if let Some(delay) = self.retry.should_retry(&err, attempt) {
+                warn!(attempt, delay_ms = delay.as_millis() as u64, "retrying after transient error");
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(CcError::Cancelled),
+                    _ = tokio::time::sleep(delay) => {},
+                }
+                attempt += 1;
+            } else {
+                return Err(err);
+            }
+        }
+    }
+
     /// Stream a message request, yielding `StreamEvent`s via a channel.
+    /// Retries transient errors (429/5xx) per the retry policy.
     /// Cancellable via the CancellationToken.
     pub async fn stream_message(
         &self,
         request: CreateMessageRequest,
         cancel: &CancellationToken,
     ) -> CcResult<mpsc::Receiver<CcResult<StreamEvent>>> {
-        let url = format!("{}/v1/messages", self.base_url);
-        let headers = self.headers()?;
-
-        let body = serde_json::to_value(&request).map_err(CcError::Json)?;
-
-        debug!(model = %request.model, "starting streaming request");
-
-        let response = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(CcError::Cancelled),
-            result = self.http.post(&url).headers(headers).json(&body).send() => {
-                result.map_err(|e| CcError::api(e.to_string()))?
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let status_code = status.as_u16();
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable body>".into());
-
-            // 429 and 5xx are retryable
-            if status_code == 429 {
-                return Err(CcError::RateLimited { retry_after: None });
-            }
-            if status_code >= 500 {
-                return Err(CcError::api_retryable(
-                    format!("HTTP {status}: {text}"),
-                    status_code,
-                ));
-            }
-            return Err(CcError::api(format!("HTTP {status}: {text}")));
-        }
+        let response = self.send_with_retry(&request, cancel).await?;
 
         let (tx, rx) = mpsc::channel::<CcResult<StreamEvent>>(64);
         let cancel = cancel.clone();
@@ -234,8 +275,8 @@ impl ApiClient {
         let usage = Usage {
             input_tokens: acc.input_tokens,
             output_tokens: acc.output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens: acc.cache_creation_input_tokens,
+            cache_read_input_tokens: acc.cache_read_input_tokens,
         };
         let content = acc.into_content();
 

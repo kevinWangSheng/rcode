@@ -139,4 +139,64 @@ mod tests {
         let config = HttpClientConfig::default().with_timeout(Duration::from_secs(60));
         assert_eq!(config.request_timeout, Some(Duration::from_secs(60)));
     }
+
+    #[test]
+    fn missing_ca_bundle_returns_config_error() {
+        let config = HttpClientConfig {
+            ca_bundle: Some(PathBuf::from("/nonexistent/ca.pem")),
+            ..Default::default()
+        };
+        let err = build_client(&config).unwrap_err();
+        assert!(matches!(err, cc_core::CcError::Config(_)));
+        assert!(err.to_string().contains("/nonexistent/ca.pem"));
+    }
+
+    #[test]
+    fn missing_client_cert_returns_config_error() {
+        let config = HttpClientConfig {
+            client_cert: Some(PathBuf::from("/nonexistent/cert.pem")),
+            client_key: Some(PathBuf::from("/nonexistent/key.pem")),
+            ..Default::default()
+        };
+        let err = build_client(&config).unwrap_err();
+        assert!(matches!(err, cc_core::CcError::Config(_)));
+    }
+
+    #[test]
+    fn from_env_reads_variables() {
+        // Save and clear existing env vars to avoid interference
+        let saved_cert = std::env::var("CLAUDE_CODE_CLIENT_CERT").ok();
+        let saved_key = std::env::var("CLAUDE_CODE_CLIENT_KEY").ok();
+        let saved_ca = std::env::var("CLAUDE_CODE_CA_BUNDLE").ok();
+        let saved_proxy = std::env::var("HTTPS_PROXY").ok();
+
+        std::env::set_var("CLAUDE_CODE_CLIENT_CERT", "/tmp/cert.pem");
+        std::env::set_var("CLAUDE_CODE_CLIENT_KEY", "/tmp/key.pem");
+        std::env::set_var("CLAUDE_CODE_CA_BUNDLE", "/tmp/ca.pem");
+        std::env::set_var("HTTPS_PROXY", "http://proxy:8080");
+
+        let config = HttpClientConfig::from_env();
+        assert_eq!(config.client_cert, Some(PathBuf::from("/tmp/cert.pem")));
+        assert_eq!(config.client_key, Some(PathBuf::from("/tmp/key.pem")));
+        assert_eq!(config.ca_bundle, Some(PathBuf::from("/tmp/ca.pem")));
+        assert_eq!(config.proxy, Some("http://proxy:8080".to_string()));
+
+        // Restore
+        match saved_cert {
+            Some(v) => std::env::set_var("CLAUDE_CODE_CLIENT_CERT", v),
+            None => std::env::remove_var("CLAUDE_CODE_CLIENT_CERT"),
+        }
+        match saved_key {
+            Some(v) => std::env::set_var("CLAUDE_CODE_CLIENT_KEY", v),
+            None => std::env::remove_var("CLAUDE_CODE_CLIENT_KEY"),
+        }
+        match saved_ca {
+            Some(v) => std::env::set_var("CLAUDE_CODE_CA_BUNDLE", v),
+            None => std::env::remove_var("CLAUDE_CODE_CA_BUNDLE"),
+        }
+        match saved_proxy {
+            Some(v) => std::env::set_var("HTTPS_PROXY", v),
+            None => std::env::remove_var("HTTPS_PROXY"),
+        }
+    }
 }

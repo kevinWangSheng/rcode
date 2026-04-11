@@ -2,6 +2,7 @@ use cc_core::CcError;
 use std::time::Duration;
 
 /// Retry configuration for API requests.
+#[derive(Clone)]
 pub struct RetryPolicy {
     pub max_retries: u32,
     pub initial_backoff: Duration,
