@@ -3,8 +3,15 @@
 //! Supports 4 hook kinds: command, prompt, http, agent.
 //! Per Phase 2 §5: config snapshot, matcher filtering, parallel execution,
 //! deduplication, once-per-session, structured JSON output, CLAUDE_ENV_FILE.
+//!
+//! Types (HookConfig, HookInput, etc.) are defined in cc_core::hook.
+//! This crate provides the runtime execution engine.
 
-use serde::{Deserialize, Serialize};
+// Re-export cc_core hook types for convenience of downstream crates.
+pub use cc_core::hook::{
+    HookConfig, HookInput, HookJsonResponse, HookKind, HookMatcherGroup, HookOutcome,
+    HooksSettings,
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,146 +21,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-
-/// Hook kind — how the hook is executed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum HookKind {
-    #[default]
-    Command,
-    Prompt,
-    Http,
-    Agent,
-}
-
-/// A single hook configuration entry (from settings.json).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HookConfig {
-    /// Hook kind; defaults to "command" if not present.
-    #[serde(default, rename = "type")]
-    pub kind: HookKind,
-    /// Shell command to execute (kind=command).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    /// Static prompt text (kind=prompt).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-    /// HTTP endpoint URL (kind=http).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// Subagent identifier (kind=agent).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
-    /// Shell to use (default: "bash").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell: Option<String>,
-    /// Condition expression (e.g. "Bash(git *)").
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "if")]
-    pub if_condition: Option<String>,
-    /// Timeout in seconds (default: 600).
-    #[serde(default = "default_timeout")]
-    pub timeout: u64,
-    /// Status message shown during execution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_message: Option<String>,
-    /// Run at most once per session.
-    #[serde(default)]
-    pub once: bool,
-    /// Run asynchronously (don't block the tool call).
-    #[serde(default, rename = "async")]
-    pub is_async: bool,
-    /// Rewake the conversation after async hook completes.
-    #[serde(default)]
-    pub async_rewake: bool,
-    /// HTTP headers (kind=http).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headers: Option<HashMap<String, String>>,
-    /// Allowed env vars to pass to hook.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_env_vars: Option<Vec<String>>,
-    /// Preserve unknown fields.
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
-}
-
-fn default_timeout() -> u64 {
-    600
-}
-
-/// A matcher group: event + matcher pattern + list of hooks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HookMatcherGroup {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matcher: Option<String>,
-    pub hooks: Vec<HookConfig>,
-}
-
-/// All hooks for all events, as stored in settings.json.
-pub type HooksSettings = HashMap<String, Vec<HookMatcherGroup>>;
-
-/// Data sent to hooks on stdin as JSON.
-#[derive(Debug, Clone, Serialize)]
-pub struct HookInput {
-    pub session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transcript_path: Option<String>,
-    pub cwd: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<String>,
-    pub hook_event_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_input: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_use_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_response: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
-}
-
-/// Structured JSON response from a hook (stdout).
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct HookJsonResponse {
-    #[serde(default, rename = "continue")]
-    pub should_continue: Option<bool>,
-    pub stop_reason: Option<String>,
-    pub decision: Option<String>,
-    pub reason: Option<String>,
-    pub system_message: Option<String>,
-    pub suppress_output: Option<bool>,
-    pub hook_specific_output: Option<HookSpecificOutput>,
-    #[serde(rename = "async", default)]
-    pub is_async: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct HookSpecificOutput {
-    pub permission_decision: Option<String>,
-    pub permission_decision_reason: Option<String>,
-    pub updated_input: Option<Value>,
-    pub additional_context: Option<String>,
-}
-
-/// Outcome of running a single hook.
-#[derive(Debug)]
-pub enum HookOutcome {
-    /// Hook ran successfully.
-    Ok,
-    /// Hook requested a blocking stop.
-    Block(String),
-    /// Hook failed (non-blocking).
-    Failed(String),
-    /// Structured JSON response from hook stdout.
-    Structured(HookJsonResponse),
-}
 
 /// Aggregated result of running all hooks for an event.
 #[derive(Debug, Default)]
@@ -348,12 +215,6 @@ impl HookRunner {
                     debug!("hook failed (non-blocking): {msg}");
                     result.failures.push(msg);
                 }
-                HookOutcome::Structured(resp) => {
-                    if resp.decision.as_deref() == Some("block") {
-                        result.blocked = true;
-                        result.block_message = resp.reason.or(resp.stop_reason);
-                    }
-                }
             }
         }
 
@@ -425,8 +286,9 @@ async fn execute_one_hook(
             run_command_hook(command, input_json, shell, env_file_path).await
         }
         HookKind::Prompt => {
-            let Some(text) = hook.prompt.as_deref().filter(|s| !s.is_empty()) else {
-                warn!("prompt hook missing `prompt` field; skipping");
+            // cc-core uses `text` field (with `prompt` as serde alias)
+            let Some(text) = hook.text.as_deref().filter(|s| !s.is_empty()) else {
+                warn!("prompt hook missing `text`/`prompt` field; skipping");
                 return HookOutcome::Ok;
             };
             HookOutcome::Block(text.to_string())
@@ -483,7 +345,12 @@ async fn run_command_hook(
 
     // Try to parse structured JSON from stdout
     if let Ok(resp) = serde_json::from_str::<HookJsonResponse>(&stdout) {
-        return HookOutcome::Structured(resp);
+        if resp.decision.as_deref() == Some("block") {
+            let msg = resp.reason.or(resp.stop_reason).unwrap_or_default();
+            return HookOutcome::Block(msg);
+        }
+        // Structured response but not blocking — treat as Ok
+        return HookOutcome::Ok;
     }
 
     if exit_code == 2 {
@@ -529,7 +396,11 @@ async fn run_http_hook(
 
     // Try structured JSON response
     if let Ok(resp) = serde_json::from_str::<HookJsonResponse>(&body) {
-        return HookOutcome::Structured(resp);
+        if resp.decision.as_deref() == Some("block") {
+            let msg = resp.reason.or(resp.stop_reason).unwrap_or_default();
+            return HookOutcome::Block(msg);
+        }
+        return HookOutcome::Ok;
     }
 
     // Legacy: {"block": true, "message": "..."} format
@@ -551,9 +422,17 @@ async fn run_http_hook(
 /// Build a deduplication key for a hook config.
 fn hook_key(h: &HookConfig) -> HookKey {
     HookKey {
-        command_or_url: h.command.clone().or_else(|| h.url.clone()).unwrap_or_default(),
+        command_or_url: h
+            .command
+            .clone()
+            .or_else(|| h.url.clone())
+            .unwrap_or_default(),
         if_condition: h.if_condition.clone(),
-        namespace: h.extra.get("namespace").and_then(|v| v.as_str()).map(String::from),
+        namespace: h
+            .extra
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
@@ -593,19 +472,51 @@ fn read_env_exports(path: &Path) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cc_core::hook::{HookConfig, HookInput, HookKind, HookMatcherGroup, HooksSettings};
+
+    fn test_input(event: &str) -> HookInput {
+        HookInput {
+            session_id: "test".into(),
+            transcript_path: None,
+            cwd: "/tmp".into(),
+            permission_mode: None,
+            hook_event_name: event.into(),
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_response: None,
+            source: None,
+            model: None,
+            message: None,
+            agent_id: None,
+        }
+    }
 
     #[test]
-    fn hook_kind_default_is_command() {
+    fn hook_config_defaults() {
         let cfg: HookConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.kind, HookKind::Command);
+        assert_eq!(cfg.timeout, 600);
+        assert!(!cfg.once);
+        assert!(!cfg.is_async);
     }
 
     #[test]
     fn parses_prompt_hook() {
-        let json = r#"{"type":"prompt","prompt":"You are concise."}"#;
+        // cc-core HookConfig uses `text` field with `prompt` as alias
+        let json = r#"{"type":"prompt","text":"You are concise."}"#;
         let cfg: HookConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.kind, HookKind::Prompt);
-        assert_eq!(cfg.prompt.as_deref(), Some("You are concise."));
+        assert_eq!(cfg.text.as_deref(), Some("You are concise."));
+    }
+
+    #[test]
+    fn parses_prompt_hook_alias() {
+        // The "prompt" alias also works
+        let json = r#"{"type":"prompt","prompt":"Be careful."}"#;
+        let cfg: HookConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.kind, HookKind::Prompt);
+        assert_eq!(cfg.text.as_deref(), Some("Be careful."));
     }
 
     #[test]
@@ -634,7 +545,8 @@ mod tests {
 
     #[test]
     fn matcher_group_deserialization() {
-        let json = r#"{"matcher":"Bash(git *)","hooks":[{"type":"command","command":"echo hi"}]}"#;
+        let json =
+            r#"{"matcher":"Bash(git *)","hooks":[{"type":"command","command":"echo hi"}]}"#;
         let group: HookMatcherGroup = serde_json::from_str(json).unwrap();
         assert_eq!(group.matcher.as_deref(), Some("Bash(git *)"));
         assert_eq!(group.hooks.len(), 1);
@@ -661,26 +573,14 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_hook_blocks_with_text() {
-        let settings: HooksSettings = serde_json::from_str(r#"{
-            "PreToolUse": [{"hooks": [{"type": "prompt", "prompt": "be careful"}]}]
-        }"#)
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "prompt", "text": "be careful"}]}]
+        }"#,
+        )
         .unwrap();
         let runner = HookRunner::new(&settings, reqwest::Client::new());
-        let input = HookInput {
-            session_id: "test".into(),
-            transcript_path: None,
-            cwd: "/tmp".into(),
-            permission_mode: None,
-            hook_event_name: "PreToolUse".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: None,
-            message: None,
-            agent_id: None,
-        };
+        let input = test_input("PreToolUse");
         let cancel = CancellationToken::new();
         let result = runner.run("PreToolUse", &input, &cancel).await;
         assert!(result.blocked);
@@ -689,26 +589,14 @@ mod tests {
 
     #[tokio::test]
     async fn command_hook_exit_2_blocks() {
-        let settings: HooksSettings = serde_json::from_str(r#"{
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
             "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'no go' && exit 2"}]}]
-        }"#)
+        }"#,
+        )
         .unwrap();
         let runner = HookRunner::new(&settings, reqwest::Client::new());
-        let input = HookInput {
-            session_id: "test".into(),
-            transcript_path: None,
-            cwd: "/tmp".into(),
-            permission_mode: None,
-            hook_event_name: "PreToolUse".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: None,
-            message: None,
-            agent_id: None,
-        };
+        let input = test_input("PreToolUse");
         let cancel = CancellationToken::new();
         let result = runner.run("PreToolUse", &input, &cancel).await;
         assert!(result.blocked);
@@ -717,26 +605,14 @@ mod tests {
 
     #[tokio::test]
     async fn once_hook_fires_only_once() {
-        let settings: HooksSettings = serde_json::from_str(r#"{
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
             "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'blocked' && exit 2", "once": true}]}]
-        }"#)
+        }"#,
+        )
         .unwrap();
         let runner = HookRunner::new(&settings, reqwest::Client::new());
-        let input = HookInput {
-            session_id: "test".into(),
-            transcript_path: None,
-            cwd: "/tmp".into(),
-            permission_mode: None,
-            hook_event_name: "PreToolUse".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: None,
-            message: None,
-            agent_id: None,
-        };
+        let input = test_input("PreToolUse");
         let cancel = CancellationToken::new();
 
         // First run should block
@@ -751,21 +627,7 @@ mod tests {
     #[tokio::test]
     async fn empty_runner_returns_empty_result() {
         let runner = HookRunner::empty();
-        let input = HookInput {
-            session_id: "test".into(),
-            transcript_path: None,
-            cwd: "/tmp".into(),
-            permission_mode: None,
-            hook_event_name: "PreToolUse".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: None,
-            message: None,
-            agent_id: None,
-        };
+        let input = test_input("PreToolUse");
         let cancel = CancellationToken::new();
         let result = runner.run("PreToolUse", &input, &cancel).await;
         assert!(!result.blocked);
@@ -773,37 +635,21 @@ mod tests {
 
     #[tokio::test]
     async fn session_hooks_are_merged() {
-        // Start with no config hooks
         let runner = HookRunner::new(&HooksSettings::new(), reqwest::Client::new());
 
-        // Add a session-scoped blocking hook
         runner.add_session_hook(
             "PreToolUse",
             HookMatcherGroup {
                 matcher: None,
                 hooks: vec![HookConfig {
                     kind: HookKind::Prompt,
-                    prompt: Some("session block".into()),
+                    text: Some("session block".into()),
                     ..Default::default()
                 }],
             },
         );
 
-        let input = HookInput {
-            session_id: "test".into(),
-            transcript_path: None,
-            cwd: "/tmp".into(),
-            permission_mode: None,
-            hook_event_name: "PreToolUse".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: None,
-            message: None,
-            agent_id: None,
-        };
+        let input = test_input("PreToolUse");
         let cancel = CancellationToken::new();
         let result = runner.run("PreToolUse", &input, &cancel).await;
         assert!(result.blocked);

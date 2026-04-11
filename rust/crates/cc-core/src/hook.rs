@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 /// All hook event names (from TS source).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub enum HookEvent {
     // Tool lifecycle
     PreToolUse,
@@ -24,9 +25,10 @@ pub enum HookEvent {
 }
 
 /// Hook execution type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HookKind {
+    #[default]
     Command, // shell command, JSON on stdin
     Prompt,  // text injected into context
     Http,    // POST JSON to URL
@@ -56,7 +58,12 @@ pub struct HookConfig {
     pub kind: HookKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Prompt text for kind=prompt (also accepts "prompt" key from settings).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "prompt"
+    )]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -85,6 +92,29 @@ pub struct HookConfig {
     /// Forward-compat: preserve unknown fields.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+impl Default for HookConfig {
+    fn default() -> Self {
+        Self {
+            kind: HookKind::Command,
+            command: None,
+            text: None,
+            url: None,
+            agent: None,
+            timeout: 600,
+            matcher: None,
+            if_condition: None,
+            shell: None,
+            status_message: None,
+            once: false,
+            is_async: false,
+            async_rewake: false,
+            headers: None,
+            allowed_env_vars: None,
+            extra: HashMap::new(),
+        }
+    }
 }
 
 /// A matcher group: event + matcher pattern + list of hooks.
@@ -132,9 +162,11 @@ pub struct HookSpecificOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct HookInput {
     pub session_id: String,
-    pub transcript_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub cwd: String,
-    pub permission_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     pub hook_event_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -166,6 +198,24 @@ mod tests {
         assert_eq!(config.timeout, 600);
         assert!(!config.once);
         assert!(!config.is_async);
+    }
+
+    #[test]
+    fn hook_event_pascal_case_serialization() {
+        assert_eq!(
+            serde_json::to_string(&HookEvent::PreToolUse).unwrap(),
+            "\"PreToolUse\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookEvent::SessionStart).unwrap(),
+            "\"SessionStart\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HookEvent::PostApiCall).unwrap(),
+            "\"PostApiCall\""
+        );
+        let event: HookEvent = serde_json::from_str("\"SubagentStop\"").unwrap();
+        assert_eq!(event, HookEvent::SubagentStop);
     }
 
     #[test]
