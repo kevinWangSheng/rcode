@@ -7,6 +7,24 @@ pub use keychain::{
 
 use cc_core::{CcError, CcResult};
 
+/// Authentication credential — used by cc-api for request signing.
+#[derive(Debug, Clone)]
+pub enum AuthCredential {
+    /// Direct API key → `x-api-key` header.
+    ApiKey(String),
+    /// OAuth token → `Authorization: Bearer` header + `anthropic-beta: oauth-2025-04-20`.
+    OAuthToken(String),
+}
+
+impl From<Credentials> for AuthCredential {
+    fn from(creds: Credentials) -> Self {
+        match creds {
+            Credentials::ApiKey(k) => AuthCredential::ApiKey(k),
+            Credentials::OAuthToken(t) => AuthCredential::OAuthToken(t),
+        }
+    }
+}
+
 /// Resolve the credentials to use for API calls.
 ///
 /// Priority order:
@@ -42,5 +60,61 @@ pub fn resolve_api_key() -> CcResult<(String, ApiKeySource)> {
         (Credentials::OAuthToken(_), _) => Err(CcError::Auth(
             "OAuth token found but direct API key required for this operation".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_var_credentials_take_priority() {
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test-key-12345");
+
+        let result = resolve_credentials();
+        assert!(result.is_ok());
+        let (creds, source) = result.unwrap();
+        assert!(matches!(creds, Credentials::ApiKey(k) if k == "sk-test-key-12345"));
+        assert_eq!(source, ApiKeySource::EnvVar);
+
+        match saved {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn empty_env_var_is_skipped() {
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "");
+
+        // Should not match the env var path — may fallback to keychain or error
+        let result = resolve_credentials();
+        // We can't assert Ok/Err because keychain state varies, but we verify
+        // it doesn't return an empty API key
+        if let Ok((Credentials::ApiKey(k), _)) = &result {
+            assert!(!k.is_empty());
+        }
+
+        match saved {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn auth_credential_from_credentials() {
+        let api = AuthCredential::from(Credentials::ApiKey("key".into()));
+        assert!(matches!(api, AuthCredential::ApiKey(k) if k == "key"));
+
+        let oauth = AuthCredential::from(Credentials::OAuthToken("token".into()));
+        assert!(matches!(oauth, AuthCredential::OAuthToken(t) if t == "token"));
+    }
+
+    #[test]
+    fn api_key_source_display() {
+        assert_eq!(ApiKeySource::EnvVar.to_string(), "ANTHROPIC_API_KEY env var");
+        assert_eq!(ApiKeySource::Keychain.to_string(), "system keychain");
     }
 }

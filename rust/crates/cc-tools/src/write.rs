@@ -59,3 +59,55 @@ impl Tool for WriteTool {
         Ok(ToolResult::ok(format!("File written successfully to {file_path}")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn write_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("new.txt");
+
+        let tool = WriteTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(
+            json!({"file_path": file.to_string_lossy(), "content": "hello world"}),
+            &cancel,
+        ).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn write_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a").join("b").join("c.txt");
+
+        let tool = WriteTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(
+            json!({"file_path": file.to_string_lossy(), "content": "deep"}),
+            &cancel,
+        ).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "deep");
+    }
+
+    #[tokio::test]
+    async fn write_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("existing.txt");
+        std::fs::write(&file, "old content").unwrap();
+
+        let tool = WriteTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(
+            json!({"file_path": file.to_string_lossy(), "content": "new content"}),
+            &cancel,
+        ).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new content");
+    }
+}

@@ -94,3 +94,50 @@ impl Tool for BashTool {
         Ok(ToolResult::ok(content))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn bash_echo() {
+        let tool = BashTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(json!({"command": "echo hello"}), &cancel).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content, "hello");
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_includes_code_no_is_error() {
+        let tool = BashTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(json!({"command": "exit 42"}), &cancel).await.unwrap();
+        // Per behavior contract: no is_error for bash failures
+        assert!(!result.is_error);
+        assert!(result.content.contains("Exit code: 42"));
+    }
+
+    #[tokio::test]
+    async fn bash_stderr_included_on_failure() {
+        let tool = BashTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(json!({"command": "echo err >&2 && exit 1"}), &cancel).await.unwrap();
+        assert!(result.content.contains("STDERR:"));
+        assert!(result.content.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn bash_missing_command_errors() {
+        let tool = BashTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(json!({}), &cancel).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bash_is_not_read_only() {
+        assert!(!BashTool.is_read_only());
+    }
+}

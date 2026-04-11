@@ -7,3 +7,6 @@ edition.workspace = true
 cc-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

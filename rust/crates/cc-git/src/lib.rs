@@ -135,4 +135,75 @@ mod tests {
         // no panic and no crash.
         let _ = ctx.to_system_text();
     }
+
+    #[tokio::test]
+    async fn collect_in_real_git_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+
+        // Initialize a real git repo
+        let init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output();
+
+        // Skip if git is not available
+        let Ok(output) = init else { return };
+        if !output.status.success() {
+            return;
+        }
+
+        // Configure user for commit
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(repo)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo)
+            .output();
+
+        // Create a commit so there's history
+        std::fs::write(repo.join("README.md"), "hello").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(repo)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(repo)
+            .output();
+
+        let ctx = GitContext::collect(repo).await;
+        assert!(ctx.branch.is_some());
+        assert!(ctx.repo_root.is_some());
+        assert!(!ctx.recent_commits.is_empty());
+
+        let text = ctx.to_system_text().expect("should have system text");
+        assert!(text.contains("Current git branch:"));
+        assert!(text.contains("Recent commits:"));
+        assert!(text.contains("initial"));
+    }
+
+    #[tokio::test]
+    async fn collect_in_nested_subdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path();
+
+        let init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output();
+        let Ok(output) = init else { return };
+        if !output.status.success() {
+            return;
+        }
+
+        let nested = repo.join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let ctx = GitContext::collect(&nested).await;
+        // Should still find the git repo root from a nested dir
+        assert!(ctx.repo_root.is_some());
+    }
 }

@@ -388,6 +388,88 @@ mod tests {
     }
 
     #[test]
+    fn merge_order_local_over_project_over_user() {
+        let sources = SettingsSources {
+            plugin_base: None,
+            user: Some(Settings {
+                model: Some("user-model".into()),
+                ..Default::default()
+            }),
+            project: Some(Settings {
+                model: Some("project-model".into()),
+                ..Default::default()
+            }),
+            local: Some(Settings {
+                model: Some("local-model".into()),
+                ..Default::default()
+            }),
+            flag: None,
+            policy: None,
+        };
+        let merged = merge_sources(sources);
+        assert_eq!(merged.model.as_deref(), Some("local-model"));
+    }
+
+    #[test]
+    fn merge_preserves_unknown_fields_from_all_layers() {
+        let user: Settings = serde_json::from_str(r#"{"customUserField": 1}"#).unwrap();
+        let project: Settings =
+            serde_json::from_str(r#"{"customProjectField": 2}"#).unwrap();
+        let sources = SettingsSources {
+            plugin_base: None,
+            user: Some(user),
+            project: Some(project),
+            local: None,
+            flag: None,
+            policy: None,
+        };
+        let merged = merge_sources(sources);
+        assert!(merged.extra.contains_key("customUserField"));
+        assert!(merged.extra.contains_key("customProjectField"));
+    }
+
+    #[test]
+    fn resolved_config_from_tempdir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = crate::project::ProjectContext::from_cwd(tmp.path());
+        let config = ResolvedConfig::resolve(project, Some("opus"), 4096, None).unwrap();
+        assert_eq!(config.model, cc_core::models::CLAUDE_OPUS_4_6);
+        assert_eq!(config.max_tokens, 4096);
+    }
+
+    #[test]
+    fn load_settings_from_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create ~/.claude/ equivalent
+        let global_dir = tmp.path().join("home").join(".claude");
+        std::fs::create_dir_all(&global_dir).unwrap();
+
+        // Create project .claude/
+        let project_dir = tmp.path().join("project").join(".claude");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("settings.json"),
+            r#"{"model": "from-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("settings.local.json"),
+            r#"{"model": "from-local"}"#,
+        )
+        .unwrap();
+
+        // Discover with project root
+        let project = crate::project::ProjectContext::from_cwd(&tmp.path().join("project"));
+        let sources = discover_sources(&project, None).unwrap();
+        // Project and local should be loaded
+        assert!(sources.project.is_some() || sources.local.is_some());
+        let merged = merge_sources(sources);
+        // Local overrides project
+        assert_eq!(merged.model.as_deref(), Some("from-local"));
+    }
+
+    #[test]
     fn hooks_and_mcp_roundtrip() {
         let json = r#"{
             "hooks": {

@@ -83,3 +83,62 @@ impl Tool for ReadTool {
         Ok(ToolResult::ok(numbered.join("\n")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn read_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
+
+        let tool = ReadTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(
+            json!({"file_path": file.to_string_lossy()}),
+            &cancel,
+        ).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("1\tline1"));
+        assert!(result.content.contains("2\tline2"));
+        assert!(result.content.contains("3\tline3"));
+    }
+
+    #[tokio::test]
+    async fn read_not_found() {
+        let tool = ReadTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(
+            json!({"file_path": "/nonexistent/file.txt"}),
+            &cancel,
+        ).await.unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn read_with_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lines.txt");
+        std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
+
+        let tool = ReadTool;
+        let cancel = CancellationToken::new();
+        let result = tool.execute(
+            json!({"file_path": file.to_string_lossy(), "offset": 2, "limit": 2}),
+            &cancel,
+        ).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("2\tb"));
+        assert!(result.content.contains("3\tc"));
+        assert!(!result.content.contains("1\ta"));
+    }
+
+    #[test]
+    fn read_is_read_only() {
+        assert!(ReadTool.is_read_only());
+    }
+}

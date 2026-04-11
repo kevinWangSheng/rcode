@@ -439,6 +439,106 @@ mod tests {
     }
 
     #[test]
+    fn circular_include_does_not_loop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        // a.md includes b.md, b.md includes a.md
+        std::fs::write(root.join("a.md"), "@./b.md\nContent A").unwrap();
+        std::fs::write(root.join("b.md"), "@./a.md\nContent B").unwrap();
+
+        let mut processed = HashSet::new();
+        let included = resolve_includes(
+            &std::fs::read_to_string(root.join("a.md")).unwrap(),
+            root,
+            MemoryType::Project,
+            &mut processed,
+        );
+        // Should include b.md but NOT re-include a.md (circular ref prevented)
+        assert_eq!(included.len(), 1);
+        assert!(included[0].content.contains("Content B"));
+    }
+
+    #[test]
+    fn load_claudemd_walk_up_finds_all_levels() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let nested = root.join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // CLAUDE.md at root
+        std::fs::write(root.join("CLAUDE.md"), "Root instructions").unwrap();
+        // CLAUDE.md at src/
+        std::fs::write(root.join("src").join("CLAUDE.md"), "Src instructions").unwrap();
+        // CLAUDE.local.md at src/deep/
+        std::fs::write(nested.join("CLAUDE.local.md"), "Local overrides").unwrap();
+
+        let files = load_claudemd_walk_up(&nested, root);
+        assert!(files.len() >= 3);
+
+        let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+        assert!(contents.iter().any(|c| c.contains("Root instructions")));
+        assert!(contents.iter().any(|c| c.contains("Src instructions")));
+        assert!(contents.iter().any(|c| c.contains("Local overrides")));
+    }
+
+    #[test]
+    fn at_include_resolves_relative_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("rules.md"), "Shared rules content").unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "@./rules.md\nMain content").unwrap();
+
+        let mut processed = HashSet::new();
+        let included = resolve_includes(
+            &std::fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+            root,
+            MemoryType::Project,
+            &mut processed,
+        );
+        assert_eq!(included.len(), 1);
+        assert!(included[0].content.contains("Shared rules content"));
+        assert!(included[0].parent.is_some());
+    }
+
+    #[test]
+    fn at_include_ignores_unsupported_extensions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        std::fs::write(root.join("script.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "@./script.rs\nContent").unwrap();
+
+        let mut processed = HashSet::new();
+        let included = resolve_includes(
+            &std::fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+            root,
+            MemoryType::Project,
+            &mut processed,
+        );
+        // .rs is not a supported extension for includes
+        assert!(included.is_empty());
+    }
+
+    #[test]
+    fn load_memory_files_integration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Create project CLAUDE.md
+        std::fs::write(root.join("CLAUDE.md"), "---\nname: proj\n---\nProject rules").unwrap();
+
+        let sources = cc_config::SettingsSourcesEnabled {
+            user: false, // don't touch real ~/.claude/memory/
+            project: true,
+            local: true,
+        };
+        let files = load_memory_files(root, root, &sources);
+        assert!(files.iter().any(|f| f.content.contains("Project rules")));
+    }
+
+    #[test]
     fn yaml_list_parsing() {
         let fm = "globs: [*.rs, *.ts]\nname: test";
         let globs = extract_yaml_list(fm, "globs").unwrap();

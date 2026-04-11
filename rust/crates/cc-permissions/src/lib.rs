@@ -7,10 +7,14 @@ use serde_json::Value;
 ///   "Bash(*)"         — same (wildcard input matches all)
 ///   "Write(**)"       — matches any Write call
 ///   "mcp__fs__*"      — glob on tool name
+///   {"tool": "Bash", "input": {"command": "git *"}} — structured with input matching
 #[derive(Debug, Clone)]
 pub struct PermissionRule {
     /// Tool name pattern (may contain `*`).
     pub tool_pattern: String,
+    /// Optional input pattern — if set, all specified fields must match.
+    /// Each value is a glob pattern matched against the corresponding field in tool input.
+    pub input_pattern: Option<Value>,
 }
 
 impl PermissionRule {
@@ -21,7 +25,10 @@ impl PermissionRule {
             .split_once('(')
             .map(|(name, _)| name.trim().to_string())
             .unwrap_or(raw);
-        PermissionRule { tool_pattern }
+        PermissionRule {
+            tool_pattern,
+            input_pattern: None,
+        }
     }
 
     /// Parse from a JSON value: string → simple rule, object → structured rule.
@@ -29,17 +36,65 @@ impl PermissionRule {
         match val {
             Value::String(s) => Some(Self::new(s)),
             Value::Object(ref obj) => {
-                // Structured rule: { "tool": "Bash", "input": {...} }
                 let tool = obj.get("tool")?.as_str()?;
-                Some(Self::new(tool))
+                let input = obj.get("input").cloned();
+                Some(PermissionRule {
+                    tool_pattern: tool.to_string(),
+                    input_pattern: input,
+                })
             }
             _ => None,
         }
     }
 
-    /// Check whether this rule matches the given tool name.
+    /// Check whether this rule matches the given tool name and input.
+    pub fn matches(&self, tool_name: &str, tool_input: &Value) -> bool {
+        if !glob_match(&self.tool_pattern, tool_name) {
+            return false;
+        }
+        // If no input pattern, tool name match is sufficient
+        let Some(ref pattern) = self.input_pattern else {
+            return true;
+        };
+        input_matches(pattern, tool_input)
+    }
+
+    /// Check whether this rule matches just the tool name (legacy compat).
     pub fn matches_tool(&self, tool_name: &str) -> bool {
         glob_match(&self.tool_pattern, tool_name)
+    }
+}
+
+/// Check if a tool input matches an input pattern.
+/// Pattern fields are glob-matched against corresponding input fields.
+/// All pattern fields must match for the overall match to succeed.
+fn input_matches(pattern: &Value, input: &Value) -> bool {
+    match (pattern, input) {
+        (Value::Object(pat), Value::Object(inp)) => {
+            for (key, pat_val) in pat {
+                let Some(inp_val) = inp.get(key) else {
+                    return false;
+                };
+                match pat_val {
+                    Value::String(pat_str) => {
+                        let inp_str = match inp_val {
+                            Value::String(s) => s.as_str(),
+                            _ => return false,
+                        };
+                        if !glob_match(pat_str, inp_str) {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        if !input_matches(pat_val, inp_val) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        _ => pattern == input,
     }
 }
 
@@ -104,7 +159,7 @@ impl PermissionEngine {
     /// Evaluate the permission for a tool call, returning the decision with audit trail.
     ///
     /// Priority: bypass → deny → session allow → settings allow → Ask
-    pub fn check(&self, tool_name: &str, _input: &Value) -> PermissionResult {
+    pub fn check(&self, tool_name: &str, input: &Value) -> PermissionResult {
         // 0. Bypass mode
         if self.bypass {
             return PermissionResult::allow(PermissionSource::BypassFlag);
@@ -112,7 +167,7 @@ impl PermissionEngine {
 
         // 1. Deny rules (highest priority)
         for rule in &self.deny_rules {
-            if rule.matches_tool(tool_name) {
+            if rule.matches(tool_name, input) {
                 return PermissionResult::deny(
                     PermissionSource::SettingsDeny,
                     format!("denied by rule: {}", rule.tool_pattern),
@@ -122,14 +177,14 @@ impl PermissionEngine {
 
         // 2. Session-level allows (user approved this session)
         for rule in &self.session_allow {
-            if rule.matches_tool(tool_name) {
+            if rule.matches(tool_name, input) {
                 return PermissionResult::allow(PermissionSource::SessionAllow);
             }
         }
 
         // 3. Settings allow rules
         for rule in &self.allow_rules {
-            if rule.matches_tool(tool_name) {
+            if rule.matches(tool_name, input) {
                 return PermissionResult::allow(PermissionSource::SettingsAllow);
             }
         }
@@ -210,5 +265,66 @@ mod tests {
         let val = json!({"tool": "Bash", "input": {"command": "git *"}});
         let rule = PermissionRule::from_value(val).unwrap();
         assert!(rule.matches_tool("Bash"));
+    }
+
+    #[test]
+    fn structured_rule_input_matching() {
+        let val = json!({"tool": "Bash", "input": {"command": "git *"}});
+        let rule = PermissionRule::from_value(val).unwrap();
+
+        // Should match git commands
+        assert!(rule.matches("Bash", &json!({"command": "git status"})));
+        assert!(rule.matches("Bash", &json!({"command": "git push origin main"})));
+
+        // Should NOT match non-git commands
+        assert!(!rule.matches("Bash", &json!({"command": "rm -rf /"})));
+        assert!(!rule.matches("Bash", &json!({"command": "ls -la"})));
+
+        // Wrong tool name
+        assert!(!rule.matches("Write", &json!({"command": "git status"})));
+    }
+
+    #[test]
+    fn structured_rule_missing_input_field() {
+        let val = json!({"tool": "Bash", "input": {"command": "git *"}});
+        let rule = PermissionRule::from_value(val).unwrap();
+
+        // Missing the "command" field entirely
+        assert!(!rule.matches("Bash", &json!({})));
+        assert!(!rule.matches("Bash", &json!({"other": "value"})));
+    }
+
+    #[test]
+    fn structured_allow_in_engine() {
+        let engine = PermissionEngine::from_settings(
+            [json!({"tool": "Bash", "input": {"command": "git *"}})],
+            Vec::<Value>::new(),
+        );
+
+        // git commands allowed
+        let result = engine.check("Bash", &json!({"command": "git status"}));
+        assert_eq!(result.behavior, PermissionBehavior::Allow);
+
+        // non-git commands require asking
+        let result = engine.check("Bash", &json!({"command": "rm -rf /"}));
+        assert_eq!(result.behavior, PermissionBehavior::Ask);
+    }
+
+    #[test]
+    fn mcp_tool_glob_pattern() {
+        let engine =
+            PermissionEngine::from_settings([json!("mcp__fs__*")], Vec::<Value>::new());
+        assert_eq!(
+            engine.check("mcp__fs__read_file", &json!({})).behavior,
+            PermissionBehavior::Allow
+        );
+        assert_eq!(
+            engine.check("mcp__fs__write_file", &json!({})).behavior,
+            PermissionBehavior::Allow
+        );
+        assert_eq!(
+            engine.check("mcp__other__tool", &json!({})).behavior,
+            PermissionBehavior::Ask
+        );
     }
 }
