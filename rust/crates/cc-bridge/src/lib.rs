@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use cc_api::ApiClient;
-use cc_core::{MessageParam, SystemBlock};
+use cc_core::{MessageParam, PermissionPrompter, SystemBlock};
 use cc_hooks::HookRunner;
 use cc_permissions::PermissionEngine;
-use cc_query::{QueryEngine, QueryOptions, ToolRegistry};
+use cc_query::{QueryEngine, QueryOptions, StdinPrompter, ToolRegistry};
 use cc_session::Session;
 use cc_tools::Tool;
+use tokio_util::sync::CancellationToken;
 
 /// One-shot request — everything the bridge needs to run a single turn.
 pub struct BridgeRequest {
@@ -88,20 +89,24 @@ where
         registry.register(tool);
     }
 
+    let prompter: Arc<dyn PermissionPrompter> =
+        Arc::new(StdinPrompter::new(non_interactive));
     let mut engine = QueryEngine::new(
         api,
         Arc::new(registry),
         permissions,
-        hooks,
+        Arc::new(hooks),
         session,
         system_blocks,
         options,
+        prompter,
     );
 
     let session_id = engine.session().id.clone();
+    let cancel = CancellationToken::new();
 
     let content = engine
-        .run_turn(user_text, |delta| on_text(delta), &mut initial_messages)
+        .run_turn(user_text, |delta| on_text(delta), &mut initial_messages, &cancel)
         .await
         .map_err(|e| BridgeError::Engine(e.to_string()))?;
 

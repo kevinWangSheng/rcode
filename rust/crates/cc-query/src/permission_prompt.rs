@@ -1,16 +1,6 @@
+use cc_core::PromptDecision;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
-
-/// Result of an interactive permission prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptDecision {
-    /// Allow this once.
-    Allow,
-    /// Allow always for this tool (engine adds session rule).
-    AllowAlways,
-    /// Deny this call.
-    Deny,
-}
 
 /// Stdin/stderr prompt — used by the headless `StdinPrompter`.
 ///

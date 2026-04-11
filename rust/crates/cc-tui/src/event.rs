@@ -9,8 +9,7 @@ use crossterm::event::KeyEvent;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use cc_core::Usage;
-use cc_query::PromptDecision;
+use cc_core::{PromptDecision, Usage};
 
 /// Events delivered to the main loop on a single mpsc channel.
 #[derive(Debug)]

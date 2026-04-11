@@ -213,6 +213,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -249,6 +250,7 @@ name = "cc-git"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -393,6 +395,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -487,6 +490,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -6,7 +6,7 @@
 use crate::app::{App, AppMode, PendingPermission};
 use crate::commands::{parse, CommandOutcome, CommandRegistry};
 use cc_core::Usage;
-use cc_query::PromptDecision;
+use cc_core::PromptDecision;
 use tokio::sync::oneshot;
 
 /// All actions the TUI can take.

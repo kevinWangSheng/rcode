@@ -1,7 +1,8 @@
-use cc_api::{ApiClient, CreateMessageRequest, StreamDelta};
+use cc_api::{ApiClient, CreateMessageRequest, StreamDelta, UsageTracker};
 use cc_core::{
-    CcError, CcResult, ContentBlock, MessageContent, MessageParam, Role, StopReason,
-    SystemBlock, ToolResultBlock, ToolUseBlock,
+    AppEvent, CcError, CcResult, ContentBlock, MessageContent, MessageParam, PermissionBehavior,
+    PermissionPrompter, PromptDecision, Role, StopReason, SystemBlock, ToolResultBlock,
+    ToolUseBlock,
 };
 use cc_hooks::{HookInput, HookRunner};
 use cc_permissions::PermissionEngine;
@@ -9,11 +10,10 @@ use cc_session::Session;
 use cc_tools::ToolResult;
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::permission_prompt::PromptDecision;
-use crate::prompter::{PermissionPrompter, StdinPrompter};
 use crate::tool_registry::ToolRegistry;
 
 /// Maximum turns in a single `run_conversation` call.
@@ -46,28 +46,29 @@ pub struct QueryEngine {
     api: ApiClient,
     tools: Arc<ToolRegistry>,
     permissions: PermissionEngine,
-    hooks: HookRunner,
+    hooks: Arc<HookRunner>,
     session: Session,
     system_blocks: Vec<SystemBlock>,
     options: QueryOptions,
     prompter: Arc<dyn PermissionPrompter>,
+    usage: UsageTracker,
+    events_tx: Option<mpsc::Sender<AppEvent>>,
     /// Set to `true` when auto-compact fires inside the most recent `run_turn`.
-    /// The TUI reads this on `EngineDone` to render a compaction boundary in
-    /// the transcript. Cleared at the start of every `run_turn`.
     compacted_last_turn: bool,
 }
 
 impl QueryEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         api: ApiClient,
         tools: Arc<ToolRegistry>,
         permissions: PermissionEngine,
-        hooks: HookRunner,
+        hooks: Arc<HookRunner>,
         session: Session,
         system_blocks: Vec<SystemBlock>,
         options: QueryOptions,
+        prompter: Arc<dyn PermissionPrompter>,
     ) -> Self {
-        let non_interactive = options.non_interactive;
         QueryEngine {
             api,
             tools,
@@ -76,9 +77,17 @@ impl QueryEngine {
             session,
             system_blocks,
             options,
-            prompter: Arc::new(StdinPrompter::new(non_interactive)),
+            prompter,
+            usage: UsageTracker::default(),
+            events_tx: None,
             compacted_last_turn: false,
         }
+    }
+
+    /// Set the TUI event channel for emitting `AppEvent`s.
+    pub fn with_events(mut self, tx: mpsc::Sender<AppEvent>) -> Self {
+        self.events_tx = Some(tx);
+        self
     }
 
     /// Whether auto-compact fired during the most recently completed
@@ -87,27 +96,30 @@ impl QueryEngine {
         self.compacted_last_turn
     }
 
-    /// Override the permission prompter (e.g. inject a TUI dialog prompter).
-    pub fn with_prompter(mut self, prompter: Arc<dyn PermissionPrompter>) -> Self {
-        self.prompter = prompter;
-        self
-    }
-
     pub fn session(&self) -> &Session {
         &self.session
     }
 
-    /// Read-only view of the active model id. Used by the TUI to render
-    /// `/model` and `/config` without having to track it separately.
+    /// Read-only access to the cumulative usage tracker.
+    pub fn usage(&self) -> &UsageTracker {
+        &self.usage
+    }
+
+    /// Read-only view of the active model id.
     pub fn model(&self) -> &str {
         &self.options.model
     }
 
-    /// Switch the active model in place. The next `run_turn` call uses the new
-    /// id; in-flight turns are not affected. Caller is responsible for passing
-    /// a fully-qualified model id (use `cc_config::expand_model_alias`).
+    /// Switch the active model in place.
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.options.model = model.into();
+    }
+
+    /// Emit an event to the TUI if a channel is connected.
+    async fn emit(&self, event: AppEvent) {
+        if let Some(tx) = &self.events_tx {
+            let _ = tx.send(event).await;
+        }
     }
 
     /// Run a complete conversation turn: add user message, loop until end_turn.
@@ -117,6 +129,7 @@ impl QueryEngine {
         user_text: impl Into<String>,
         mut on_text: impl FnMut(&str),
         messages: &mut Vec<MessageParam>,
+        cancel: &CancellationToken,
     ) -> CcResult<String> {
         // Clear per-turn flags before anything else.
         self.compacted_last_turn = false;
@@ -156,19 +169,41 @@ impl QueryEngine {
             // 4. Stream response
             let mut text_buf = String::new();
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
-            let cancel = CancellationToken::new();
 
+            let events_tx = self.events_tx.clone();
             let (message, usage) = self
                 .api
                 .complete_message(req, |delta| {
-                    if let StreamDelta::Text(ref text) = delta {
-                        text_buf.push_str(text);
-                        on_text(text);
+                    match &delta {
+                        StreamDelta::Text(ref text) => {
+                            text_buf.push_str(text);
+                            on_text(text);
+                            if let Some(tx) = &events_tx {
+                                let _ = tx.try_send(AppEvent::StreamDelta(text.clone()));
+                            }
+                        }
+                        StreamDelta::Thinking(ref thinking) => {
+                            if let Some(tx) = &events_tx {
+                                let _ = tx.try_send(AppEvent::StreamThinking(thinking.clone()));
+                            }
+                        }
+                        StreamDelta::ToolUseStart { id, name } => {
+                            if let Some(tx) = &events_tx {
+                                let _ = tx.try_send(AppEvent::StreamToolUse(ToolUseBlock {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: Value::Null,
+                                }));
+                            }
+                        }
+                        StreamDelta::InputJsonDelta(_) => {}
                     }
-                }, &cancel)
+                }, cancel)
                 .await?;
 
-            let input_tokens = usage.input_tokens;
+            // Record usage
+            self.usage.record(&usage);
+
             let stop_reason = message.stop_reason;
 
             // Collect tool_use blocks from the response
@@ -195,7 +230,7 @@ impl QueryEngine {
                 Some(StopReason::ToolUse) if !tool_use_blocks.is_empty() => {
                     // Execute tools and build tool_result user message
                     let tool_results = self
-                        .execute_tools(&tool_use_blocks, messages)
+                        .execute_tools(&tool_use_blocks, cancel)
                         .await?;
 
                     let result_msg = MessageParam {
@@ -212,18 +247,21 @@ impl QueryEngine {
 
                     // Auto-compact check (§4.5: threshold = context_window - 13,000)
                     let threshold = compact_threshold();
-                    if input_tokens > threshold {
+                    if self.usage.last_input_tokens() > threshold {
                         debug!(
-                            "auto-compact triggered: input_tokens={input_tokens} > threshold={threshold}"
+                            "auto-compact triggered: input_tokens={} > threshold={threshold}",
+                            self.usage.last_input_tokens()
                         );
                         compact_messages(messages);
                         self.compacted_last_turn = true;
+                        self.emit(AppEvent::CompactBoundary).await;
                     }
 
                     // Continue loop
                 }
                 _ => {
                     // end_turn, max_tokens, or stop_sequence → done
+                    self.emit(AppEvent::TurnComplete { usage }).await;
                     break;
                 }
             }
@@ -237,7 +275,7 @@ impl QueryEngine {
     async fn execute_tools(
         &mut self,
         tool_use_blocks: &[ToolUseBlock],
-        _messages: &[MessageParam],
+        cancel: &CancellationToken,
     ) -> CcResult<Vec<ToolResultBlock>> {
         // Partition into read-only and mutating
         let (read_only, mutating): (Vec<_>, Vec<_>) = tool_use_blocks.iter().partition(|tu| {
@@ -253,28 +291,59 @@ impl QueryEngine {
         if !read_only.is_empty() {
             let mut authorized: Vec<(&ToolUseBlock, Arc<dyn cc_tools::Tool>)> = Vec::new();
             for tu in &read_only {
-                match self.check_tool_permissions(tu).await {
+                match self.check_tool_permissions(tu, cancel).await {
                     Ok(tool) => authorized.push((tu, tool)),
                     Err(result) => results.push(result),
                 }
             }
 
             if !authorized.is_empty() {
+                let events_tx = self.events_tx.clone();
+                let hooks = Arc::clone(&self.hooks);
+                let session_id = self.session.id.clone();
                 let futures: Vec<_> = authorized
                     .into_iter()
                     .map(|(tu, tool)| {
-                        let cancel = CancellationToken::new();
+                        let cancel = cancel.child_token();
+                        let events_tx = events_tx.clone();
+                        let hooks = Arc::clone(&hooks);
+                        let session_id = session_id.clone();
+                        let tu = tu.clone();
                         async move {
+                            // Emit ToolStart
+                            if let Some(tx) = &events_tx {
+                                let _ = tx.send(AppEvent::ToolStart {
+                                    name: tu.name.clone(),
+                                    input: tu.input.clone(),
+                                }).await;
+                            }
+
                             let result: ToolResult =
                                 match tool.execute(tu.input.clone(), &cancel).await {
                                     Ok(r) => r,
                                     Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
                                 };
-                            ToolResultBlock {
+
+                            let tool_result_block = ToolResultBlock {
                                 tool_use_id: tu.id.clone(),
-                                content: Some(Value::String(result.content)),
+                                content: Some(Value::String(result.content.clone())),
                                 is_error: if result.is_error { Some(true) } else { None },
+                            };
+
+                            // Emit ToolEnd
+                            if let Some(tx) = &events_tx {
+                                let _ = tx.send(AppEvent::ToolEnd {
+                                    name: tu.name.clone(),
+                                    result: result.clone(),
+                                }).await;
                             }
+
+                            // PostToolUse hook
+                            run_post_tool_hook(
+                                &hooks, &session_id, &tu, &tool_result_block, &cancel,
+                            ).await;
+
+                            tool_result_block
                         }
                     })
                     .collect();
@@ -284,7 +353,7 @@ impl QueryEngine {
 
         // Run mutating tools sequentially
         for tu in &mutating {
-            results.push(self.execute_one_tool(tu).await);
+            results.push(self.execute_one_tool(tu, cancel).await);
         }
 
         // Re-sort to match original tool_use order
@@ -303,6 +372,7 @@ impl QueryEngine {
     async fn check_tool_permissions(
         &mut self,
         tu: &ToolUseBlock,
+        cancel: &CancellationToken,
     ) -> Result<Arc<dyn cc_tools::Tool>, ToolResultBlock> {
         let tool_name = &tu.name;
         let input = &tu.input;
@@ -326,8 +396,7 @@ impl QueryEngine {
             message: None,
             agent_id: None,
         };
-        let cancel = CancellationToken::new();
-        let hook_result = self.hooks.run("PreToolUse", &hook_input, &cancel).await;
+        let hook_result = self.hooks.run("PreToolUse", &hook_input, cancel).await;
         if hook_result.blocked {
             let msg = hook_result
                 .block_message
@@ -338,7 +407,6 @@ impl QueryEngine {
         // --- Permission check ---
         if !self.options.bypass_permissions {
             let result = self.permissions.check(tool_name, input);
-            use cc_core::PermissionBehavior;
             match result.behavior {
                 PermissionBehavior::Deny => {
                     return Err(tool_result_error(
@@ -347,7 +415,11 @@ impl QueryEngine {
                     ));
                 }
                 PermissionBehavior::Ask => {
-                    let decision = self.prompter.prompt(tool_name, input).await;
+                    let decision = self
+                        .prompter
+                        .prompt(tool_name, input, cancel)
+                        .await
+                        .unwrap_or(PromptDecision::Deny);
                     match decision {
                         PromptDecision::Deny => {
                             return Err(tool_result_error(
@@ -372,26 +444,72 @@ impl QueryEngine {
             .ok_or_else(|| tool_result_error(&tu.id, format!("Unknown tool: {tool_name}")))
     }
 
-    async fn execute_one_tool(&mut self, tu: &ToolUseBlock) -> ToolResultBlock {
+    async fn execute_one_tool(&mut self, tu: &ToolUseBlock, cancel: &CancellationToken) -> ToolResultBlock {
         debug!("tool_use: {}", tu.name);
 
-        let tool = match self.check_tool_permissions(tu).await {
+        let tool = match self.check_tool_permissions(tu, cancel).await {
             Ok(t) => t,
             Err(result) => return result,
         };
 
-        let cancel = CancellationToken::new();
-        let result: ToolResult = match tool.execute(tu.input.clone(), &cancel).await {
+        // Emit ToolStart
+        self.emit(AppEvent::ToolStart {
+            name: tu.name.clone(),
+            input: tu.input.clone(),
+        }).await;
+
+        let child_cancel = cancel.child_token();
+        let result: ToolResult = match tool.execute(tu.input.clone(), &child_cancel).await {
             Ok(r) => r,
             Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
         };
 
-        ToolResultBlock {
+        let tool_result_block = ToolResultBlock {
             tool_use_id: tu.id.clone(),
-            content: Some(Value::String(result.content)),
+            content: Some(Value::String(result.content.clone())),
             is_error: if result.is_error { Some(true) } else { None },
-        }
+        };
+
+        // Emit ToolEnd
+        self.emit(AppEvent::ToolEnd {
+            name: tu.name.clone(),
+            result,
+        }).await;
+
+        // PostToolUse hook
+        run_post_tool_hook(&self.hooks, &self.session.id, tu, &tool_result_block, cancel).await;
+
+        tool_result_block
     }
+}
+
+/// Run PostToolUse hook after tool execution.
+async fn run_post_tool_hook(
+    hooks: &HookRunner,
+    session_id: &str,
+    tu: &ToolUseBlock,
+    result: &ToolResultBlock,
+    cancel: &CancellationToken,
+) {
+    let hook_input = HookInput {
+        session_id: session_id.to_string(),
+        transcript_path: None,
+        cwd: std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        permission_mode: None,
+        hook_event_name: "PostToolUse".into(),
+        tool_name: Some(tu.name.clone()),
+        tool_input: Some(tu.input.clone()),
+        tool_use_id: Some(tu.id.clone()),
+        tool_response: result.content.clone(),
+        source: None,
+        model: None,
+        message: None,
+        agent_id: None,
+    };
+    let _ = hooks.run("PostToolUse", &hook_input, cancel).await;
 }
 
 fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResultBlock {
@@ -414,9 +532,6 @@ fn compact_threshold() -> u32 {
 }
 
 /// Simple compaction: keep only the first user message and the last N messages.
-/// Used both by the engine's auto-compact path (when input tokens cross
-/// `AUTO_COMPACT_TOKEN_THRESHOLD`) and by the `/compact` slash command in the
-/// TUI host. This is a basic implementation that satisfies the exit criterion.
 pub fn compact_messages(messages: &mut Vec<MessageParam>) {
     const KEEP_RECENT: usize = 20;
     if messages.len() <= KEEP_RECENT + 1 {
@@ -454,7 +569,6 @@ mod tests {
 
     #[test]
     fn compact_messages_keeps_first_and_last_n() {
-        // 50 messages → should collapse to: first + boundary marker + last 20.
         let mut msgs: Vec<MessageParam> = (0..50)
             .map(|i| {
                 let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
@@ -463,19 +577,16 @@ mod tests {
             .collect();
         compact_messages(&mut msgs);
         assert_eq!(msgs.len(), 22, "first + boundary + last 20 = 22");
-        // First message preserved.
         if let MessageContent::Text(t) = &msgs[0].content {
             assert_eq!(t, "m0");
         } else {
             panic!("expected text content for first message");
         }
-        // Second slot is the "[Context compacted: ...]" marker.
         if let MessageContent::Text(t) = &msgs[1].content {
             assert!(t.contains("Context compacted"), "marker text present");
         } else {
             panic!("expected text content for marker");
         }
-        // Last message is the original last.
         if let MessageContent::Text(t) = &msgs[msgs.len() - 1].content {
             assert_eq!(t, "m49");
         } else {

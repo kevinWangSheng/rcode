@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 
-use cc_query::PromptDecision;
+use cc_core::PromptDecision;
 use tokio::sync::oneshot;
 
 /// One transcript entry. Tool calls and assistant text are flattened into a flat

@@ -7,11 +7,11 @@
 //! engine doesn't know whether it's talking to a terminal, a unit test, or a
 //! mocked GUI.
 
-use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
-use cc_query::{PermissionPrompter, PromptDecision};
+use cc_core::{CcResult, PermissionPrompter, PromptDecision};
 
 use crate::event::AppEvent;
 
@@ -25,9 +25,14 @@ impl ChannelPrompter {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl PermissionPrompter for ChannelPrompter {
-    async fn prompt(&self, tool_name: &str, input: &Value) -> PromptDecision {
+    async fn prompt(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        cancel: &CancellationToken,
+    ) -> CcResult<PromptDecision> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = AppEvent::PermissionRequest {
             tool_name: tool_name.to_string(),
@@ -36,9 +41,16 @@ impl PermissionPrompter for ChannelPrompter {
         };
         if self.tx.send(req).await.is_err() {
             // UI is gone — fail closed.
-            return PromptDecision::Deny;
+            return Ok(PromptDecision::Deny);
         }
-        // If the UI drops the reply channel (e.g. shutting down), default to Deny.
-        reply_rx.await.unwrap_or(PromptDecision::Deny)
+        // If the UI drops the reply channel or cancel fires, default to Deny.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Ok(PromptDecision::Deny),
+            result = reply_rx => {
+                let decision: PromptDecision = result.unwrap_or(PromptDecision::Deny);
+                Ok(decision)
+            }
+        }
     }
 }

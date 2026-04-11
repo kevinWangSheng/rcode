@@ -13,7 +13,7 @@ use cc_hooks::{HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryOptions},
-    ToolRegistry,
+    StdinPrompter, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
 use cc_tools::default_tools;
@@ -296,15 +296,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         tool_registry.register(tool);
     }
 
+    let non_interactive = options.non_interactive;
+    let prompter: Arc<dyn cc_core::PermissionPrompter> =
+        Arc::new(StdinPrompter::new(non_interactive));
     let mut engine = QueryEngine::new(
         api,
         Arc::new(tool_registry),
         permission_engine,
-        hook_runner,
+        Arc::new(hook_runner),
         session,
         system_blocks,
         options,
+        prompter,
     );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
 
     match cli.output {
         OutputFormat::Text => {
@@ -314,7 +320,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .run_turn(user_text, |delta| {
                     let _ = out.write_all(delta.as_bytes());
                     let _ = out.flush();
-                }, &mut messages)
+                }, &mut messages, &cancel)
                 .await?;
             writeln!(out)?;
             tracing::debug!("session: {}", engine.session().id);
@@ -325,7 +331,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let final_text = engine
                 .run_turn(user_text, |delta| {
                     full_text.push_str(delta);
-                }, &mut messages)
+                }, &mut messages, &cancel)
                 .await?;
             let output = json!({
                 "session_id": engine.session().id,
