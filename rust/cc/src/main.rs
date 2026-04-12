@@ -284,6 +284,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             runner: Some(sub_agent_runner),
             directory: teammate_dir.clone(),
         }));
+
+        // Wire ToolSearchTool: snapshot the current tool list as a lister closure.
+        let snapshot: Vec<Arc<dyn cc_core::tool::Tool>> = tools.clone();
+        let lister: cc_tools::tool_search::ToolLister = Arc::new(move || {
+            snapshot.iter().map(|t| cc_tools::tool_search::ToolEntry {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                schema: serde_json::to_value(t.input_schema()).unwrap_or_default(),
+            }).collect()
+        });
+        tools.push(Arc::new(cc_tools::tool_search::ToolSearchTool {
+            list_tools: Some(lister),
+        }));
     }
 
     // SDK / --print path — runs through cc-bridge.

@@ -20,6 +20,7 @@ pub mod task_update;
 pub mod team_create;
 pub mod team_delete;
 pub mod todo;
+pub mod tool_search;
 pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
