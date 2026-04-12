@@ -152,6 +152,42 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         (s, Vec::<MessageParam>::new())
     };
 
+    // Fire SessionStart hook (§4 contract: trigger='resume' when resuming)
+    {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let session_start_input = cc_core::hook::HookInput {
+            session_id: session.id.clone(),
+            transcript_path: Some(session.transcript_path().to_string_lossy().to_string()),
+            cwd: cwd.to_string_lossy().to_string(),
+            permission_mode: None,
+            hook_event_name: "SessionStart".to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_response: None,
+            source: None,
+            model: Some(model.clone()),
+            message: resume_id.as_ref().map(|_| "resume".to_string()),
+            agent_id: None,
+        };
+        // Build a temporary hook runner just for the SessionStart event.
+        // We'll re-build the real one below with the same config.
+        let hooks_raw_pre = settings
+            .extra
+            .get("hooks")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let hooks_config_pre: cc_hooks::HooksSettings = if hooks_raw_pre.is_null() {
+            cc_hooks::HooksSettings::new()
+        } else {
+            serde_json::from_value(hooks_raw_pre).unwrap_or_default()
+        };
+        let http_pre = cc_http::build_client(&cc_http::HttpClientConfig::from_env()).unwrap_or_default();
+        let pre_runner = HookRunner::new(&hooks_config_pre, http_pre);
+        let cancel_pre = tokio_util::sync::CancellationToken::new();
+        let _ = pre_runner.run("SessionStart", &session_start_input, &cancel_pre).await;
+    }
+
     eprintln!("Session: {}", session.id);
 
     // Write session metadata

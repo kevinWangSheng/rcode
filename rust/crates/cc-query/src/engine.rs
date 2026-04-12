@@ -201,6 +201,22 @@ impl QueryEngine {
                 }, cancel)
                 .await?;
 
+            // §4 contract: if streaming was interrupted (cancel fired), save partial
+            // text with interrupt marker before propagating cancellation.
+            if cancel.is_cancelled() && !text_buf.is_empty() {
+                let mut interrupted_content = message.content.clone();
+                interrupted_content.push(ContentBlock::text(
+                    "\n[Interrupted by user]",
+                ));
+                let partial_msg = MessageParam {
+                    role: Role::Assistant,
+                    content: MessageContent::Blocks(interrupted_content),
+                };
+                self.session.append(&partial_msg)?;
+                messages.push(partial_msg);
+                return Err(CcError::Cancelled);
+            }
+
             // Record usage
             self.usage.record(&usage);
 
@@ -532,6 +548,7 @@ fn compact_threshold() -> u32 {
 }
 
 /// Simple compaction: keep only the first user message and the last N messages.
+/// Also strips image blocks from kept messages (§4 contract: images stripped before API call).
 pub fn compact_messages(messages: &mut Vec<MessageParam>) {
     const KEEP_RECENT: usize = 20;
     if messages.len() <= KEEP_RECENT + 1 {
@@ -543,7 +560,7 @@ pub fn compact_messages(messages: &mut Vec<MessageParam>) {
     // Keep first message (initial user message) + last KEEP_RECENT
     let first = messages[0].clone();
     let keep_from = messages.len().saturating_sub(KEEP_RECENT);
-    let recent: Vec<MessageParam> = messages[keep_from..].to_vec();
+    let recent: Vec<MessageParam> = messages[keep_from..].iter().map(strip_images).collect();
 
     messages.clear();
     messages.push(first);
@@ -554,6 +571,52 @@ pub fn compact_messages(messages: &mut Vec<MessageParam>) {
     ));
 
     messages.extend(recent);
+}
+
+/// Strip image blocks from a message to reduce token count after compaction.
+/// Removes `ContentBlock::Image` blocks and image entries from ToolResult content arrays.
+fn strip_images(msg: &MessageParam) -> MessageParam {
+    let content = match &msg.content {
+        MessageContent::Text(_) => return msg.clone(),
+        MessageContent::Blocks(blocks) => {
+            let filtered: Vec<ContentBlock> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Image(_) => None,
+                    ContentBlock::ToolResult(tr) => {
+                        // Strip image blocks from tool_result content arrays
+                        let content = tr.content.as_ref().map(|v| strip_images_from_value(v));
+                        Some(ContentBlock::ToolResult(cc_core::ToolResultBlock {
+                            tool_use_id: tr.tool_use_id.clone(),
+                            content,
+                            is_error: tr.is_error,
+                        }))
+                    }
+                    other => Some(other.clone()),
+                })
+                .collect();
+            MessageContent::Blocks(filtered)
+        }
+    };
+    MessageParam { role: msg.role, content }
+}
+
+/// Remove image-type blocks from a tool_result content value.
+fn strip_images_from_value(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Array(arr) => {
+            let filtered: Vec<serde_json::Value> = arr
+                .iter()
+                .filter(|item| {
+                    // Remove blocks with type "image"
+                    item.get("type").and_then(|t| t.as_str()) != Some("image")
+                })
+                .cloned()
+                .collect();
+            serde_json::Value::Array(filtered)
+        }
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -600,5 +663,65 @@ mod tests {
         let before = msgs.clone();
         compact_messages(&mut msgs);
         assert_eq!(msgs.len(), before.len(), "no compaction when ≤ KEEP_RECENT + 1");
+    }
+
+    #[test]
+    fn compact_messages_strips_images_from_kept_messages() {
+        use cc_core::{ContentBlock, ImageBlock, ImageSource, MessageContent, ToolResultBlock};
+        use serde_json::json;
+
+        let image_block = ContentBlock::Image(ImageBlock {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "abc123".into(),
+            },
+        });
+        let text_block = ContentBlock::text("hello");
+
+        // Build enough messages for compaction (> 21)
+        let mut msgs: Vec<MessageParam> = (0..20)
+            .map(|i| msg(if i % 2 == 0 { Role::User } else { Role::Assistant }, &format!("m{i}")))
+            .collect();
+
+        // Add a message with image + text blocks as the last one
+        msgs.push(MessageParam {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![image_block.clone(), text_block.clone()]),
+        });
+
+        // Add a tool_result message with image content
+        msgs.push(MessageParam {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult(ToolResultBlock {
+                tool_use_id: "tu1".into(),
+                content: Some(json!([
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "xyz"}},
+                    {"type": "text", "text": "description"}
+                ])),
+                is_error: None,
+            })]),
+        });
+
+        compact_messages(&mut msgs);
+
+        // Verify no image blocks remain in any kept message
+        for m in &msgs {
+            if let MessageContent::Blocks(blocks) = &m.content {
+                for b in blocks {
+                    assert!(!matches!(b, ContentBlock::Image(_)), "image block should be stripped");
+                    if let ContentBlock::ToolResult(tr) = b {
+                        if let Some(serde_json::Value::Array(items)) = &tr.content {
+                            for item in items {
+                                assert_ne!(
+                                    item.get("type").and_then(|t| t.as_str()),
+                                    Some("image"),
+                                    "image in tool_result should be stripped"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
