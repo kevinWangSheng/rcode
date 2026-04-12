@@ -1,3 +1,4 @@
+pub mod agent_tool;
 pub mod bash;
 pub mod edit;
 pub mod glob_tool;
@@ -61,6 +62,18 @@ pub fn background_task_tools(registry: Arc<Mutex<TaskRegistry>>) -> Vec<Arc<dyn 
 }
 
 /// Build all built-in tools: 8 core tools + 4 todo task tools + 2 background task tools.
+///
+/// **Does not include AgentTool** — add it separately after building the ToolRegistry
+/// to avoid a cc-tools → cc-query → cc-tools circular dependency:
+///
+/// ```ignore
+/// let (mut tools, list, task_reg) = all_tools();
+/// // ... add MCP tools ...
+/// let shared_reg = Arc::new(build_registry(&tools));
+/// let runner = Arc::new(SubAgentRunnerImpl { tools: shared_reg.clone(), ... });
+/// tools.push(Arc::new(AgentTool { runner: Some(runner) }));
+/// let full_reg = Arc::new(build_registry(&tools));
+/// ```
 ///
 /// Returns the combined tool list, the shared todo list, and the shared task registry.
 pub fn all_tools() -> (Vec<Arc<dyn Tool>>, Arc<Mutex<TodoList>>, Arc<Mutex<TaskRegistry>>) {

@@ -13,10 +13,10 @@ use cc_hooks::{HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryOptions},
-    StdinPrompter, ToolRegistry,
+    SubAgentRunnerImpl, StdinPrompter, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
-use cc_tools::all_tools;
+use cc_tools::{agent_tool::AgentTool, all_tools};
 use cc_tui::TuiConfig;
 
 /// Claude Code — Rust implementation (Milestone 2: Tool Execution + Session)
@@ -213,7 +213,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let http_config = cc_http::HttpClientConfig::from_env();
     let http = cc_http::build_client(&http_config).unwrap_or_default();
-    let hook_runner = HookRunner::new(&hooks_config, http.clone());
+    let hook_runner = Arc::new(HookRunner::new(&hooks_config, http.clone()));
 
     // Build tools (built-in + task management + MCP servers from settings.json `mcpServers`).
     let (mut tools, _todo_list, _task_registry) = all_tools();
@@ -243,6 +243,31 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Credentials::OAuthToken(t) => AuthCredential::OAuthToken(t),
     };
     let api = ApiClient::new(http, auth);
+
+    // Wire AgentTool: build a base registry (without AgentTool) to give to the
+    // SubAgentRunner, then add AgentTool to the full tool list.
+    // This two-pass approach breaks the cc-tools → cc-query → cc-tools cycle.
+    {
+        let mut base_registry = ToolRegistry::new();
+        for tool in &tools {
+            base_registry.register(tool.clone());
+        }
+        let sub_agent_registry = Arc::new(base_registry);
+        let sub_agent_prompter: Arc<dyn cc_core::PermissionPrompter> =
+            Arc::new(StdinPrompter::new(true));
+        let sub_agent_runner = Arc::new(SubAgentRunnerImpl {
+            api: api.clone(),
+            tools: sub_agent_registry,
+            permissions: permission_engine.clone(),
+            hooks: hook_runner.clone(),
+            system_blocks: system_blocks.clone(),
+            options: options.clone(),
+            prompter: sub_agent_prompter,
+        });
+        tools.push(Arc::new(AgentTool {
+            runner: Some(sub_agent_runner),
+        }));
+    }
 
     // SDK / --print path — runs through cc-bridge.
     if let Some(_print) = &print_text {
@@ -296,7 +321,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             api,
             Arc::new(tui_tool_registry),
             permission_engine,
-            Arc::new(hook_runner),
+            hook_runner.clone(),
             session,
             system_blocks,
             options,
@@ -345,7 +370,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         api,
         Arc::new(tool_registry),
         permission_engine,
-        Arc::new(hook_runner),
+        hook_runner.clone(),
         session,
         system_blocks,
         options,

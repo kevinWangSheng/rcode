@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod error;
 pub mod hook;
 pub mod message;
@@ -7,6 +8,7 @@ pub mod state;
 pub mod task;
 pub mod tool;
 
+pub use agent::SubAgentRunner;
 pub use error::{CcError, CcResult};
 pub use hook::*;
 pub use message::*;

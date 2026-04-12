@@ -365,6 +365,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cc-agents",
  "cc-core",
  "glob",
  "regex",

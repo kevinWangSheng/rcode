@@ -95,7 +95,7 @@ async fn print_mode_streams_text_through_bridge() {
         api,
         tools: Vec::new(),
         permissions: PermissionEngine::from_settings(Vec::<serde_json::Value>::new(), Vec::<serde_json::Value>::new()),
-        hooks: HookRunner::empty(),
+        hooks: std::sync::Arc::new(HookRunner::empty()),
         session: Session::new().expect("session"),
         system_blocks: Vec::new(),
         initial_messages: Vec::new(),
