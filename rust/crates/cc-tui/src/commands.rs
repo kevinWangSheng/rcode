@@ -105,6 +105,15 @@ pub enum Builtin {
     Init,
     Mcp,
     Hooks,
+    // Phase 3 additions
+    Skills,
+    Tasks,
+    Permissions,
+    Plan,
+    Status,
+    Diff,
+    Commit,
+    Context,
 }
 
 impl Builtin {
@@ -122,6 +131,14 @@ impl Builtin {
         Builtin::Init,
         Builtin::Mcp,
         Builtin::Hooks,
+        Builtin::Skills,
+        Builtin::Tasks,
+        Builtin::Permissions,
+        Builtin::Plan,
+        Builtin::Status,
+        Builtin::Diff,
+        Builtin::Commit,
+        Builtin::Context,
     ];
 
     pub fn name(self) -> &'static str {
@@ -139,6 +156,14 @@ impl Builtin {
             Builtin::Init => "init",
             Builtin::Mcp => "mcp",
             Builtin::Hooks => "hooks",
+            Builtin::Skills => "skills",
+            Builtin::Tasks => "tasks",
+            Builtin::Permissions => "permissions",
+            Builtin::Plan => "plan",
+            Builtin::Status => "status",
+            Builtin::Diff => "diff",
+            Builtin::Commit => "commit",
+            Builtin::Context => "context",
         }
     }
 
@@ -157,6 +182,14 @@ impl Builtin {
             Builtin::Init => "create a starter CLAUDE.md in the project root",
             Builtin::Mcp => "list configured MCP servers",
             Builtin::Hooks => "list configured hook events",
+            Builtin::Skills => "list available skill slash commands",
+            Builtin::Tasks => "show current session task list",
+            Builtin::Permissions => "show current permission rules",
+            Builtin::Plan => "enter plan mode (design before coding)",
+            Builtin::Status => "show session status (model, tokens, turns)",
+            Builtin::Diff => "show current git diff",
+            Builtin::Commit => "stage and commit all changes with an AI-generated message",
+            Builtin::Context => "show context window usage (tokens remaining)",
         }
     }
 
@@ -233,6 +266,26 @@ impl CommandRegistry {
             Builtin::Init => CommandOutcome::Info(execute_init(ctx)),
             Builtin::Mcp => CommandOutcome::Info(format_mcp_servers(&ctx.mcp_servers)),
             Builtin::Hooks => CommandOutcome::Info(format_hook_events(&ctx.hook_events)),
+            Builtin::Skills => CommandOutcome::Info(format_skills(self)),
+            Builtin::Tasks => CommandOutcome::Info(
+                "Use TaskList tool or check TodoWrite list via the model.".to_string(),
+            ),
+            Builtin::Permissions => CommandOutcome::Info(format_permissions(ctx)),
+            Builtin::Plan => CommandOutcome::SubmitUserMessage(
+                "Enter plan mode. Use EnterPlanMode tool to begin designing the solution.".to_string(),
+            ),
+            Builtin::Status => CommandOutcome::Info(format_status(ctx)),
+            Builtin::Diff => CommandOutcome::SubmitUserMessage(
+                "Show the current git diff using the Bash tool: run `git diff --stat` and then \
+                 `git diff` to display all changes."
+                    .to_string(),
+            ),
+            Builtin::Commit => CommandOutcome::SubmitUserMessage(
+                "Stage all changes and create a commit. Run `git status` first, then \
+                 `git add -A` and write a clear commit message describing the changes."
+                    .to_string(),
+            ),
+            Builtin::Context => CommandOutcome::Info(format_context(ctx)),
         }
     }
 
@@ -384,6 +437,64 @@ fn format_hook_events(events: &[String]) -> String {
         out.push_str(&format!("  {e}\n"));
     }
     out
+}
+
+fn format_skills(registry: &CommandRegistry) -> String {
+    if registry.skills.is_empty() {
+        return "No skills found. Add markdown files to ~/.claude/skills/.".to_string();
+    }
+    let mut out = String::from("Available skills:\n");
+    for s in &registry.skills {
+        let desc = if s.description.is_empty() {
+            "(no description)"
+        } else {
+            s.description.as_str()
+        };
+        out.push_str(&format!("  /{:<12} {}\n", s.name, desc));
+    }
+    out
+}
+
+fn format_permissions(ctx: &CommandContext) -> String {
+    let mut out = String::from("Permission system:\n\n");
+    out.push_str(&format!("  model:    {}\n", ctx.model));
+    out.push_str(
+        "\nConfigure allow/deny rules in ~/.claude/settings.json under `permissions`.\n\
+         Example:\n\
+         {\n  \"permissions\": {\n    \"allow\": [\"Bash(git *)\"],\n    \
+         \"deny\": [\"Bash(rm -rf *)\"]\n  }\n}\n",
+    );
+    out
+}
+
+fn format_status(ctx: &CommandContext) -> String {
+    let mut out = String::from("Session status:\n\n");
+    out.push_str(&format!("  model:   {}\n", ctx.model));
+    out.push_str(&format!("  turns:   {}\n", ctx.turn_count));
+    out.push_str(&format!(
+        "  tokens:  {} in / {} out\n",
+        format_tokens(ctx.input_tokens),
+        format_tokens(ctx.output_tokens)
+    ));
+    if ctx.turn_count > 0 {
+        out.push_str(&format!("  cost:    ${:.4}\n", ctx.estimated_cost_usd));
+    }
+    out
+}
+
+fn format_context(ctx: &CommandContext) -> String {
+    // Approximate remaining context (200k for recent Claude models)
+    const CONTEXT_WINDOW: u64 = 200_000;
+    let used = ctx.input_tokens;
+    let remaining = CONTEXT_WINDOW.saturating_sub(used);
+    let pct = (used as f64 / CONTEXT_WINDOW as f64 * 100.0) as u32;
+    format!(
+        "Context window usage:\n\n  Used:      {} tokens ({pct}%)\n  Remaining: {} tokens\n  Window:    {} tokens\n\
+         \nAuto-compact triggers at ~80% usage.",
+        format_tokens(used),
+        format_tokens(remaining),
+        format_tokens(CONTEXT_WINDOW),
+    )
 }
 
 fn execute_init(ctx: &CommandContext) -> String {
