@@ -22,6 +22,14 @@ pub struct CommandContext {
     pub mcp_servers: Vec<String>,
     pub hook_events: Vec<String>,
     pub project_root: Option<PathBuf>,
+    /// Cumulative input tokens (snapshot from UsageTracker, updated before each command).
+    pub input_tokens: u64,
+    /// Cumulative output tokens.
+    pub output_tokens: u64,
+    /// Estimated cost in USD.
+    pub estimated_cost_usd: f64,
+    /// Number of completed turns.
+    pub turn_count: u32,
 }
 
 impl CommandContext {
@@ -219,9 +227,7 @@ impl CommandRegistry {
             }
             Builtin::Version => CommandOutcome::Info(format!("claude {}", ctx.version)),
             Builtin::Model => execute_model(args, ctx),
-            Builtin::Cost => CommandOutcome::Info(
-                "Token usage tracking is not yet implemented.".to_string(),
-            ),
+            Builtin::Cost => CommandOutcome::Info(format_cost(ctx)),
             Builtin::Compact => CommandOutcome::Compact,
             Builtin::Config => CommandOutcome::Info(format_config(ctx)),
             Builtin::Init => CommandOutcome::Info(execute_init(ctx)),
@@ -304,6 +310,34 @@ fn execute_model(args: &str, ctx: &CommandContext) -> CommandOutcome {
         CommandOutcome::Info(format!("Current model: {}", ctx.model))
     } else {
         CommandOutcome::SwitchModel(arg.to_string())
+    }
+}
+
+fn format_cost(ctx: &CommandContext) -> String {
+    if ctx.turn_count == 0 {
+        return "No API calls made yet in this session.".to_string();
+    }
+    let mut s = String::new();
+    s.push_str(&format!("Token usage — {} turn(s)\n\n", ctx.turn_count));
+    s.push_str(&format!(
+        "  Input:  {:>10} tokens\n",
+        format_tokens(ctx.input_tokens)
+    ));
+    s.push_str(&format!(
+        "  Output: {:>10} tokens\n",
+        format_tokens(ctx.output_tokens)
+    ));
+    s.push_str(&format!("\n  Estimated cost: ${:.4}", ctx.estimated_cost_usd));
+    s
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 
@@ -505,6 +539,34 @@ mod tests {
         let reg = CommandRegistry::empty();
         let cmd = parse("/compact").unwrap();
         assert!(matches!(reg.execute(&cmd, &ctx()), CommandOutcome::Compact));
+    }
+
+    #[test]
+    fn cost_with_no_turns_shows_no_calls() {
+        let reg = CommandRegistry::empty();
+        let c = ctx(); // turn_count=0
+        match reg.execute(&parse("/cost").unwrap(), &c) {
+            CommandOutcome::Info(msg) => assert!(msg.contains("No API calls")),
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_with_usage_shows_tokens_and_cost() {
+        let mut c = ctx();
+        c.input_tokens = 1_500;
+        c.output_tokens = 300;
+        c.estimated_cost_usd = 0.0095;
+        c.turn_count = 3;
+        let reg = CommandRegistry::empty();
+        match reg.execute(&parse("/cost").unwrap(), &c) {
+            CommandOutcome::Info(msg) => {
+                assert!(msg.contains("3 turn"), "expected turn count: {msg}");
+                assert!(msg.contains("1.5k"), "expected token format: {msg}");
+                assert!(msg.contains("$0.0095"), "expected cost: {msg}");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
     }
 
     #[test]

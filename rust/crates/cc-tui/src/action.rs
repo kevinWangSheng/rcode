@@ -89,7 +89,14 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
 
             // Check if it's a slash command
             if let Some(cmd) = parse(&text) {
-                let outcome = ctx.commands.execute(&cmd, ctx.command_ctx);
+                // Snapshot current usage into CommandContext before dispatch
+                // so /cost and similar commands see up-to-date numbers.
+                let mut cmd_ctx = ctx.command_ctx.clone();
+                cmd_ctx.input_tokens = app.status.input_tokens;
+                cmd_ctx.output_tokens = app.status.output_tokens;
+                cmd_ctx.estimated_cost_usd = app.status.estimated_cost_usd;
+                cmd_ctx.turn_count = app.status.turn_count;
+                let outcome = ctx.commands.execute(&cmd, &cmd_ctx);
                 match outcome {
                     CommandOutcome::Info(msg) => app.push_system(msg),
                     CommandOutcome::Exit => return UpdateResult::Quit,
