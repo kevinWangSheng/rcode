@@ -3,6 +3,11 @@ pub mod edit;
 pub mod glob_tool;
 pub mod grep;
 pub mod read;
+pub mod task_create;
+pub mod task_get;
+pub mod task_list;
+pub mod task_update;
+pub mod todo;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write;
@@ -10,10 +15,11 @@ pub mod write;
 // Re-export cc-core's Tool trait and ToolResult for use by tool implementations.
 pub use cc_core::tool::{Tool, ToolResult};
 pub use cc_core::{ToolDefinition, ToolInputSchema};
+pub use todo::TodoList;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// Build the default set of built-in tools.
+/// Build the default set of stateless built-in tools (8 core tools).
 pub fn default_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(bash::BashTool),
@@ -25,4 +31,29 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(web_fetch::WebFetchTool),
         Arc::new(web_search::WebSearchTool),
     ]
+}
+
+/// Build the task management tools (TaskCreate/Update/List/Get) sharing a single list.
+///
+/// Pass a pre-created `Arc<Mutex<TodoList>>` so the caller can hold a reference to
+/// the same list (e.g., for display in a TUI status panel or for injection into other
+/// components). Use `Arc::new(Mutex::new(TodoList::new()))` if you don't need the ref.
+pub fn task_tools(list: Arc<Mutex<TodoList>>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(task_create::TaskCreateTool { list: list.clone() }),
+        Arc::new(task_update::TaskUpdateTool { list: list.clone() }),
+        Arc::new(task_list::TaskListTool { list: list.clone() }),
+        Arc::new(task_get::TaskGetTool { list }),
+    ]
+}
+
+/// Build all built-in tools: 8 core tools + 4 task management tools.
+///
+/// Returns both the combined tool list and the shared todo list so callers can
+/// attach the list to a status panel or other components.
+pub fn all_tools() -> (Vec<Arc<dyn Tool>>, Arc<Mutex<TodoList>>) {
+    let list = Arc::new(Mutex::new(TodoList::new()));
+    let mut tools = default_tools();
+    tools.extend(task_tools(list.clone()));
+    (tools, list)
 }
