@@ -16,7 +16,7 @@ use cc_query::{
     StdinPrompter, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
-use cc_tools::default_tools;
+use cc_tools::all_tools;
 use cc_tui::TuiConfig;
 
 /// Claude Code — Rust implementation (Milestone 2: Tool Execution + Session)
@@ -215,8 +215,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let http = cc_http::build_client(&http_config).unwrap_or_default();
     let hook_runner = HookRunner::new(&hooks_config, http.clone());
 
-    // Build tools (built-in + MCP servers from settings.json `mcpServers`).
-    let mut tools = default_tools();
+    // Build tools (built-in + task management + MCP servers from settings.json `mcpServers`).
+    let (mut tools, _todo_list) = all_tools();
     if let Some(mcp_servers) = settings.extra.get("mcpServers") {
         let (mcp_tools, errors) = cc_mcp::load_mcp_tools_from_config(mcp_servers).await;
         for err in &errors {
