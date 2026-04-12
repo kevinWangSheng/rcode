@@ -16,7 +16,12 @@ use cc_query::{
     SubAgentRunnerImpl, StdinPrompter, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
-use cc_tools::{agent_tool::AgentTool, ask_user_question::AskUserQuestionTool, all_tools};
+use cc_tools::{
+    agent_tool::AgentTool,
+    ask_user_question::AskUserQuestionTool,
+    team_create::TeamCreateTool,
+    all_tools,
+};
 use cc_tui::TuiConfig;
 
 /// Claude Code — Rust implementation (Milestone 2: Tool Execution + Session)
@@ -216,7 +221,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let hook_runner = Arc::new(HookRunner::new(&hooks_config, http.clone()));
 
     // Build tools (built-in + task management + MCP servers from settings.json `mcpServers`).
-    let (mut tools, _todo_list, _todo_write_list, _task_registry) = all_tools();
+    let (mut tools, _todo_list, _todo_write_list, _task_registry, teammate_dir) = all_tools();
     if let Some(mcp_servers) = settings.extra.get("mcpServers") {
         let (mcp_tools, errors) = cc_mcp::load_mcp_tools_from_config(mcp_servers).await;
         for err in &errors {
@@ -273,7 +278,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             prompter: sub_agent_prompter,
         });
         tools.push(Arc::new(AgentTool {
+            runner: Some(sub_agent_runner.clone()),
+        }));
+        tools.push(Arc::new(TeamCreateTool {
             runner: Some(sub_agent_runner),
+            directory: teammate_dir.clone(),
         }));
     }
 

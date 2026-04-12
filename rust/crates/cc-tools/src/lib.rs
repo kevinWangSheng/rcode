@@ -9,6 +9,7 @@ pub mod exit_worktree;
 pub mod glob_tool;
 pub mod grep;
 pub mod read;
+pub mod send_message;
 pub mod sleep_tool;
 pub mod task_create;
 pub mod task_get;
@@ -16,6 +17,8 @@ pub mod task_list;
 pub mod task_output;
 pub mod task_stop;
 pub mod task_update;
+pub mod team_create;
+pub mod team_delete;
 pub mod todo;
 pub mod todo_write;
 pub mod web_fetch;
@@ -28,7 +31,7 @@ pub use cc_core::{ToolDefinition, ToolInputSchema};
 pub use todo::TodoList;
 pub use todo_write::TodoWriteList;
 
-use cc_agents::TaskRegistry;
+use cc_agents::{TaskRegistry, TeammateDirectory};
 use std::sync::{Arc, Mutex};
 
 /// Build the default set of stateless built-in tools (13 core tools).
@@ -74,26 +77,40 @@ pub fn background_task_tools(registry: Arc<Mutex<TaskRegistry>>) -> Vec<Arc<dyn 
     ]
 }
 
-/// Build all built-in tools: 13 core tools + TodoWrite + 4 task tools + 2 background task tools.
+/// Build swarm communication tools (SendMessage, TeamDelete) sharing a TeammateDirectory.
 ///
-/// **Does not include AgentTool or AskUserQuestionTool** — add them separately after
-/// building the ToolRegistry (AgentTool to break the circular dep, AskUserQuestion
-/// because it needs the prompter which is mode-specific).
+/// TeamCreate is NOT included here because it also needs the SubAgentRunner
+/// (injected from main.rs to break the circular dep, same as AgentTool).
+pub fn swarm_tools(directory: Arc<Mutex<TeammateDirectory>>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(send_message::SendMessageTool { directory: directory.clone() }),
+        Arc::new(team_delete::TeamDeleteTool { directory }),
+    ]
+}
+
+/// Build all built-in tools: 13 core tools + TodoWrite + 4 task tools + 2 background
+/// task tools + 2 swarm tools.
 ///
-/// Returns the combined tool list, the shared todo list, the TodoWrite list,
-/// and the shared task registry.
+/// **Does not include AgentTool, AskUserQuestionTool, or TeamCreateTool** — add them
+/// separately after building the ToolRegistry.
+///
+/// Returns the combined tool list, shared todo list, TodoWrite list, task registry,
+/// and teammate directory.
 pub fn all_tools() -> (
     Vec<Arc<dyn Tool>>,
     Arc<Mutex<TodoList>>,
     Arc<Mutex<todo_write::TodoWriteList>>,
     Arc<Mutex<TaskRegistry>>,
+    Arc<Mutex<TeammateDirectory>>,
 ) {
     let list = Arc::new(Mutex::new(TodoList::new()));
     let todo_write_list = Arc::new(Mutex::new(todo_write::TodoWriteList::new()));
     let registry = Arc::new(Mutex::new(TaskRegistry::new(16)));
+    let directory = Arc::new(Mutex::new(TeammateDirectory::new()));
     let mut tools = default_tools();
     tools.extend(task_tools(list.clone()));
     tools.extend(background_task_tools(registry.clone()));
+    tools.extend(swarm_tools(directory.clone()));
     tools.push(Arc::new(todo_write::TodoWriteTool { list: todo_write_list.clone() }));
-    (tools, list, todo_write_list, registry)
+    (tools, list, todo_write_list, registry, directory)
 }

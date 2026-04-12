@@ -11,6 +11,8 @@
 pub mod mailbox;
 mod registry;
 pub mod tasks;
+pub mod teammate_dir;
 
 pub use mailbox::{create_mailbox, ParentHandle, TeammateHandle, TeammateMessage};
 pub use registry::{TaskOutput, TaskRegistry};
+pub use teammate_dir::TeammateDirectory;
