@@ -7,13 +7,16 @@
 //! engine doesn't know whether it's talking to a terminal, a unit test, or a
 //! mocked GUI.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use cc_core::{CcResult, PermissionPrompter, PromptDecision};
+use cc_core::{AppEvent, CcResult, PermissionPrompter, PromptDecision};
 
-use crate::event::AppEvent;
+/// Monotonic counter for permission request IDs.
+static NEXT_PERM_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct ChannelPrompter {
     tx: mpsc::Sender<AppEvent>,
@@ -33,11 +36,13 @@ impl PermissionPrompter for ChannelPrompter {
         input: &Value,
         cancel: &CancellationToken,
     ) -> CcResult<PromptDecision> {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let id = NEXT_PERM_ID.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = oneshot::channel();
         let req = AppEvent::PermissionRequest {
+            id,
             tool_name: tool_name.to_string(),
-            input: input.clone(),
-            reply: reply_tx,
+            tool_input: input.clone(),
+            response_tx,
         };
         if self.tx.send(req).await.is_err() {
             // UI is gone — fail closed.
@@ -47,7 +52,7 @@ impl PermissionPrompter for ChannelPrompter {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Ok(PromptDecision::Deny),
-            result = reply_rx => {
+            result = response_rx => {
                 let decision: PromptDecision = result.unwrap_or(PromptDecision::Deny);
                 Ok(decision)
             }

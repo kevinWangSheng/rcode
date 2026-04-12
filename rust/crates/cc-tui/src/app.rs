@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 use cc_core::PromptDecision;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 /// One transcript entry. Tool calls and assistant text are flattened into a flat
 /// list so we can render them in order without recovering structure from the
@@ -109,6 +110,9 @@ pub struct App {
     pub session_id: String,
     /// Reply channel for the current permission prompt.
     pub pending_reply: Option<oneshot::Sender<PromptDecision>>,
+    /// Cancellation token for the currently-running engine turn (if any).
+    /// Set on Submit; cancelled on Abort; cleared on TurnComplete.
+    pub current_turn_cancel: Option<CancellationToken>,
 }
 
 impl App {
@@ -125,6 +129,7 @@ impl App {
             queued: VecDeque::new(),
             session_id,
             pending_reply: None,
+            current_turn_cancel: None,
         }
     }
 

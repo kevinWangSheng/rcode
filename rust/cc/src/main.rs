@@ -279,10 +279,52 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if interactive_tui {
-        // TUI path — will be fully implemented in Phase 3 Layer 6.
+        // TUI path: build a full QueryEngine wired to the TUI permission prompter.
+        //
+        // The events channel must be pre-created here so that ChannelPrompter
+        // (passed to QueryEngine) and the engine itself share the same sender.
+        let (events_tx, events_rx) =
+            tokio::sync::mpsc::channel::<cc_core::AppEvent>(512);
+        let tui_prompter: Arc<dyn cc_core::PermissionPrompter> =
+            Arc::new(cc_tui::ChannelPrompter::new(events_tx.clone()));
+
+        let mut tui_tool_registry = ToolRegistry::new();
+        for tool in tools {
+            tui_tool_registry.register(tool);
+        }
+        let tui_engine = QueryEngine::new(
+            api,
+            Arc::new(tui_tool_registry),
+            permission_engine,
+            Arc::new(hook_runner),
+            session,
+            system_blocks,
+            options,
+            tui_prompter,
+        );
+
+        // Discover skills and build the command registry.
+        let config_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".claude");
+        let commands = cc_tui::CommandRegistry::discover(&config_dir);
+        let cmd_ctx = cc_tui::CommandContext {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            model: model.clone(),
+            ..Default::default()
+        };
+
+        let tui_cancel = tokio_util::sync::CancellationToken::new();
         let cfg = TuiConfig {
             model: model.clone(),
-            session_id: session.id.clone(),
+            session_id: tui_engine.session().id.clone(),
+            engine: tui_engine,
+            messages,
+            cancel: tui_cancel,
+            commands,
+            command_ctx: cmd_ctx,
+            events_tx,
+            events_rx,
         };
         cc_tui::run_tui(cfg).await?;
         return Ok(());

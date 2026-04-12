@@ -488,6 +488,7 @@ dependencies = [
  "cc-tui",
  "chrono",
  "clap",
+ "dirs",
  "serde",
  "serde_json",
  "tokio",

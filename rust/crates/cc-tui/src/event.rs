@@ -1,43 +1,6 @@
-//! Internal event union driving the TUI main loop.
+//! Engine → TUI event type.
 //!
-//! Events come from three places:
-//!   1. The blocking input thread reading crossterm events.
-//!   2. The engine task as it streams tokens / asks for permission.
-//!   3. Internal scheduling (e.g. tick, redraw).
+//! Re-exports `cc_core::AppEvent` as the canonical engine event type.
+//! The main loop receives these from the `QueryEngine` via an mpsc channel.
 
-use crossterm::event::KeyEvent;
-use serde_json::Value;
-use tokio::sync::oneshot;
-
-use cc_core::{PromptDecision, Usage};
-
-/// Events delivered to the main loop on a single mpsc channel.
-#[derive(Debug)]
-pub enum AppEvent {
-    /// A raw key event from the terminal.
-    Key(KeyEvent),
-    /// One streaming text delta from the engine.
-    Token(String),
-    /// Tool execution started.
-    ToolStart { name: String, input_summary: String },
-    /// Tool execution finished.
-    ToolEnd { name: String, output: String, is_error: bool },
-    /// The current engine turn finished naturally.
-    EngineDone(Result<String, String>),
-    /// Turn completed with usage data.
-    TurnComplete { usage: Usage },
-    /// The engine asked for permission. The TUI must respond on `reply`.
-    PermissionRequest {
-        tool_name: String,
-        input: Value,
-        reply: oneshot::Sender<PromptDecision>,
-    },
-    /// User-triggered abort (Ctrl+C).
-    Abort,
-    /// User asked to quit (Ctrl+Q).
-    Quit,
-    /// Periodic tick — used to refresh time-sensitive UI elements.
-    Tick,
-    /// Compact boundary marker from engine.
-    CompactBoundary,
-}
+pub use cc_core::AppEvent;

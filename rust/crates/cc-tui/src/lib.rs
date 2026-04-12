@@ -19,10 +19,34 @@ pub use event::AppEvent;
 pub use keybindings::Keybindings;
 pub use prompter::ChannelPrompter;
 
+use std::sync::Arc;
+
+use cc_core::{AppEvent as CoreEvent, MessageParam};
+use cc_query::QueryEngine;
+use futures::StreamExt;
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+
 /// Configuration for the TUI entry point.
 pub struct TuiConfig {
     pub model: String,
     pub session_id: String,
+    /// Fully-constructed engine (built by main with all tools, hooks, session).
+    pub engine: QueryEngine,
+    /// Conversation history (may contain resumed messages).
+    pub messages: Vec<MessageParam>,
+    /// Root cancellation token (user-level Ctrl+C, not per-turn).
+    pub cancel: CancellationToken,
+    /// Pre-built command registry (skills discovered from config dir).
+    pub commands: CommandRegistry,
+    /// Runtime context for command execution.
+    pub command_ctx: CommandContext,
+    /// Sender half of the engine→TUI event channel.
+    /// Must be the same sender used by `ChannelPrompter` so permission
+    /// requests and streaming events share a single receiver.
+    pub events_tx: mpsc::Sender<CoreEvent>,
+    /// Receiver half of the engine→TUI event channel.
+    pub events_rx: mpsc::Receiver<CoreEvent>,
 }
 
 /// Entry point for the interactive TUI.
@@ -33,33 +57,38 @@ pub struct TuiConfig {
 ///   3. A 100ms tick interval for spinner animation.
 pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     use crossterm::event::EventStream;
-    use futures::StreamExt;
-    use tokio::sync::mpsc;
 
+    // ── Channel: engine → TUI ─────────────────────────────────────────────
+    // The channel was pre-created in main so that ChannelPrompter (which the
+    // engine uses for permission prompts) shares the same sender.
+    let events_tx = config.events_tx;
+    let mut events_rx = config.events_rx;
+
+    // Wire the events channel into the engine for streaming deltas / tool events.
+    let engine = config.engine.with_events(events_tx.clone());
+
+    // Wrap engine + message history in a shared mutex so the spawned turn
+    // task can take exclusive access while the main loop owns the terminal.
+    let engine_state: Arc<Mutex<(QueryEngine, Vec<MessageParam>)>> =
+        Arc::new(Mutex::new((engine, config.messages)));
+
+    let root_cancel = config.cancel;
+
+    // ── Build TUI state ───────────────────────────────────────────────────
     let mut app = App::new(config.session_id.clone(), config.model.clone());
-    let kb = Keybindings::load();
-    let commands = CommandRegistry::default();
-    let cmd_ctx = commands::CommandContext::new(env!("CARGO_PKG_VERSION"), &config.model);
-
-    // Channel for engine → TUI events. The engine task (spawned on Submit)
-    // sends AppEvents here; the main loop converts them to AppActions.
-    let (_engine_tx, mut engine_rx) = mpsc::unbounded_channel::<AppEvent>();
-
-    // Initialize terminal
-    let mut terminal = ratatui::init();
-
-    // Crossterm event stream
-    let mut reader = EventStream::new();
-
-    // Tick interval
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-
+    let commands = config.commands;
+    let cmd_ctx = config.command_ctx;
     let update_ctx = UpdateContext {
         commands: &commands,
         command_ctx: &cmd_ctx,
     };
 
-    // Initial render
+    // ── Initialize terminal ───────────────────────────────────────────────
+    let mut terminal = ratatui::init();
+    let mut reader = EventStream::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+
+    // Initial render.
     terminal
         .draw(|frame| render::render(frame, &app))
         .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
@@ -70,24 +99,19 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(crossterm::event::Event::Key(key))) => {
+                        let kb = Keybindings::load();
                         map_key_event(&key, &kb, &app)
                     }
-                    Some(Ok(crossterm::event::Event::Resize(_, _))) => {
-                        // Just redraw
-                        None
-                    }
-                    Some(Err(_)) | None => {
-                        // Terminal closed or error — quit
-                        Some(AppAction::Quit)
-                    }
+                    Some(Ok(crossterm::event::Event::Resize(_, _))) => None,
+                    Some(Err(_)) | None => Some(AppAction::Quit),
                     _ => None,
                 }
             }
             // Branch 2: engine events
-            Some(event) = engine_rx.recv() => {
+            Some(event) = events_rx.recv() => {
                 map_engine_event(event)
             }
-            // Branch 3: tick
+            // Branch 3: tick (spinner animation)
             _ = tick.tick() => {
                 Some(AppAction::Tick)
             }
@@ -95,18 +119,39 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
 
         if let Some(action) = action {
             let result = update(&mut app, action, &update_ctx);
-            if result == UpdateResult::Quit {
-                break;
+            match result {
+                UpdateResult::Quit => break,
+                UpdateResult::SubmitToEngine(text) => {
+                    // Spawn a background task for this engine turn.
+                    let es = engine_state.clone();
+                    let child_cancel = root_cancel.child_token();
+                    app.current_turn_cancel = Some(child_cancel.clone());
+                    let tx = events_tx.clone();
+                    tokio::spawn(async move {
+                        let mut guard = es.lock().await;
+                        let (engine, messages) = &mut *guard;
+                        if let Err(e) = engine
+                            .run_turn(text, |_| {}, messages, &child_cancel)
+                            .await
+                        {
+                            // Send the error to the TUI (TurnComplete was not
+                            // sent by the engine in this error path).
+                            let _ = tx.send(CoreEvent::Error(e.to_string())).await;
+                        }
+                        // On success the engine already sent TurnComplete.
+                    });
+                }
+                UpdateResult::Continue => {}
             }
         }
 
-        // Redraw
+        // Redraw after every event.
         terminal
             .draw(|frame| render::render(frame, &app))
             .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
     }
 
-    // Restore terminal
+    // Restore terminal.
     ratatui::restore();
     Ok(())
 }
@@ -162,27 +207,90 @@ fn map_key_event(
     }
 }
 
-/// Map an engine event to an AppAction.
-fn map_engine_event(event: AppEvent) -> Option<AppAction> {
+/// Map a `cc_core::AppEvent` from the engine to an `AppAction`.
+fn map_engine_event(event: CoreEvent) -> Option<AppAction> {
     match event {
-        AppEvent::Token(delta) => Some(AppAction::StreamDelta(delta)),
-        AppEvent::ToolStart { name, input_summary } => {
+        CoreEvent::StreamDelta(text) => Some(AppAction::StreamDelta(text)),
+        CoreEvent::ToolStart { name, input } => {
+            let input_summary = summarize_input(&input);
             Some(AppAction::ToolStart { name, input_summary })
         }
-        AppEvent::ToolEnd { name, output, is_error } => {
-            Some(AppAction::ToolEnd { name, output, is_error })
+        CoreEvent::ToolEnd { name, result } => {
+            // Truncate very long tool output for display.
+            let output = truncate_output(&result.content);
+            Some(AppAction::ToolEnd {
+                name,
+                output,
+                is_error: result.is_error,
+            })
         }
-        AppEvent::EngineDone(Ok(_)) => Some(AppAction::StreamEnd),
-        AppEvent::EngineDone(Err(msg)) => Some(AppAction::Error(msg)),
-        AppEvent::TurnComplete { usage } => Some(AppAction::TurnComplete { usage }),
-        AppEvent::PermissionRequest { tool_name, input, reply } => {
-            let summary = format!("{}: {}", tool_name, serde_json::to_string(&input).unwrap_or_default());
-            Some(AppAction::ShowPermission { tool_name, summary, reply })
+        CoreEvent::TurnComplete { usage } => Some(AppAction::TurnComplete { usage }),
+        CoreEvent::CompactBoundary => Some(AppAction::CompactBoundary),
+        CoreEvent::PermissionRequest { id: _, tool_name, tool_input, response_tx } => {
+            let summary = summarize_input(&tool_input);
+            Some(AppAction::ShowPermission {
+                tool_name,
+                summary,
+                reply: response_tx,
+            })
         }
-        AppEvent::Abort => Some(AppAction::Abort),
-        AppEvent::Quit => Some(AppAction::Quit),
-        AppEvent::Tick => Some(AppAction::Tick),
-        AppEvent::CompactBoundary => Some(AppAction::CompactBoundary),
-        AppEvent::Key(_) => None, // Already handled by the terminal branch
+        CoreEvent::Error(msg) => Some(AppAction::Error(msg)),
+        // Ignored: thinking blocks and streaming tool-use fragments are
+        // internal streaming details not shown in the transcript view.
+        CoreEvent::StreamThinking(_)
+        | CoreEvent::StreamToolUse(_)
+        | CoreEvent::StreamEnd(_)
+        | CoreEvent::TaskUpdate(_) => None,
+    }
+}
+
+/// Format a JSON `Value` as a short one-line summary for the transcript.
+fn summarize_input(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            // Pick the most informative field: command, path, pattern, query, url.
+            for key in &["command", "path", "pattern", "query", "url", "content"] {
+                if let Some(serde_json::Value::String(s)) = map.get(*key) {
+                    let s = s.trim();
+                    if s.len() > 120 {
+                        return format!("{}…", &s[..120]);
+                    }
+                    return s.to_string();
+                }
+            }
+            // Fall back to compact JSON, truncated.
+            let s = serde_json::to_string(v).unwrap_or_default();
+            if s.len() > 120 {
+                format!("{}…", &s[..120])
+            } else {
+                s
+            }
+        }
+        serde_json::Value::String(s) => {
+            if s.len() > 120 {
+                format!("{}…", &s[..120])
+            } else {
+                s.clone()
+            }
+        }
+        other => {
+            let s = other.to_string();
+            if s.len() > 120 { format!("{}…", &s[..120]) } else { s }
+        }
+    }
+}
+
+/// Truncate long tool output to a preview for transcript display.
+fn truncate_output(s: &str) -> String {
+    const MAX_LINES: usize = 20;
+    const MAX_CHARS: usize = 2000;
+    let lines: Vec<&str> = s.lines().take(MAX_LINES + 1).collect();
+    let truncated_lines = lines.len() > MAX_LINES;
+    let joined = lines[..lines.len().min(MAX_LINES)].join("\n");
+    if truncated_lines || joined.len() > MAX_CHARS {
+        let preview = &joined[..joined.len().min(MAX_CHARS)];
+        format!("{preview}\n… (truncated)")
+    } else {
+        joined
     }
 }
