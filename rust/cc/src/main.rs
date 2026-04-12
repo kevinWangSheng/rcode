@@ -16,7 +16,7 @@ use cc_query::{
     SubAgentRunnerImpl, StdinPrompter, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
-use cc_tools::{agent_tool::AgentTool, all_tools};
+use cc_tools::{agent_tool::AgentTool, ask_user_question::AskUserQuestionTool, all_tools};
 use cc_tui::TuiConfig;
 
 /// Claude Code — Rust implementation (Milestone 2: Tool Execution + Session)
@@ -243,6 +243,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Credentials::OAuthToken(t) => AuthCredential::OAuthToken(t),
     };
     let api = ApiClient::new(http, auth);
+
+    // Add AskUserQuestionTool — wired with a StdinPrompter for headless and
+    // TUI modes (TUI will get full dialog support via a future AppEvent variant).
+    {
+        let ask_prompter: Arc<dyn cc_core::PermissionPrompter> =
+            Arc::new(StdinPrompter::new(non_interactive));
+        tools.push(Arc::new(AskUserQuestionTool { prompter: ask_prompter }));
+    }
 
     // Wire AgentTool: build a base registry (without AgentTool) to give to the
     // SubAgentRunner, then add AgentTool to the full tool list.

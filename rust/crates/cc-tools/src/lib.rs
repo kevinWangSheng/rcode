@@ -1,9 +1,13 @@
 pub mod agent_tool;
+pub mod ask_user_question;
 pub mod bash;
 pub mod edit;
+pub mod enter_plan_mode;
+pub mod exit_plan_mode;
 pub mod glob_tool;
 pub mod grep;
 pub mod read;
+pub mod sleep_tool;
 pub mod task_create;
 pub mod task_get;
 pub mod task_list;
@@ -23,7 +27,7 @@ pub use todo::TodoList;
 use cc_agents::TaskRegistry;
 use std::sync::{Arc, Mutex};
 
-/// Build the default set of stateless built-in tools (8 core tools).
+/// Build the default set of stateless built-in tools (11 core tools).
 pub fn default_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(bash::BashTool),
@@ -34,6 +38,9 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(grep::GrepTool),
         Arc::new(web_fetch::WebFetchTool),
         Arc::new(web_search::WebSearchTool),
+        Arc::new(sleep_tool::SleepTool),
+        Arc::new(enter_plan_mode::EnterPlanModeTool),
+        Arc::new(exit_plan_mode::ExitPlanModeTool),
     ]
 }
 

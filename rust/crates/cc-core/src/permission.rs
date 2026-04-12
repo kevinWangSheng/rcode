@@ -89,6 +89,21 @@ pub trait PermissionPrompter: Send + Sync {
         tool_input: &Value,
         cancel: &CancellationToken,
     ) -> CcResult<PromptDecision>;
+
+    /// Ask the user a free-form question and return their response.
+    ///
+    /// `options` is an optional list of suggested responses to display.
+    /// The default implementation returns a message indicating the user
+    /// is not available (non-interactive context).
+    async fn ask_question(
+        &self,
+        question: &str,
+        options: &[String],
+        cancel: &CancellationToken,
+    ) -> CcResult<String> {
+        let _ = (question, options, cancel);
+        Ok("User is not available to answer questions in this mode.".to_string())
+    }
 }
 
 #[cfg(test)]
