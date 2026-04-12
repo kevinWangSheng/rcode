@@ -113,6 +113,38 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Permission mode — controls the default behavior when no rule matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionMode {
+    /// Normal interactive mode: ask the user when no rule matches.
+    #[default]
+    Default,
+    /// `dontAsk` / auto-approve mode: auto-allow after deny check (no dialog).
+    DontAsk,
+    /// `plan` mode: read-only tools allowed; write tools auto-denied.
+    Plan,
+}
+
+impl PermissionMode {
+    /// Parse from the `defaultMode` settings string.
+    pub fn from_settings_str(s: &str) -> Self {
+        match s {
+            "dontAsk" | "bypassPermissions" | "acceptEdits" => Self::DontAsk,
+            "plan" => Self::Plan,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// Write tools — auto-denied in plan mode.
+static WRITE_TOOLS: &[&str] = &["Write", "Edit", "Bash", "MultiEdit"];
+
+fn is_write_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    WRITE_TOOLS.iter().any(|w| lower == w.to_ascii_lowercase())
+        || lower.starts_with("mcp__") // MCP tools are assumed mutating
+}
+
 /// Engine that evaluates permission rules against tool invocations.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionEngine {
@@ -122,8 +154,10 @@ pub struct PermissionEngine {
     deny_rules: Vec<PermissionRule>,
     /// Session-level allow rules added at runtime (e.g., user chose "always").
     session_allow: Vec<PermissionRule>,
-    /// If true, all tools are allowed without prompting.
+    /// If true, all tools are allowed without prompting (--bypass-permissions flag).
     bypass: bool,
+    /// Permission mode from settings defaultMode.
+    mode: PermissionMode,
 }
 
 impl PermissionEngine {
@@ -143,12 +177,23 @@ impl PermissionEngine {
                 .collect(),
             session_allow: Vec::new(),
             bypass: false,
+            mode: PermissionMode::Default,
         }
     }
 
     /// Enable bypass mode (--bypass-permissions flag).
     pub fn set_bypass(&mut self, bypass: bool) {
         self.bypass = bypass;
+    }
+
+    /// Set the permission mode from settings `defaultMode`.
+    pub fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+    }
+
+    /// Set the permission mode from the string value in settings.
+    pub fn set_mode_str(&mut self, mode: &str) {
+        self.mode = PermissionMode::from_settings_str(mode);
     }
 
     /// Add a session-level allow rule (user chose "always allow" at runtime).
@@ -158,14 +203,14 @@ impl PermissionEngine {
 
     /// Evaluate the permission for a tool call, returning the decision with audit trail.
     ///
-    /// Priority: bypass → deny → session allow → settings allow → Ask
+    /// Priority: bypass → deny → session allow → settings allow → mode default → Ask
     pub fn check(&self, tool_name: &str, input: &Value) -> PermissionResult {
-        // 0. Bypass mode
+        // 0. Bypass mode (--bypass-permissions CLI flag)
         if self.bypass {
             return PermissionResult::allow(PermissionSource::BypassFlag);
         }
 
-        // 1. Deny rules (highest priority)
+        // 1. Deny rules (highest priority among rule-based checks)
         for rule in &self.deny_rules {
             if rule.matches(tool_name, input) {
                 return PermissionResult::deny(
@@ -189,8 +234,29 @@ impl PermissionEngine {
             }
         }
 
-        // 4. Default: ask the user
-        PermissionResult::ask()
+        // 4. Mode-based default behavior
+        match self.mode {
+            PermissionMode::DontAsk => {
+                // Auto-allow: no dialog, no prompt
+                PermissionResult::allow(PermissionSource::ModeDefault)
+            }
+            PermissionMode::Plan => {
+                if is_write_tool(tool_name) {
+                    // Plan mode: write tools are auto-denied
+                    PermissionResult::deny(
+                        PermissionSource::ModeDefault,
+                        format!("{tool_name} is not allowed in plan mode"),
+                    )
+                } else {
+                    // Read-only tools allowed in plan mode
+                    PermissionResult::allow(PermissionSource::ModeDefault)
+                }
+            }
+            PermissionMode::Default => {
+                // Ask the user interactively
+                PermissionResult::ask()
+            }
+        }
     }
 }
 
@@ -326,5 +392,88 @@ mod tests {
             engine.check("mcp__other__tool", &json!({})).behavior,
             PermissionBehavior::Ask
         );
+    }
+
+    #[test]
+    fn dont_ask_mode_auto_allows_after_deny() {
+        let mut engine = PermissionEngine::default();
+        engine.set_mode(PermissionMode::DontAsk);
+        // No rules — mode should auto-allow
+        let result = engine.check("Bash", &json!({}));
+        assert_eq!(result.behavior, PermissionBehavior::Allow);
+        assert_eq!(result.source, PermissionSource::ModeDefault);
+    }
+
+    #[test]
+    fn dont_ask_mode_deny_still_applies() {
+        let mut engine =
+            PermissionEngine::from_settings(Vec::<Value>::new(), [json!("Bash")]);
+        engine.set_mode(PermissionMode::DontAsk);
+        // Deny rules still win even in dontAsk mode
+        let result = engine.check("Bash", &json!({}));
+        assert_eq!(result.behavior, PermissionBehavior::Deny);
+        assert_eq!(result.source, PermissionSource::SettingsDeny);
+    }
+
+    #[test]
+    fn plan_mode_denies_write_allows_read() {
+        let mut engine = PermissionEngine::default();
+        engine.set_mode(PermissionMode::Plan);
+
+        // Write tools auto-denied
+        assert_eq!(
+            engine.check("Write", &json!({})).behavior,
+            PermissionBehavior::Deny
+        );
+        assert_eq!(
+            engine.check("Bash", &json!({})).behavior,
+            PermissionBehavior::Deny
+        );
+        assert_eq!(
+            engine.check("Edit", &json!({})).behavior,
+            PermissionBehavior::Deny
+        );
+
+        // Read-only tools auto-allowed
+        assert_eq!(
+            engine.check("Read", &json!({})).behavior,
+            PermissionBehavior::Allow
+        );
+        assert_eq!(
+            engine.check("Glob", &json!({})).behavior,
+            PermissionBehavior::Allow
+        );
+        assert_eq!(
+            engine.check("Grep", &json!({})).behavior,
+            PermissionBehavior::Allow
+        );
+    }
+
+    #[test]
+    fn plan_mode_deny_rule_still_applies_to_reads() {
+        let mut engine =
+            PermissionEngine::from_settings(Vec::<Value>::new(), [json!("Read")]);
+        engine.set_mode(PermissionMode::Plan);
+        // Explicit deny overrides plan-mode allow for read tools
+        assert_eq!(
+            engine.check("Read", &json!({})).behavior,
+            PermissionBehavior::Deny
+        );
+    }
+
+    #[test]
+    fn set_mode_str_parses_known_values() {
+        let mut engine = PermissionEngine::default();
+        engine.set_mode_str("dontAsk");
+        assert_eq!(engine.mode, PermissionMode::DontAsk);
+
+        engine.set_mode_str("plan");
+        assert_eq!(engine.mode, PermissionMode::Plan);
+
+        engine.set_mode_str("unknown");
+        assert_eq!(engine.mode, PermissionMode::Default);
+
+        engine.set_mode_str("bypassPermissions");
+        assert_eq!(engine.mode, PermissionMode::DontAsk);
     }
 }

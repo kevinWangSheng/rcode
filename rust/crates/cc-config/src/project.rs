@@ -122,12 +122,12 @@ fn normalize_path(path: &Path) -> PathBuf {
     {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
+        use unicode_normalization::UnicodeNormalization;
         // NFC-normalize the path string if it contains non-ASCII bytes
         let bytes = path.as_os_str().as_bytes();
         if bytes.iter().any(|&b| b > 127) {
             if let Ok(s) = std::str::from_utf8(bytes) {
-                // Use Unicode NFC normalization
-                let normalized: String = s.chars().collect(); // TODO: use unicode-normalization crate for proper NFC
+                let normalized: String = s.nfc().collect();
                 return PathBuf::from(OsStr::from_bytes(normalized.as_bytes()));
             }
         }
