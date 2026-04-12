@@ -3,7 +3,9 @@ pub mod ask_user_question;
 pub mod bash;
 pub mod edit;
 pub mod enter_plan_mode;
+pub mod enter_worktree;
 pub mod exit_plan_mode;
+pub mod exit_worktree;
 pub mod glob_tool;
 pub mod grep;
 pub mod read;
@@ -15,6 +17,7 @@ pub mod task_output;
 pub mod task_stop;
 pub mod task_update;
 pub mod todo;
+pub mod todo_write;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write;
@@ -23,11 +26,12 @@ pub mod write;
 pub use cc_core::tool::{Tool, ToolResult};
 pub use cc_core::{ToolDefinition, ToolInputSchema};
 pub use todo::TodoList;
+pub use todo_write::TodoWriteList;
 
 use cc_agents::TaskRegistry;
 use std::sync::{Arc, Mutex};
 
-/// Build the default set of stateless built-in tools (11 core tools).
+/// Build the default set of stateless built-in tools (13 core tools).
 pub fn default_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(bash::BashTool),
@@ -41,6 +45,8 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(sleep_tool::SleepTool),
         Arc::new(enter_plan_mode::EnterPlanModeTool),
         Arc::new(exit_plan_mode::ExitPlanModeTool),
+        Arc::new(enter_worktree::EnterWorktreeTool),
+        Arc::new(exit_worktree::ExitWorktreeTool),
     ]
 }
 
@@ -68,26 +74,26 @@ pub fn background_task_tools(registry: Arc<Mutex<TaskRegistry>>) -> Vec<Arc<dyn 
     ]
 }
 
-/// Build all built-in tools: 8 core tools + 4 todo task tools + 2 background task tools.
+/// Build all built-in tools: 13 core tools + TodoWrite + 4 task tools + 2 background task tools.
 ///
-/// **Does not include AgentTool** — add it separately after building the ToolRegistry
-/// to avoid a cc-tools → cc-query → cc-tools circular dependency:
+/// **Does not include AgentTool or AskUserQuestionTool** — add them separately after
+/// building the ToolRegistry (AgentTool to break the circular dep, AskUserQuestion
+/// because it needs the prompter which is mode-specific).
 ///
-/// ```ignore
-/// let (mut tools, list, task_reg) = all_tools();
-/// // ... add MCP tools ...
-/// let shared_reg = Arc::new(build_registry(&tools));
-/// let runner = Arc::new(SubAgentRunnerImpl { tools: shared_reg.clone(), ... });
-/// tools.push(Arc::new(AgentTool { runner: Some(runner) }));
-/// let full_reg = Arc::new(build_registry(&tools));
-/// ```
-///
-/// Returns the combined tool list, the shared todo list, and the shared task registry.
-pub fn all_tools() -> (Vec<Arc<dyn Tool>>, Arc<Mutex<TodoList>>, Arc<Mutex<TaskRegistry>>) {
+/// Returns the combined tool list, the shared todo list, the TodoWrite list,
+/// and the shared task registry.
+pub fn all_tools() -> (
+    Vec<Arc<dyn Tool>>,
+    Arc<Mutex<TodoList>>,
+    Arc<Mutex<todo_write::TodoWriteList>>,
+    Arc<Mutex<TaskRegistry>>,
+) {
     let list = Arc::new(Mutex::new(TodoList::new()));
+    let todo_write_list = Arc::new(Mutex::new(todo_write::TodoWriteList::new()));
     let registry = Arc::new(Mutex::new(TaskRegistry::new(16)));
     let mut tools = default_tools();
     tools.extend(task_tools(list.clone()));
     tools.extend(background_task_tools(registry.clone()));
-    (tools, list, registry)
+    tools.push(Arc::new(todo_write::TodoWriteTool { list: todo_write_list.clone() }));
+    (tools, list, todo_write_list, registry)
 }
