@@ -216,7 +216,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let hook_runner = HookRunner::new(&hooks_config, http.clone());
 
     // Build tools (built-in + task management + MCP servers from settings.json `mcpServers`).
-    let (mut tools, _todo_list) = all_tools();
+    let (mut tools, _todo_list, _task_registry) = all_tools();
     if let Some(mcp_servers) = settings.extra.get("mcpServers") {
         let (mcp_tools, errors) = cc_mcp::load_mcp_tools_from_config(mcp_servers).await;
         for err in &errors {

@@ -6,6 +6,8 @@ pub mod read;
 pub mod task_create;
 pub mod task_get;
 pub mod task_list;
+pub mod task_output;
+pub mod task_stop;
 pub mod task_update;
 pub mod todo;
 pub mod web_fetch;
@@ -17,6 +19,7 @@ pub use cc_core::tool::{Tool, ToolResult};
 pub use cc_core::{ToolDefinition, ToolInputSchema};
 pub use todo::TodoList;
 
+use cc_agents::TaskRegistry;
 use std::sync::{Arc, Mutex};
 
 /// Build the default set of stateless built-in tools (8 core tools).
@@ -47,13 +50,24 @@ pub fn task_tools(list: Arc<Mutex<TodoList>>) -> Vec<Arc<dyn Tool>> {
     ]
 }
 
-/// Build all built-in tools: 8 core tools + 4 task management tools.
+/// Build background task management tools (TaskStop, TaskOutput) sharing a TaskRegistry.
 ///
-/// Returns both the combined tool list and the shared todo list so callers can
-/// attach the list to a status panel or other components.
-pub fn all_tools() -> (Vec<Arc<dyn Tool>>, Arc<Mutex<TodoList>>) {
+/// The registry should be the same one used by cc-agents to spawn background tasks.
+pub fn background_task_tools(registry: Arc<Mutex<TaskRegistry>>) -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(task_stop::TaskStopTool { registry: registry.clone() }),
+        Arc::new(task_output::TaskOutputTool { registry }),
+    ]
+}
+
+/// Build all built-in tools: 8 core tools + 4 todo task tools + 2 background task tools.
+///
+/// Returns the combined tool list, the shared todo list, and the shared task registry.
+pub fn all_tools() -> (Vec<Arc<dyn Tool>>, Arc<Mutex<TodoList>>, Arc<Mutex<TaskRegistry>>) {
     let list = Arc::new(Mutex::new(TodoList::new()));
+    let registry = Arc::new(Mutex::new(TaskRegistry::new(16)));
     let mut tools = default_tools();
     tools.extend(task_tools(list.clone()));
-    (tools, list)
+    tools.extend(background_task_tools(registry.clone()));
+    (tools, list, registry)
 }
