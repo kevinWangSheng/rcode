@@ -3,9 +3,11 @@
 //! Each function runs a specific task type as an async future that can be
 //! spawned into the TaskRegistry.
 
-use cc_core::{CcError, CcResult};
+use cc_core::{CcError, CcResult, SubAgentRunner};
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::TaskOutput;
@@ -49,26 +51,60 @@ pub async fn run_local_bash(
     }
 }
 
-/// Placeholder for local_agent task type.
-/// Full implementation requires a reference to QueryEngine which creates
-/// a circular dependency — will be wired via trait object in Layer 6.
+/// Run an in-process sub-agent (local_agent task type).
+///
+/// Executes a single agent turn and returns the output. Wired via the
+/// `SubAgentRunner` trait to avoid cc-agents → cc-query circular dependency.
 pub async fn run_local_agent(
-    _prompt: String,
-    _cancel: CancellationToken,
+    prompt: String,
+    runner: Arc<dyn SubAgentRunner>,
+    cancel: CancellationToken,
 ) -> CcResult<TaskOutput> {
-    Err(CcError::Other(
-        "local_agent not yet implemented".to_string(),
-    ))
+    let content = runner.run(None, prompt, Vec::new(), cancel).await?;
+    Ok(TaskOutput {
+        summary: "agent completed".into(),
+        content,
+    })
 }
 
-/// Placeholder for in_process_teammate task type.
+/// Run an in-process teammate agent (in_process_teammate task type).
+///
+/// Runs an initial turn, then loops processing messages from the mailbox
+/// inbox until the inbox is closed or the task is cancelled. Each inbox
+/// message becomes a new user turn.
 pub async fn run_in_process_teammate(
-    _prompt: String,
-    _cancel: CancellationToken,
+    prompt: String,
+    runner: Arc<dyn SubAgentRunner>,
+    mut inbox: mpsc::Receiver<String>,
+    cancel: CancellationToken,
 ) -> CcResult<TaskOutput> {
-    Err(CcError::Other(
-        "in_process_teammate not yet implemented".to_string(),
-    ))
+    // Run initial turn
+    let mut last_output = runner
+        .run(None, prompt, Vec::new(), cancel.clone())
+        .await?;
+
+    // Process inbox messages until cancelled or closed
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            msg = inbox.recv() => {
+                match msg {
+                    None => break, // inbox closed (TeamDelete called)
+                    Some(message) => {
+                        last_output = runner
+                            .run(None, message, Vec::new(), cancel.clone())
+                            .await?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(TaskOutput {
+        summary: "teammate completed".into(),
+        content: last_output,
+    })
 }
 
 /// Remote agent task type: delegate to a remote Claude Code instance via HTTP API.
