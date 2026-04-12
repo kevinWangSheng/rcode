@@ -74,6 +74,11 @@ struct Cli {
     #[arg(long)]
     non_interactive: bool,
 
+    /// Add additional working directory paths to the session context.
+    /// The model will be informed about these directories and can read files from them.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    add_dir: Vec<String>,
+
     /// Enable verbose / debug logging.
     #[arg(short, long)]
     verbose: bool,
@@ -191,7 +196,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build system prompt blocks
-    let system_blocks = build_system_blocks(&model).await;
+    let system_blocks = build_system_blocks(&model, &cli.add_dir).await;
 
     // Build permission engine
     let perms = settings.permissions.as_ref();
@@ -442,7 +447,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn build_system_blocks(model: &str) -> Vec<SystemBlock> {
+async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBlock> {
     let mut blocks = Vec::new();
 
     // Static attribution block
@@ -481,6 +486,16 @@ async fn build_system_blocks(model: &str) -> Vec<SystemBlock> {
                 kind: "ephemeral".into(),
                 scope: None,
             }),
+        });
+    }
+
+    // Additional working directories
+    if !add_dirs.is_empty() {
+        let dirs_text = add_dirs.iter().map(|d| format!("  - {d}")).collect::<Vec<_>>().join("\n");
+        blocks.push(SystemBlock {
+            kind: "text".into(),
+            text: format!("Additional working directories available:\n{dirs_text}"),
+            cache_control: None,
         });
     }
 
