@@ -276,9 +276,47 @@ impl QueryEngine {
                     // Continue loop
                 }
                 _ => {
-                    // end_turn, max_tokens, or stop_sequence → done
-                    self.emit(AppEvent::TurnComplete { usage }).await;
-                    break;
+                    // §5.1: Fire Stop hook before concluding the turn.
+                    // Exit 2 → stderr → model, continue conversation.
+                    let stop_input = HookInput {
+                        session_id: self.session.id.clone(),
+                        transcript_path: Some(
+                            self.session.transcript_path().to_string_lossy().to_string(),
+                        ),
+                        cwd: std::env::current_dir()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        permission_mode: None,
+                        hook_event_name: "Stop".to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_use_id: None,
+                        tool_response: None,
+                        source: None,
+                        model: Some(self.options.model.clone()),
+                        message: None,
+                        agent_id: None,
+                        stop_hook_active: Some(true),
+                        last_assistant_message: if final_text.is_empty() {
+                            None
+                        } else {
+                            Some(final_text.clone())
+                        },
+                    };
+                    let stop_result = self.hooks.run("Stop", &stop_input, cancel).await;
+                    if stop_result.blocked {
+                        // Inject block message as user turn and continue loop
+                        let block_msg = stop_result.block_message.unwrap_or_default();
+                        debug!("Stop hook blocked: continuing conversation with model");
+                        let continue_msg = MessageParam::user(block_msg);
+                        self.session.append(&continue_msg)?;
+                        messages.push(continue_msg);
+                        // loop continues — don't break or emit TurnComplete yet
+                    } else {
+                        self.emit(AppEvent::TurnComplete { usage }).await;
+                        break;
+                    }
                 }
             }
         }
@@ -411,6 +449,8 @@ impl QueryEngine {
             model: None,
             message: None,
             agent_id: None,
+            stop_hook_active: None,
+            last_assistant_message: None,
         };
         let hook_result = self.hooks.run("PreToolUse", &hook_input, cancel).await;
         if hook_result.blocked {
@@ -524,6 +564,8 @@ async fn run_post_tool_hook(
         model: None,
         message: None,
         agent_id: None,
+        stop_hook_active: None,
+        last_assistant_message: None,
     };
     let _ = hooks.run("PostToolUse", &hook_input, cancel).await;
 }
@@ -585,7 +627,7 @@ fn strip_images(msg: &MessageParam) -> MessageParam {
                     ContentBlock::Image(_) => None,
                     ContentBlock::ToolResult(tr) => {
                         // Strip image blocks from tool_result content arrays
-                        let content = tr.content.as_ref().map(|v| strip_images_from_value(v));
+                        let content = tr.content.as_ref().map(strip_images_from_value);
                         Some(ContentBlock::ToolResult(cc_core::ToolResultBlock {
                             tool_use_id: tr.tool_use_id.clone(),
                             content,

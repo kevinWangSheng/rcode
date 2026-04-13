@@ -109,6 +109,7 @@ impl TodoList {
     }
 
     /// Update a task. Returns an error string if the task does not exist.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         id: &str,

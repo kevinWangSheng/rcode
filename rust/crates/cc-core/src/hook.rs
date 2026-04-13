@@ -184,6 +184,12 @@ pub struct HookInput {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Stop hook: whether a stop hook is already active (prevents recursion).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_hook_active: Option<bool>,
+    /// Stop hook: last assistant message text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
 }
 
 #[cfg(test)]

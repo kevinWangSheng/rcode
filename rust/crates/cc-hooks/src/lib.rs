@@ -96,6 +96,21 @@ impl HookRunner {
         hooks.entry(event.to_string()).or_default().push(group);
     }
 
+    /// Run `SessionEnd` hooks with a tight 1.5s timeout (§5.2 behavior contract).
+    /// Respects `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` env var override.
+    pub async fn run_session_end(&self, input: &HookInput) {
+        if self.disabled {
+            return;
+        }
+        let timeout_ms: u64 = std::env::var("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1500);
+        let cancel = CancellationToken::new();
+        let result_fut = self.run("SessionEnd", input, &cancel);
+        let _ = tokio::time::timeout(Duration::from_millis(timeout_ms), result_fut).await;
+    }
+
     /// List all hook event names with at least one handler.
     pub fn event_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
@@ -162,6 +177,10 @@ impl HookRunner {
         // Setup CLAUDE_ENV_FILE
         let env_file = setup_env_file();
 
+        // Extract env context from input for subprocess injection
+        let session_id = input.session_id.clone();
+        let cwd = input.cwd.clone();
+
         // Execute all in parallel
         let futures: Vec<_> = hooks
             .into_iter()
@@ -170,6 +189,8 @@ impl HookRunner {
                 let cancel = cancel.clone();
                 let http = self.http.clone();
                 let env_path = env_file.as_ref().map(|(p, _)| p.clone());
+                let sid = session_id.clone();
+                let cwd = cwd.clone();
                 async move {
                     let timeout = Duration::from_secs(h.timeout);
                     tokio::select! {
@@ -177,7 +198,7 @@ impl HookRunner {
                         _ = cancel.cancelled() => HookOutcome::Failed("cancelled".into()),
                         result = tokio::time::timeout(
                             timeout,
-                            execute_one_hook(h, &input_json, &http, env_path.as_deref()),
+                            execute_one_hook(h, &input_json, &http, env_path.as_deref(), &sid, &cwd),
                         ) => {
                             match result {
                                 Ok(outcome) => outcome,
@@ -276,6 +297,8 @@ async fn execute_one_hook(
     input_json: &str,
     http: &reqwest::Client,
     env_file_path: Option<&Path>,
+    session_id: &str,
+    cwd: &str,
 ) -> HookOutcome {
     match &hook.kind {
         HookKind::Command => {
@@ -283,7 +306,7 @@ async fn execute_one_hook(
                 return HookOutcome::Ok; // silently skip
             };
             let shell = hook.shell.as_deref().unwrap_or("bash");
-            run_command_hook(command, input_json, shell, env_file_path).await
+            run_command_hook(command, input_json, shell, env_file_path, session_id, cwd).await
         }
         HookKind::Prompt => {
             // cc-core uses `text` field (with `prompt` as serde alias)
@@ -313,13 +336,18 @@ async fn run_command_hook(
     input_json: &str,
     shell: &str,
     env_file_path: Option<&Path>,
+    session_id: &str,
+    cwd: &str,
 ) -> HookOutcome {
     let mut cmd = Command::new(shell);
     cmd.arg("-c")
         .arg(command)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // §5.3: inject hook environment variables (TS: hooks.ts:815-926)
+        .env("CLAUDE_SESSION_ID", session_id)
+        .env("CLAUDE_CWD", cwd);
 
     if let Some(path) = env_file_path {
         cmd.env("CLAUDE_ENV_FILE", path);
@@ -489,6 +517,8 @@ mod tests {
             model: None,
             message: None,
             agent_id: None,
+            stop_hook_active: None,
+            last_assistant_message: None,
         }
     }
 
@@ -654,5 +684,72 @@ mod tests {
         let result = runner.run("PreToolUse", &input, &cancel).await;
         assert!(result.blocked);
         assert_eq!(result.block_message.as_deref(), Some("session block"));
+    }
+
+    #[tokio::test]
+    async fn command_hook_injects_session_env_vars() {
+        // Hook prints CLAUDE_SESSION_ID and CLAUDE_CWD — we check exit code 0
+        // to confirm the variables are set (a missing var causes `echo $VAR` to print
+        // an empty line, not fail, so we use `test -n "$VAR"` instead).
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "test -n \"$CLAUDE_SESSION_ID\" && test -n \"$CLAUDE_CWD\""}]}]
+        }"#,
+        )
+        .unwrap();
+        let runner = HookRunner::new(&settings, reqwest::Client::new());
+        let mut input = test_input("PreToolUse");
+        input.session_id = "test-session-123".into();
+        input.cwd = "/tmp/test".into();
+        let cancel = CancellationToken::new();
+        let result = runner.run("PreToolUse", &input, &cancel).await;
+        // Command exits 0 if both vars are set → not blocked, no failures
+        assert!(!result.blocked);
+        assert!(result.failures.is_empty(), "failures: {:?}", result.failures);
+    }
+
+    #[tokio::test]
+    async fn stop_hook_input_has_correct_fields() {
+        // Verify HookInput serializes stop_hook_active and last_assistant_message
+        let input = HookInput {
+            session_id: "sess".into(),
+            transcript_path: None,
+            cwd: "/".into(),
+            permission_mode: None,
+            hook_event_name: "Stop".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_response: None,
+            source: None,
+            model: None,
+            message: None,
+            agent_id: None,
+            stop_hook_active: Some(true),
+            last_assistant_message: Some("hello".into()),
+        };
+        let json = serde_json::to_value(&input).unwrap();
+        assert_eq!(json["stop_hook_active"], serde_json::json!(true));
+        assert_eq!(json["last_assistant_message"], serde_json::json!("hello"));
+        assert_eq!(json["hook_event_name"], serde_json::json!("Stop"));
+    }
+
+    #[tokio::test]
+    async fn session_end_respects_tight_timeout() {
+        // Hook sleeps 10s — session_end enforces 1.5s (or env override).
+        // We use a 100ms override via env var to keep the test fast.
+        std::env::set_var("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS", "100");
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{"SessionEnd": [{"hooks": [{"type": "command", "command": "sleep 10", "timeout": 30}]}]}"#,
+        )
+        .unwrap();
+        let runner = HookRunner::new(&settings, reqwest::Client::new());
+        let input = test_input("SessionEnd");
+        let start = std::time::Instant::now();
+        runner.run_session_end(&input).await;
+        let elapsed = start.elapsed();
+        std::env::remove_var("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS");
+        // Should return in ~100ms, well under 1 second
+        assert!(elapsed < std::time::Duration::from_secs(1), "took {:?}", elapsed);
     }
 }

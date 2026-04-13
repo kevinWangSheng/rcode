@@ -97,6 +97,7 @@ pub fn swarm_tools(directory: Arc<Mutex<TeammateDirectory>>) -> Vec<Arc<dyn Tool
 ///
 /// Returns the combined tool list, shared todo list, TodoWrite list, task registry,
 /// and teammate directory.
+#[allow(clippy::type_complexity)]
 pub fn all_tools() -> (
     Vec<Arc<dyn Tool>>,
     Arc<Mutex<TodoList>>,

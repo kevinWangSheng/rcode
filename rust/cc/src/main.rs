@@ -169,6 +169,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             model: Some(model.clone()),
             message: resume_id.as_ref().map(|_| "resume".to_string()),
             agent_id: None,
+            stop_hook_active: None,
+            last_assistant_message: None,
         };
         // Build a temporary hook runner just for the SessionStart event.
         // We'll re-build the real one below with the same config.
@@ -411,9 +413,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let tui_cancel = tokio_util::sync::CancellationToken::new();
+        let tui_session_id = tui_engine.session().id.clone();
         let cfg = TuiConfig {
             model: model.clone(),
-            session_id: tui_engine.session().id.clone(),
+            session_id: tui_session_id.clone(),
             engine: tui_engine,
             messages,
             cancel: tui_cancel,
@@ -423,6 +426,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             events_rx,
         };
         cc_tui::run_tui(cfg).await?;
+        // §5.2: Fire SessionEnd hook with tight 1.5s timeout when TUI exits.
+        fire_session_end(&hook_runner, &tui_session_id).await;
         return Ok(());
     }
 
@@ -450,6 +455,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let cancel = tokio_util::sync::CancellationToken::new();
 
+    let headless_session_id = engine.session().id.clone();
     match cli.output {
         OutputFormat::Text => {
             let stdout = io::stdout();
@@ -480,7 +486,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // §5.2: Fire SessionEnd hook with tight 1.5s timeout.
+    fire_session_end(&hook_runner, &headless_session_id).await;
+
     Ok(())
+}
+
+/// Fire SessionEnd hooks with the tight 1.5-second timeout required by the
+/// behavior contract (§5.2).  Uses `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`
+/// for override.
+async fn fire_session_end(hook_runner: &HookRunner, session_id: &str) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let input = cc_core::hook::HookInput {
+        session_id: session_id.to_string(),
+        transcript_path: None,
+        cwd: cwd.to_string_lossy().to_string(),
+        permission_mode: None,
+        hook_event_name: "SessionEnd".to_string(),
+        tool_name: None,
+        tool_input: None,
+        tool_use_id: None,
+        tool_response: None,
+        source: None,
+        model: None,
+        message: None,
+        agent_id: None,
+        stop_hook_active: None,
+        last_assistant_message: None,
+    };
+    hook_runner.run_session_end(&input).await;
 }
 
 async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBlock> {
