@@ -1,6 +1,6 @@
 use cc_core::CcResult;
 use keyring::Entry;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ─── Keychain layout (must match TS version exactly) ──────────────────────
 // Service:  "Claude Code-credentials"  (CREDENTIALS_SERVICE_SUFFIX = "-credentials")
@@ -13,21 +13,21 @@ const KEYCHAIN_SERVICE_CREDENTIALS: &str = "Claude Code-credentials";
 
 // ─── SecureStorageData schema ──────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OAuthTokens {
-    access_token: String,
-    // We only need access_token for Phase 1; refresh_token / expiry handled later.
-    #[allow(dead_code)]
-    refresh_token: Option<String>,
-    #[allow(dead_code)]
-    expires_at: Option<u64>,
+pub(crate) struct OAuthTokens {
+    pub(crate) access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct SecureStorageData {
-    claude_ai_oauth: Option<OAuthTokens>,
+pub(crate) struct SecureStorageData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) claude_ai_oauth: Option<OAuthTokens>,
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────
@@ -36,6 +36,8 @@ struct SecureStorageData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiKeySource {
     EnvVar,
+    /// Plain-file credentials at `~/.claude/credentials.json` (or `CLAUDE_CREDENTIALS_FILE`).
+    File,
     Keychain,
 }
 
@@ -43,6 +45,7 @@ impl std::fmt::Display for ApiKeySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiKeySource::EnvVar => write!(f, "ANTHROPIC_API_KEY env var"),
+            ApiKeySource::File => write!(f, "credentials file"),
             ApiKeySource::Keychain => write!(f, "system keychain"),
         }
     }
