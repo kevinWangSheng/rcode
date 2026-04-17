@@ -104,9 +104,18 @@ impl McpManager {
                     })
                     .unwrap_or_default();
 
-                let mut client = McpHttpClient::connect_with_headers(name, url, headers)
-                    .await
-                    .map_err(cc_core::CcError::Other)?;
+                // Optional `timeout_ms` per-server override. Accepts integer
+                // or string-integer (settings.json is JSON, but we lean
+                // lenient on config parsing in case someone hand-edits).
+                let timeout_ms = config
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .unwrap_or(30_000);
+
+                let mut client =
+                    McpHttpClient::connect_with(name, url, headers, timeout_ms)
+                        .await
+                        .map_err(cc_core::CcError::Other)?;
                 let tools = client
                     .list_tools()
                     .await

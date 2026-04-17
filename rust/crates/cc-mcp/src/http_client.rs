@@ -47,6 +47,9 @@ fn next_id() -> u64 {
 /// Must match the `protocolVersion` field sent in the initialize payload.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Default per-request timeout. Matches the TS MCP client's 30s default.
+const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
 /// HTTP-based MCP client.
 pub struct McpHttpClient {
     pub server_name: String,
@@ -68,7 +71,7 @@ impl McpHttpClient {
         server_name: impl Into<String>,
         url: impl Into<String>,
     ) -> Result<Self, String> {
-        Self::connect_with_headers(server_name, url, HashMap::new()).await
+        Self::connect_with(server_name, url, HashMap::new(), DEFAULT_TIMEOUT_MS).await
     }
 
     /// Build a client with custom headers (e.g. `Authorization: Bearer …`)
@@ -78,8 +81,20 @@ impl McpHttpClient {
         url: impl Into<String>,
         extra_headers: HashMap<String, String>,
     ) -> Result<Self, String> {
+        Self::connect_with(server_name, url, extra_headers, DEFAULT_TIMEOUT_MS).await
+    }
+
+    /// Full constructor with per-server timeout (ms). Tests and advanced
+    /// callers use this directly; most callers should use `connect` or
+    /// `connect_with_headers`.
+    pub async fn connect_with(
+        server_name: impl Into<String>,
+        url: impl Into<String>,
+        extra_headers: HashMap<String, String>,
+        timeout_ms: u64,
+    ) -> Result<Self, String> {
         let http = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_millis(timeout_ms))
             .build()
             .map_err(|e| format!("failed to build http client: {e}"))?;
 
@@ -90,6 +105,14 @@ impl McpHttpClient {
             extra_headers,
             session_id: tokio::sync::Mutex::new(None),
         };
+
+        // Redact sensitive values before logging. Matches the TS client
+        // (src/services/mcp/client.ts `headersForLogging`).
+        debug!(
+            "MCP HTTP '{}' headers: {:?}",
+            client.server_name,
+            redact_headers(&client.extra_headers)
+        );
 
         let init_params = json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -189,6 +212,51 @@ impl McpHttpClient {
     /// and debugging — production code doesn't need to read it directly.
     pub async fn session_id(&self) -> Option<String> {
         self.session_id.lock().await.clone()
+    }
+
+    /// Send `DELETE <url>` with the current session ID header to tell the
+    /// server we're terminating the session cleanly (MCP 2025-03-26
+    /// §Session Management). Best-effort: servers MAY return 405 if they
+    /// don't support explicit termination, in which case the session just
+    /// times out on their side. Clears our local session_id either way.
+    async fn terminate_session(&self) -> Result<(), String> {
+        let sid = {
+            let mut guard = self.session_id.lock().await;
+            guard.take()
+        };
+        let Some(sid) = sid else {
+            return Ok(()); // No session to terminate.
+        };
+
+        let mut builder = self
+            .http
+            .delete(&self.url)
+            .header("MCP-Protocol-Version", PROTOCOL_VERSION)
+            .header("Mcp-Session-Id", &sid);
+        for (k, v) in &self.extra_headers {
+            builder = builder.header(k, v);
+        }
+
+        match builder.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                // 200/202/204 = terminated; 405 = server doesn't support
+                // explicit termination, that's fine; anything else is
+                // surprising but non-fatal.
+                if !status.is_success() && status.as_u16() != 405 {
+                    debug!(
+                        "MCP '{}' DELETE session returned {status} (non-fatal)",
+                        self.server_name
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Network error during shutdown shouldn't prevent exit.
+                debug!("MCP '{}' DELETE session failed: {e}", self.server_name);
+                Ok(())
+            }
+        }
     }
 
     async fn send_request(
@@ -303,11 +371,18 @@ impl McpHttpClient {
             builder = builder.header(k, v);
         }
 
-        builder
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| format!("http error: {e}"))
+        builder.json(body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                format!(
+                    "MCP '{}' request timed out (configured timeout applies to all requests; see `timeout_ms` in settings)",
+                    self.server_name
+                )
+            } else if e.is_connect() {
+                format!("MCP '{}' connect failed: {e}", self.server_name)
+            } else {
+                format!("MCP '{}' http error: {e}", self.server_name)
+            }
+        })
     }
 }
 
@@ -342,8 +417,33 @@ impl McpTransport for Mutex<McpHttpClient> {
     }
 
     async fn close(&self) -> CcResult<()> {
-        Ok(())
+        let guard = self.lock().await;
+        guard.terminate_session().await.map_err(CcError::Other)
     }
+}
+
+/// Return a copy of `headers` with any sensitive values replaced by
+/// `[REDACTED]`. Used before debug-logging user-supplied headers so tokens
+/// don't end up in log sinks. Key matching is case-insensitive and covers
+/// the common header names that carry secrets.
+pub fn redact_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let lower = k.to_ascii_lowercase();
+            let is_sensitive = lower == "authorization"
+                || lower == "proxy-authorization"
+                || lower == "x-api-key"
+                || lower.contains("token")
+                || lower.contains("secret");
+            let value = if is_sensitive {
+                "[REDACTED]".to_string()
+            } else {
+                v.clone()
+            };
+            (k.clone(), value)
+        })
+        .collect()
 }
 
 /// Parse a Server-Sent Events body and return the first JSON-RPC response
@@ -398,5 +498,25 @@ mod tests {
     fn returns_error_when_id_not_present() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
         assert!(parse_sse_for_id(body, 99).is_err());
+    }
+
+    #[test]
+    fn redact_headers_masks_sensitive_keys_case_insensitive() {
+        let mut h = HashMap::new();
+        h.insert("Authorization".into(), "Bearer abc".into());
+        h.insert("X-API-Key".into(), "secret123".into());
+        h.insert("x-session-token".into(), "tok".into());
+        h.insert("Proxy-Authorization".into(), "Basic zzz".into());
+        h.insert("User-Agent".into(), "claude-code/0.1".into());
+        h.insert("X-Trace-Id".into(), "req-42".into());
+
+        let out = redact_headers(&h);
+        assert_eq!(out.get("Authorization").unwrap(), "[REDACTED]");
+        assert_eq!(out.get("X-API-Key").unwrap(), "[REDACTED]");
+        assert_eq!(out.get("x-session-token").unwrap(), "[REDACTED]");
+        assert_eq!(out.get("Proxy-Authorization").unwrap(), "[REDACTED]");
+        // Non-sensitive keys pass through unchanged.
+        assert_eq!(out.get("User-Agent").unwrap(), "claude-code/0.1");
+        assert_eq!(out.get("X-Trace-Id").unwrap(), "req-42");
     }
 }

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use cc_mcp::McpHttpClient;
+use cc_mcp::{McpHttpClient, McpTransport};
 
 /// Parse one HTTP request off `sock`. Returns (headers_lowercased, json_body).
 /// Crude but sufficient for test fixtures — no chunked encoding, tiny bodies.
@@ -207,6 +207,78 @@ async fn custom_headers_from_config_reach_server() {
     let _client = McpHttpClient::connect_with_headers("stub", &url, extra)
         .await
         .expect("connect");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn close_sends_delete_with_session_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    const SESSION_ID: &str = "sess-to-be-killed";
+
+    let server = tokio::spawn(async move {
+        // 1. initialize — hand back a session ID.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (_h, req) = read_request(&mut sock).await;
+        let id = req["id"].as_u64().unwrap_or(0);
+        write_response(
+            &mut sock,
+            200,
+            &[("Mcp-Session-Id", SESSION_ID)],
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "stub", "version": "0.0.1"}
+                }
+            }),
+        )
+        .await;
+
+        // 2. notifications/initialized 202.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut sock).await;
+        write_empty_202(&mut sock).await;
+
+        // 3. Expect a DELETE with the session ID.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let mut total = Vec::new();
+        loop {
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            if n == 0 { break; }
+            total.extend_from_slice(&buf[..n]);
+            if find_subseq(&total, b"\r\n\r\n").is_some() { break; }
+        }
+        let request = std::str::from_utf8(&total).unwrap_or("");
+        assert!(
+            request.starts_with("DELETE "),
+            "expected DELETE request, got: {}",
+            request.lines().next().unwrap_or("")
+        );
+        assert!(
+            request.to_ascii_lowercase().contains(&format!("mcp-session-id: {SESSION_ID}").to_ascii_lowercase()),
+            "DELETE must include Mcp-Session-Id header"
+        );
+        let _ = sock
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = sock.shutdown().await;
+    });
+
+    let client = McpHttpClient::connect("stub", &url).await.expect("connect");
+    assert_eq!(client.session_id().await.as_deref(), Some(SESSION_ID));
+
+    // Call close via the McpTransport trait — this is what McpManager::shutdown does.
+    let transport = tokio::sync::Mutex::new(client);
+    transport.close().await.expect("close");
+
+    // After close, the session ID must be cleared.
+    let client = transport.into_inner();
+    assert_eq!(client.session_id().await, None);
+
     server.await.unwrap();
 }
 

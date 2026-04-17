@@ -13,7 +13,7 @@ pub mod types;
 
 pub use adapter::{load_mcp_tools_from_config, McpToolAdapter};
 pub use client::McpClient;
-pub use http_client::McpHttpClient;
+pub use http_client::{redact_headers, McpHttpClient};
 pub use manager::{ConnectedServer, McpManager, McpServerState};
 pub use transport::McpTransport;
 pub use types::{McpTool, McpToolResult};
