@@ -465,12 +465,47 @@ impl QueryEngine {
             let result = self.permissions.check(tool_name, input);
             match result.behavior {
                 PermissionBehavior::Deny => {
+                    fire_permission_denied(
+                        &self.hooks,
+                        &self.session.id,
+                        tu,
+                        "policy-deny",
+                        cancel,
+                    )
+                    .await;
                     return Err(tool_result_error(
                         &tu.id,
                         format!("Permission denied for tool '{tool_name}'"),
                     ));
                 }
                 PermissionBehavior::Ask => {
+                    // PermissionRequest hook runs before the interactive prompter.
+                    // If any hook returns `decision: "block"`, we deny without
+                    // bothering the user — matching TS executePermissionRequestHooks.
+                    let req_result = fire_permission_request(
+                        &self.hooks,
+                        &self.session.id,
+                        tu,
+                        cancel,
+                    )
+                    .await;
+                    if req_result.blocked {
+                        fire_permission_denied(
+                            &self.hooks,
+                            &self.session.id,
+                            tu,
+                            "permission-request-hook",
+                            cancel,
+                        )
+                        .await;
+                        let msg = req_result
+                            .block_message
+                            .unwrap_or_else(|| "permission denied by hook".into());
+                        return Err(tool_result_error(
+                            &tu.id,
+                            format!("Permission denied for tool '{tool_name}': {msg}"),
+                        ));
+                    }
                     let decision = self
                         .prompter
                         .prompt(tool_name, input, cancel)
@@ -478,6 +513,14 @@ impl QueryEngine {
                         .unwrap_or(PromptDecision::Deny);
                     match decision {
                         PromptDecision::Deny => {
+                            fire_permission_denied(
+                                &self.hooks,
+                                &self.session.id,
+                                tu,
+                                "user-deny",
+                                cancel,
+                            )
+                            .await;
                             return Err(tool_result_error(
                                 &tu.id,
                                 format!("Permission denied for tool '{tool_name}'"),
@@ -532,14 +575,82 @@ impl QueryEngine {
             result,
         }).await;
 
-        // PostToolUse hook
+        // PostToolUse (success) or PostToolUseFailure (error) — never both.
         run_post_tool_hook(&self.hooks, &self.session.id, tu, &tool_result_block, cancel).await;
 
         tool_result_block
     }
 }
 
-/// Run PostToolUse hook after tool execution.
+/// Fire `PermissionRequest` hook before calling the interactive prompter.
+/// Hooks may return `decision: "block"` to deny without prompting; this
+/// function just surfaces the HookRunResult so the caller can branch.
+async fn fire_permission_request(
+    hooks: &HookRunner,
+    session_id: &str,
+    tu: &ToolUseBlock,
+    cancel: &CancellationToken,
+) -> cc_hooks::HookRunResult {
+    let input = HookInput {
+        session_id: session_id.to_string(),
+        transcript_path: None,
+        cwd: std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        permission_mode: None,
+        hook_event_name: "PermissionRequest".into(),
+        tool_name: Some(tu.name.clone()),
+        tool_input: Some(tu.input.clone()),
+        tool_use_id: Some(tu.id.clone()),
+        tool_response: None,
+        source: None,
+        model: None,
+        message: None,
+        agent_id: None,
+        stop_hook_active: None,
+        last_assistant_message: None,
+    };
+    hooks.run("PermissionRequest", &input, cancel).await
+}
+
+/// Fire `PermissionDenied` hook after any denial path. Observation-style —
+/// result is ignored because the denial already happened. `reason_tag` is
+/// passed through `message` so hooks can distinguish policy-deny vs user-deny
+/// vs permission-request-hook-deny.
+async fn fire_permission_denied(
+    hooks: &HookRunner,
+    session_id: &str,
+    tu: &ToolUseBlock,
+    reason_tag: &str,
+    cancel: &CancellationToken,
+) {
+    let input = HookInput {
+        session_id: session_id.to_string(),
+        transcript_path: None,
+        cwd: std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        permission_mode: None,
+        hook_event_name: "PermissionDenied".into(),
+        tool_name: Some(tu.name.clone()),
+        tool_input: Some(tu.input.clone()),
+        tool_use_id: Some(tu.id.clone()),
+        tool_response: None,
+        source: None,
+        model: None,
+        message: Some(reason_tag.to_string()),
+        agent_id: None,
+        stop_hook_active: None,
+        last_assistant_message: None,
+    };
+    let _ = hooks.run("PermissionDenied", &input, cancel).await;
+}
+
+/// Run PostToolUse (success) or PostToolUseFailure (error) hook after tool execution.
+/// Matches TS behavior in src/services/tools/toolExecution.ts — the two events
+/// are mutually exclusive: failure path fires `PostToolUseFailure` instead.
 async fn run_post_tool_hook(
     hooks: &HookRunner,
     session_id: &str,
@@ -547,6 +658,11 @@ async fn run_post_tool_hook(
     result: &ToolResultBlock,
     cancel: &CancellationToken,
 ) {
+    let event = if result.is_error == Some(true) {
+        "PostToolUseFailure"
+    } else {
+        "PostToolUse"
+    };
     let hook_input = HookInput {
         session_id: session_id.to_string(),
         transcript_path: None,
@@ -555,7 +671,7 @@ async fn run_post_tool_hook(
             .to_string_lossy()
             .to_string(),
         permission_mode: None,
-        hook_event_name: "PostToolUse".into(),
+        hook_event_name: event.into(),
         tool_name: Some(tu.name.clone()),
         tool_input: Some(tu.input.clone()),
         tool_use_id: Some(tu.id.clone()),
@@ -567,7 +683,7 @@ async fn run_post_tool_hook(
         stop_hook_active: None,
         last_assistant_message: None,
     };
-    let _ = hooks.run("PostToolUse", &hook_input, cancel).await;
+    let _ = hooks.run(event, &hook_input, cancel).await;
 }
 
 fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResultBlock {
@@ -705,6 +821,139 @@ mod tests {
         let before = msgs.clone();
         compact_messages(&mut msgs);
         assert_eq!(msgs.len(), before.len(), "no compaction when ≤ KEEP_RECENT + 1");
+    }
+
+    #[tokio::test]
+    async fn permission_request_hook_fires() {
+        use cc_core::hook::HooksSettings;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("req.txt");
+        let settings: HooksSettings = serde_json::from_str(&format!(
+            r#"{{"PermissionRequest": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}]}}"#,
+            marker.display()
+        ))
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let tu = ToolUseBlock {
+            id: "tu_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "rm -rf /"}),
+        };
+        let cancel = CancellationToken::new();
+        let result = fire_permission_request(&hooks, "sess-1", &tu, &cancel).await;
+        assert!(!result.blocked);
+        assert!(marker.exists(), "PermissionRequest hook should fire");
+    }
+
+    #[tokio::test]
+    async fn permission_request_hook_can_block() {
+        // A PermissionRequest hook returning exit 2 should set `blocked=true`,
+        // letting the engine deny the tool without calling the interactive prompter.
+        use cc_core::hook::HooksSettings;
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{"PermissionRequest": [{"hooks": [{"type": "command", "command": "printf 'nope' && exit 2"}]}]}"#,
+        )
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let tu = ToolUseBlock {
+            id: "tu_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({}),
+        };
+        let cancel = CancellationToken::new();
+        let result = fire_permission_request(&hooks, "sess-1", &tu, &cancel).await;
+        assert!(result.blocked);
+        assert_eq!(result.block_message.as_deref(), Some("nope"));
+    }
+
+    #[tokio::test]
+    async fn permission_denied_hook_fires() {
+        use cc_core::hook::HooksSettings;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("denied.txt");
+        let settings: HooksSettings = serde_json::from_str(&format!(
+            r#"{{"PermissionDenied": [{{"hooks": [{{"type": "command", "command": "cat > {} <<< \"$CLAUDE_SESSION_ID\""}}]}}]}}"#,
+            marker.display()
+        ))
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let tu = ToolUseBlock {
+            id: "tu_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({}),
+        };
+        let cancel = CancellationToken::new();
+        fire_permission_denied(&hooks, "sess-abc", &tu, "policy-deny", &cancel).await;
+        assert!(marker.exists(), "PermissionDenied hook should fire");
+        let contents = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            contents.trim() == "sess-abc",
+            "CLAUDE_SESSION_ID should be injected, got {contents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_hook_fires_on_success() {
+        use cc_core::hook::HooksSettings;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("fired.txt");
+        let settings: HooksSettings = serde_json::from_str(&format!(
+            r#"{{"PostToolUse": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}]}}"#,
+            marker.display()
+        ))
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let tu = ToolUseBlock {
+            id: "tu_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "echo ok"}),
+        };
+        let result = ToolResultBlock {
+            tool_use_id: "tu_1".into(),
+            content: Some(serde_json::Value::String("ok".into())),
+            is_error: None,
+        };
+        let cancel = CancellationToken::new();
+        run_post_tool_hook(&hooks, "sess-1", &tu, &result, &cancel).await;
+        assert!(marker.exists(), "PostToolUse hook should have fired");
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_failure_hook_fires_on_error() {
+        use cc_core::hook::HooksSettings;
+        let dir = tempfile::tempdir().unwrap();
+        let success_marker = dir.path().join("success.txt");
+        let failure_marker = dir.path().join("failure.txt");
+        let settings: HooksSettings = serde_json::from_str(&format!(
+            r#"{{
+                "PostToolUse": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}],
+                "PostToolUseFailure": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}]
+            }}"#,
+            success_marker.display(),
+            failure_marker.display()
+        ))
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let tu = ToolUseBlock {
+            id: "tu_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "false"}),
+        };
+        let result = ToolResultBlock {
+            tool_use_id: "tu_1".into(),
+            content: Some(serde_json::Value::String("boom".into())),
+            is_error: Some(true),
+        };
+        let cancel = CancellationToken::new();
+        run_post_tool_hook(&hooks, "sess-1", &tu, &result, &cancel).await;
+        assert!(
+            failure_marker.exists(),
+            "PostToolUseFailure hook should have fired"
+        );
+        assert!(
+            !success_marker.exists(),
+            "PostToolUse must not fire on error path"
+        );
     }
 
     #[test]

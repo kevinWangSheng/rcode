@@ -9,6 +9,10 @@ pub enum HookEvent {
     // Tool lifecycle
     PreToolUse,
     PostToolUse,
+    PostToolUseFailure,
+    // Permission decision points
+    PermissionRequest,
+    PermissionDenied,
     // Notification
     Notification,
     // Session lifecycle

@@ -29,6 +29,10 @@ pub struct HookRunResult {
     pub block_message: Option<String>,
     pub env_exports: HashMap<String, String>,
     pub failures: Vec<String>,
+    /// Extra context strings returned by hooks via `hook_specific_output.additional_context`.
+    /// Used by SessionStart / SubagentStart / UserPromptSubmit to inject context
+    /// as a user message before the next turn.
+    pub additional_contexts: Vec<String>,
 }
 
 impl HookRunResult {
@@ -195,16 +199,16 @@ impl HookRunner {
                     let timeout = Duration::from_secs(h.timeout);
                     tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => HookOutcome::Failed("cancelled".into()),
+                        _ = cancel.cancelled() => (HookOutcome::Failed("cancelled".into()), None),
                         result = tokio::time::timeout(
                             timeout,
                             execute_one_hook(h, &input_json, &http, env_path.as_deref(), &sid, &cwd),
                         ) => {
                             match result {
-                                Ok(outcome) => outcome,
-                                Err(_) => HookOutcome::Failed(
+                                Ok(pair) => pair,
+                                Err(_) => (HookOutcome::Failed(
                                     format!("hook timed out after {}s", h.timeout),
-                                ),
+                                ), None),
                             }
                         }
                     }
@@ -225,7 +229,12 @@ impl HookRunner {
             env_exports,
             ..Default::default()
         };
-        for outcome in outcomes {
+        for (outcome, extra_ctx) in outcomes {
+            if let Some(ctx) = extra_ctx {
+                if !ctx.is_empty() {
+                    result.additional_contexts.push(ctx);
+                }
+            }
             match outcome {
                 HookOutcome::Ok => {}
                 HookOutcome::Block(msg) => {
@@ -291,7 +300,7 @@ impl HookRunner {
     }
 }
 
-/// Execute a single hook.
+/// Execute a single hook. Returns (outcome, optional additional_context).
 async fn execute_one_hook(
     hook: &HookConfig,
     input_json: &str,
@@ -299,11 +308,11 @@ async fn execute_one_hook(
     env_file_path: Option<&Path>,
     session_id: &str,
     cwd: &str,
-) -> HookOutcome {
+) -> (HookOutcome, Option<String>) {
     match &hook.kind {
         HookKind::Command => {
             let Some(command) = hook.command.as_deref().filter(|s| !s.is_empty()) else {
-                return HookOutcome::Ok; // silently skip
+                return (HookOutcome::Ok, None); // silently skip
             };
             let shell = hook.shell.as_deref().unwrap_or("bash");
             run_command_hook(command, input_json, shell, env_file_path, session_id, cwd).await
@@ -312,21 +321,21 @@ async fn execute_one_hook(
             // cc-core uses `text` field (with `prompt` as serde alias)
             let Some(text) = hook.text.as_deref().filter(|s| !s.is_empty()) else {
                 warn!("prompt hook missing `text`/`prompt` field; skipping");
-                return HookOutcome::Ok;
+                return (HookOutcome::Ok, None);
             };
-            HookOutcome::Block(text.to_string())
+            (HookOutcome::Block(text.to_string()), None)
         }
         HookKind::Http => {
             let Some(url) = hook.url.as_deref().filter(|s| !s.is_empty()) else {
                 warn!("http hook missing `url` field; skipping");
-                return HookOutcome::Ok;
+                return (HookOutcome::Ok, None);
             };
-            run_http_hook(http, url, input_json, &hook.headers).await
+            (run_http_hook(http, url, input_json, &hook.headers).await, None)
         }
         HookKind::Agent => {
             let agent_name = hook.agent.as_deref().unwrap_or("unknown");
             debug!("agent hook delegation requested: {agent_name} (no-op)");
-            HookOutcome::Ok
+            (HookOutcome::Ok, None)
         }
     }
 }
@@ -338,7 +347,7 @@ async fn run_command_hook(
     env_file_path: Option<&Path>,
     session_id: &str,
     cwd: &str,
-) -> HookOutcome {
+) -> (HookOutcome, Option<String>) {
     let mut cmd = Command::new(shell);
     cmd.arg("-c")
         .arg(command)
@@ -355,7 +364,7 @@ async fn run_command_hook(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return HookOutcome::Failed(format!("failed to spawn hook: {e}")),
+        Err(e) => return (HookOutcome::Failed(format!("failed to spawn hook: {e}")), None),
     };
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -365,7 +374,7 @@ async fn run_command_hook(
 
     let output = match child.wait_with_output().await {
         Ok(o) => o,
-        Err(e) => return HookOutcome::Failed(format!("failed to wait for hook: {e}")),
+        Err(e) => return (HookOutcome::Failed(format!("failed to wait for hook: {e}")), None),
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
@@ -373,21 +382,25 @@ async fn run_command_hook(
 
     // Try to parse structured JSON from stdout
     if let Ok(resp) = serde_json::from_str::<HookJsonResponse>(&stdout) {
+        let extra = resp
+            .hook_specific_output
+            .as_ref()
+            .and_then(|o| o.additional_context.clone());
         if resp.decision.as_deref() == Some("block") {
             let msg = resp.reason.or(resp.stop_reason).unwrap_or_default();
-            return HookOutcome::Block(msg);
+            return (HookOutcome::Block(msg), extra);
         }
         // Structured response but not blocking — treat as Ok
-        return HookOutcome::Ok;
+        return (HookOutcome::Ok, extra);
     }
 
     if exit_code == 2 {
-        HookOutcome::Block(stdout.trim().to_string())
+        (HookOutcome::Block(stdout.trim().to_string()), None)
     } else if exit_code != 0 {
         debug!("hook exited {exit_code}: {command}");
-        HookOutcome::Failed(format!("exit {exit_code}"))
+        (HookOutcome::Failed(format!("exit {exit_code}")), None)
     } else {
-        HookOutcome::Ok
+        (HookOutcome::Ok, None)
     }
 }
 
@@ -732,6 +745,27 @@ mod tests {
         assert_eq!(json["stop_hook_active"], serde_json::json!(true));
         assert_eq!(json["last_assistant_message"], serde_json::json!("hello"));
         assert_eq!(json["hook_event_name"], serde_json::json!("Stop"));
+    }
+
+    #[tokio::test]
+    async fn command_hook_collects_additional_context() {
+        // Hook emits a structured JSON response with hook_specific_output.additional_context.
+        // SubagentStart / SessionStart / UserPromptSubmit hooks use this to inject context.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "SubagentStart": [{"hooks": [{"type": "command", "command": "printf '{\"hook_specific_output\":{\"additional_context\":\"context from hook\"}}'"}]}]
+        }"#,
+        )
+        .unwrap();
+        let runner = HookRunner::new(&settings, reqwest::Client::new());
+        let input = test_input("SubagentStart");
+        let cancel = CancellationToken::new();
+        let result = runner.run("SubagentStart", &input, &cancel).await;
+        assert!(!result.blocked);
+        assert_eq!(
+            result.additional_contexts,
+            vec!["context from hook".to_string()]
+        );
     }
 
     #[tokio::test]
