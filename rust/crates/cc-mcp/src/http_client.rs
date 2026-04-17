@@ -1,4 +1,4 @@
-//! MCP HTTP transport (Streamable HTTP, MCP 2025 spec).
+//! MCP HTTP transport (Streamable HTTP, MCP 2025-03-26 spec).
 //!
 //! Each JSON-RPC request is POSTed to the server URL. The server responds with
 //! either:
@@ -9,17 +9,26 @@
 //!
 //! Notifications (no id) are POSTed and the server is expected to return 202.
 //!
+//! Session management (MCP 2025-03-26 §Session Management):
+//!   - If the server returns an `Mcp-Session-Id` header in the initialize
+//!     response, the client MUST echo it on every subsequent request.
+//!   - A 404 response to a request with a stored session ID means the session
+//!     has expired; we clear the stored ID so the next call re-initializes.
+//!   - `MCP-Protocol-Version` is sent on every request for servers that
+//!     negotiate per-call.
+//!
 //! This is intentionally a thin slice — enough to satisfy `initialize`,
 //! `tools/list`, and `tools/call` from a single `McpHttpClient`. We do not
-//! maintain a long-lived SSE listener for server-to-client notifications; that
-//! would belong in a follow-up if/when we need server-pushed tool list updates.
+//! maintain a long-lived server-to-client SSE listener (GET stream); that
+//! would belong in a follow-up if/when we need server-pushed notifications.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
-use reqwest::{header, Client};
+use reqwest::{header, Client, Response, StatusCode};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -34,11 +43,23 @@ fn next_id() -> u64 {
     REQUEST_ID.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Protocol version advertised in the `MCP-Protocol-Version` header.
+/// Must match the `protocolVersion` field sent in the initialize payload.
+const PROTOCOL_VERSION: &str = "2024-11-05";
+
 /// HTTP-based MCP client.
 pub struct McpHttpClient {
     pub server_name: String,
     url: String,
     http: Client,
+    /// Custom headers to send on every request — typically `Authorization:
+    /// Bearer <token>` for OAuth-protected MCP servers. Sourced from the
+    /// per-server `headers` map in settings.json.
+    extra_headers: HashMap<String, String>,
+    /// Session ID captured from the initialize response. Echoed on every
+    /// subsequent request. Cleared when the server returns 404 (session
+    /// expired) so the next call re-initializes.
+    session_id: tokio::sync::Mutex<Option<String>>,
 }
 
 impl McpHttpClient {
@@ -46,6 +67,16 @@ impl McpHttpClient {
     pub async fn connect(
         server_name: impl Into<String>,
         url: impl Into<String>,
+    ) -> Result<Self, String> {
+        Self::connect_with_headers(server_name, url, HashMap::new()).await
+    }
+
+    /// Build a client with custom headers (e.g. `Authorization: Bearer …`)
+    /// and run the `initialize` handshake.
+    pub async fn connect_with_headers(
+        server_name: impl Into<String>,
+        url: impl Into<String>,
+        extra_headers: HashMap<String, String>,
     ) -> Result<Self, String> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -56,10 +87,12 @@ impl McpHttpClient {
             server_name: server_name.into(),
             url: url.into(),
             http,
+            extra_headers,
+            session_id: tokio::sync::Mutex::new(None),
         };
 
         let init_params = json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "claude-code", "version": "0.1.0"}
         });
@@ -72,7 +105,11 @@ impl McpHttpClient {
             return Err(format!("MCP HTTP initialize error: {} ({})", err.message, err.code));
         }
 
-        debug!("MCP HTTP server '{}' initialized", client.server_name);
+        debug!(
+            "MCP HTTP server '{}' initialized (session_id={:?})",
+            client.server_name,
+            client.session_id.lock().await
+        );
 
         // Best-effort initialized notification — many servers ignore it but the
         // spec says clients MUST send it.
@@ -148,6 +185,12 @@ impl McpHttpClient {
         McpToolResult { content, is_error }
     }
 
+    /// Returns the currently-stored session ID, if any. Primarily for tests
+    /// and debugging — production code doesn't need to read it directly.
+    pub async fn session_id(&self) -> Option<String> {
+        self.session_id.lock().await.clone()
+    }
+
     async fn send_request(
         &self,
         method: &str,
@@ -156,18 +199,44 @@ impl McpHttpClient {
         let req_id = next_id();
         let req = JsonRpcRequest::new(req_id, method, params);
 
-        let resp = self
-            .http
-            .post(&self.url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::ACCEPT, "application/json, text/event-stream")
-            .json(&req)
-            .send()
-            .await
-            .map_err(|e| format!("http error: {e}"))?;
+        let resp = self.post(&req, /*is_notification=*/ false).await?;
+
+        // 404 on a session-bound request → session expired. Drop our cached
+        // ID; the caller will bubble up an error and the next retry path
+        // (manager.reconnect, or the next `initialize` by a new client)
+        // will get a fresh session.
+        if resp.status() == StatusCode::NOT_FOUND {
+            let had_session = {
+                let mut guard = self.session_id.lock().await;
+                let had = guard.is_some();
+                *guard = None;
+                had
+            };
+            if had_session {
+                return Err(format!(
+                    "MCP session expired (404) for '{}'; caller must reconnect",
+                    self.server_name
+                ));
+            }
+        }
 
         if !resp.status().is_success() {
             return Err(format!("http {}: {}", resp.status(), resp.status().as_str()));
+        }
+
+        // Capture Mcp-Session-Id from the response (initialize sets this).
+        // Header name is case-insensitive — reqwest normalizes to lowercase.
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+        {
+            let mut guard = self.session_id.lock().await;
+            if guard.as_deref() != Some(sid.as_str()) {
+                debug!("MCP '{}' session_id ← {}", self.server_name, sid);
+                *guard = Some(sid);
+            }
         }
 
         let content_type = resp
@@ -204,18 +273,41 @@ impl McpHttpClient {
             method: method.to_string(),
             params,
         };
-        let resp = self
-            .http
-            .post(&self.url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(&notif)
-            .send()
-            .await
-            .map_err(|e| format!("http error: {e}"))?;
+        let resp = self.post(&notif, /*is_notification=*/ true).await?;
         if !resp.status().is_success() && resp.status().as_u16() != 202 {
             return Err(format!("http {}", resp.status()));
         }
         Ok(())
+    }
+
+    /// Issue the POST with all the common MCP headers plus our stored
+    /// session ID. `is_notification` is cosmetic — the headers are the same,
+    /// but the caller treats the response differently.
+    async fn post<B: serde::Serialize + ?Sized>(
+        &self,
+        body: &B,
+        _is_notification: bool,
+    ) -> Result<Response, String> {
+        let mut builder = self
+            .http
+            .post(&self.url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", PROTOCOL_VERSION);
+
+        if let Some(sid) = self.session_id.lock().await.as_deref() {
+            builder = builder.header("Mcp-Session-Id", sid);
+        }
+
+        for (k, v) in &self.extra_headers {
+            builder = builder.header(k, v);
+        }
+
+        builder
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("http error: {e}"))
     }
 }
 

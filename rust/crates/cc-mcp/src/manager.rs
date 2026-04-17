@@ -89,7 +89,22 @@ impl McpManager {
 
         let (transport, tools): (Arc<dyn McpTransport>, Vec<McpTool>) = match (url, command) {
             (Some(url), _) => {
-                let mut client = McpHttpClient::connect(name, url)
+                // Pull optional headers out of the config — used for things
+                // like `Authorization: Bearer <token>` on OAuth-protected
+                // MCP servers. Non-string values are silently skipped.
+                let headers: HashMap<String, String> = config
+                    .get("headers")
+                    .and_then(|v| v.as_object())
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| {
+                                v.as_str().map(|s| (k.clone(), s.to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut client = McpHttpClient::connect_with_headers(name, url, headers)
                     .await
                     .map_err(cc_core::CcError::Other)?;
                 let tools = client
