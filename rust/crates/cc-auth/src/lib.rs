@@ -25,6 +25,16 @@ impl From<Credentials> for AuthCredential {
     }
 }
 
+/// Read credentials from `ANTHROPIC_API_KEY` env var. Returns `None` when the
+/// var is unset or empty. Pure (no Keychain access) so tests can exercise
+/// the env-var path without provoking a Keychain ACL prompt.
+fn env_var_credentials() -> Option<Credentials> {
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .map(Credentials::ApiKey)
+}
+
 /// Resolve the credentials to use for API calls.
 ///
 /// Priority order:
@@ -32,10 +42,8 @@ impl From<Credentials> for AuthCredential {
 ///   2. System keychain (`Claude Code-credentials`) → `Credentials::OAuthToken`
 pub fn resolve_credentials() -> CcResult<(Credentials, ApiKeySource)> {
     // 1. Environment variable (direct API key).
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            return Ok((Credentials::ApiKey(key), ApiKeySource::EnvVar));
-        }
+    if let Some(creds) = env_var_credentials() {
+        return Ok((creds, ApiKeySource::EnvVar));
     }
 
     // 2. System keychain (OAuth token stored by `claude /login`).
@@ -86,16 +94,13 @@ mod tests {
 
     #[test]
     fn empty_env_var_is_skipped() {
+        // Test env_var_credentials directly so we never fall through to the
+        // Keychain path (which would trigger an ACL prompt for the test binary).
         let saved = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::set_var("ANTHROPIC_API_KEY", "");
-
-        // Should not match the env var path — may fallback to keychain or error
-        let result = resolve_credentials();
-        // We can't assert Ok/Err because keychain state varies, but we verify
-        // it doesn't return an empty API key
-        if let Ok((Credentials::ApiKey(k), _)) = &result {
-            assert!(!k.is_empty());
-        }
+        assert!(env_var_credentials().is_none());
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        assert!(env_var_credentials().is_none());
 
         match saved {
             Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
