@@ -246,6 +246,83 @@ pub async fn wait_for_callback(
         .map_err(|_| CcError::Auth(format!("timed out after {:?} waiting for OAuth callback", timeout)))?
 }
 
+/// 5-minute safety buffer for expiry checks. Matches TS `isOAuthTokenExpired`
+/// in src/services/oauth/client.ts — we treat a token as expired slightly
+/// before its real expiry so an in-flight request can't fire on a token
+/// that times out mid-connection.
+const EXPIRY_BUFFER_MS: u64 = 5 * 60 * 1000;
+
+/// Current wall-clock in milliseconds since the Unix epoch. Used by the
+/// refresh path to compute `expires_at`.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Return `true` when `expires_at` (ms since epoch) is in the past or
+/// within the 5-minute buffer window. `None` is treated as never-expiring
+/// (matches the TS behavior for tokens without an explicit expiry).
+pub fn is_oauth_token_expired(expires_at: Option<u64>) -> bool {
+    match expires_at {
+        None => false,
+        Some(exp) => now_ms().saturating_add(EXPIRY_BUFFER_MS) >= exp,
+    }
+}
+
+/// Exchange a refresh_token for a new access_token. Matches `refreshOAuthToken`
+/// in src/services/oauth/client.ts, without the profile/subscription side
+/// effects (those are a TS-only analytics path).
+///
+/// The backend preserves or rotates the refresh_token — we pass the original
+/// through when the response omits a new one, matching the TS fallback.
+pub async fn refresh_oauth_token(
+    cfg: &OAuthConfig,
+    http: &reqwest::Client,
+    refresh_token: &str,
+) -> CcResult<OAuthTokenResponse> {
+    #[derive(Serialize)]
+    struct RefreshRequest<'a> {
+        grant_type: &'a str,
+        refresh_token: &'a str,
+        client_id: &'a str,
+        scope: String,
+    }
+    let body = RefreshRequest {
+        grant_type: "refresh_token",
+        refresh_token,
+        client_id: &cfg.client_id,
+        scope: cfg.scopes.join(" "),
+    };
+    let resp = http
+        .post(&cfg.token_url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| CcError::Auth(format!("token refresh request failed: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(CcError::Auth(format!(
+            "token refresh failed ({status}): {text}"
+        )));
+    }
+    let mut tokens: OAuthTokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| CcError::Auth(format!("token refresh response parse error: {e}")))?;
+    // Carry the old refresh_token forward when the server doesn't return a
+    // rotated one — same fallback as `refreshOAuthToken` in client.ts.
+    if tokens.refresh_token.is_none() {
+        tokens.refresh_token = Some(refresh_token.to_string());
+    }
+    Ok(tokens)
+}
+
 /// Exchange an authorization code for OAuth tokens. Matches `exchangeCodeForTokens`.
 pub async fn exchange_code_for_tokens(
     cfg: &OAuthConfig,
@@ -317,12 +394,7 @@ pub async fn run_login_flow(cfg: OAuthConfig) -> CcResult<std::path::PathBuf> {
     let http = reqwest::Client::new();
     let tokens = exchange_code_for_tokens(&cfg, &http, &code, &verifier, &state, port).await?;
 
-    let expires_at = tokens
-        .expires_in
-        .map(|s| std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64 + s * 1000)
-            .unwrap_or(0));
+    let expires_at = tokens.expires_in.map(|s| now_ms() + s * 1000);
     let path = crate::file_store::write_oauth_token(
         tokens.access_token,
         tokens.refresh_token,
@@ -414,6 +486,139 @@ mod tests {
             .unwrap();
         assert_eq!(code, "abc123");
         hit.await.unwrap();
+    }
+
+    #[test]
+    fn expiry_none_is_never_expired() {
+        assert!(!is_oauth_token_expired(None));
+    }
+
+    #[test]
+    fn expiry_far_future_is_fresh() {
+        // now + 1 hour — well outside the 5-minute buffer.
+        let exp = now_ms() + 60 * 60 * 1000;
+        assert!(!is_oauth_token_expired(Some(exp)));
+    }
+
+    #[test]
+    fn expiry_within_buffer_is_expired() {
+        // now + 2 minutes — inside the 5-minute buffer, so treated as expired.
+        let exp = now_ms() + 2 * 60 * 1000;
+        assert!(is_oauth_token_expired(Some(exp)));
+    }
+
+    #[test]
+    fn expiry_in_past_is_expired() {
+        // 10 minutes ago — definitely expired.
+        let exp = now_ms().saturating_sub(10 * 60 * 1000);
+        assert!(is_oauth_token_expired(Some(exp)));
+    }
+
+    /// Minimal one-shot HTTP/1.1 handler for the token endpoint. Reads the
+    /// request, discards it, and replies with `body`. Used by refresh tests
+    /// to avoid pulling in wiremock/mockito just for a single endpoint.
+    async fn spawn_mock_token_endpoint(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/v1/oauth/token");
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            // Read request line.
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line).await;
+            // Drain headers.
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header).await {
+                    Ok(0) => break,
+                    Ok(_) if header == "\r\n" || header == "\n" => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            // Don't bother consuming the body — reqwest closes the connection
+            // after it reads our response.
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            );
+            let _ = writer.write_all(response.as_bytes()).await;
+            let _ = writer.shutdown().await;
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn refresh_oauth_token_parses_success_response() {
+        let (token_url, server) = spawn_mock_token_endpoint(
+            r#"{"access_token":"new-access-xyz","refresh_token":"new-refresh-abc","expires_in":28800}"#,
+        )
+        .await;
+        let cfg = OAuthConfig {
+            token_url,
+            ..OAuthConfig::default()
+        };
+        let http = reqwest::Client::new();
+        let tokens = refresh_oauth_token(&cfg, &http, "old-refresh-123").await.unwrap();
+        assert_eq!(tokens.access_token, "new-access-xyz");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh-abc"));
+        assert_eq!(tokens.expires_in, Some(28800));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_oauth_token_carries_old_refresh_forward() {
+        // Server returns no refresh_token — we should fall back to the one we sent.
+        let (token_url, server) = spawn_mock_token_endpoint(
+            r#"{"access_token":"new-access-xyz","expires_in":28800}"#,
+        )
+        .await;
+        let cfg = OAuthConfig {
+            token_url,
+            ..OAuthConfig::default()
+        };
+        let http = reqwest::Client::new();
+        let tokens = refresh_oauth_token(&cfg, &http, "kept-refresh-999").await.unwrap();
+        assert_eq!(tokens.refresh_token.as_deref(), Some("kept-refresh-999"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_oauth_token_returns_error_on_non_200() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token_url = format!("http://127.0.0.1:{port}/v1/oauth/token");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (_reader, mut writer) = stream.into_split();
+            let body = r#"{"error":"invalid_grant"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            );
+            let _ = writer.write_all(response.as_bytes()).await;
+            let _ = writer.shutdown().await;
+        });
+        let cfg = OAuthConfig {
+            token_url,
+            ..OAuthConfig::default()
+        };
+        let http = reqwest::Client::new();
+        let err = refresh_oauth_token(&cfg, &http, "dead-refresh").await.unwrap_err();
+        assert!(matches!(err, CcError::Auth(msg) if msg.contains("refresh failed")));
+        server.await.unwrap();
     }
 
     #[tokio::test]

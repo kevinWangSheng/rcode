@@ -15,19 +15,19 @@ const KEYCHAIN_SERVICE_CREDENTIALS: &str = "Claude Code-credentials";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct OAuthTokens {
-    pub(crate) access_token: String,
+pub struct OAuthTokens {
+    pub access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) refresh_token: Option<String>,
+    pub refresh_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) expires_at: Option<u64>,
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SecureStorageData {
+pub struct SecureStorageData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) claude_ai_oauth: Option<OAuthTokens>,
+    pub claude_ai_oauth: Option<OAuthTokens>,
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────

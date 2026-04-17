@@ -74,9 +74,11 @@ mod tests {
 
     #[test]
     fn cost_estimate_uses_model_pricing() {
-        let mut tracker = UsageTracker::default();
-        tracker.total_input_tokens = 1_000_000;
-        tracker.total_output_tokens = 1_000_000;
+        let tracker = UsageTracker {
+            total_input_tokens: 1_000_000,
+            total_output_tokens: 1_000_000,
+            ..UsageTracker::default()
+        };
 
         let opus_cost = tracker.estimated_cost_usd("claude-opus-4-6");
         assert!((opus_cost - 90.0).abs() < 0.01); // 15 + 75

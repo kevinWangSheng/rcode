@@ -6,7 +6,7 @@ use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
 use cc_api::{ApiClient, AuthCredential};
-use cc_auth::{resolve_credentials, Credentials};
+use cc_auth::{ensure_fresh_credentials, Credentials};
 use cc_config::{load_settings, resolve_model};
 use cc_core::{MessageParam, SystemBlock};
 use cc_hooks::{HookRunner, HooksSettings};
@@ -128,7 +128,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (credentials, key_source) = resolve_credentials()?;
+    let (credentials, key_source) = ensure_fresh_credentials().await?;
     tracing::debug!("using credentials from {key_source}");
 
     let settings = load_settings(None)?;
