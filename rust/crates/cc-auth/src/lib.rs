@@ -1,11 +1,13 @@
 mod file_store;
 mod keychain;
+pub mod oauth;
 
 pub use file_store::{credentials_file_path, read_credentials_from_file, write_oauth_token};
 pub use keychain::{
     delete_api_key, get_api_key, get_credentials_from_keychain, save_api_key, ApiKeySource,
     Credentials,
 };
+pub use oauth::{run_login_flow, OAuthConfig};
 
 use cc_core::{CcError, CcResult};
 

@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
@@ -82,6 +82,16 @@ struct Cli {
     /// Enable verbose / debug logging.
     #[arg(short, long)]
     verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Authenticate with claude.ai via OAuth and save the token to
+    /// ~/.claude/credentials.json. Used by dev builds to avoid Keychain prompts.
+    Login,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -111,6 +121,13 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // Subcommand branches (don't require credentials to already exist).
+    if let Some(Commands::Login) = &cli.command {
+        let path = cc_auth::run_login_flow(cc_auth::OAuthConfig::default()).await?;
+        println!("Credentials saved to {}", path.display());
+        return Ok(());
+    }
+
     let (credentials, key_source) = resolve_credentials()?;
     tracing::debug!("using credentials from {key_source}");
 

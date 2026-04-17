@@ -75,6 +75,11 @@ unicode-normalization = "0.1"
 # Keychain (macOS Keychain, Linux SecretService, Windows Credential Manager)
 keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
 
+# Crypto primitives for OAuth PKCE
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
 # TUI
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
