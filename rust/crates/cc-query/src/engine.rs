@@ -274,32 +274,15 @@ impl QueryEngine {
                 _ => {
                     // §5.1: Fire Stop hook before concluding the turn.
                     // Exit 2 → stderr → model, continue conversation.
-                    let stop_input = HookInput {
-                        session_id: self.session.id.clone(),
-                        transcript_path: Some(
-                            self.session.transcript_path().to_string_lossy().to_string(),
-                        ),
-                        cwd: std::env::current_dir()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        permission_mode: None,
-                        hook_event_name: "Stop".to_string(),
-                        tool_name: None,
-                        tool_input: None,
-                        tool_use_id: None,
-                        tool_response: None,
-                        source: None,
-                        model: Some(self.options.model.clone()),
-                        message: None,
-                        agent_id: None,
-                        stop_hook_active: Some(true),
-                        last_assistant_message: if final_text.is_empty() {
+                    let stop_input = HookInput::base(self.session.id.clone(), "Stop")
+                        .with_transcript_path(self.session.transcript_path().to_string_lossy())
+                        .with_model(self.options.model.clone())
+                        .with_stop_hook_active(true)
+                        .with_last_assistant_message(if final_text.is_empty() {
                             None
                         } else {
                             Some(final_text.clone())
-                        },
-                    };
+                        });
                     let stop_result = self.hooks.run("Stop", &stop_input, cancel).await;
                     if stop_result.blocked {
                         // Inject block message as user turn and continue loop
@@ -437,26 +420,7 @@ impl QueryEngine {
         let input = &tu.input;
 
         // --- PreToolUse hook ---
-        let hook_input = HookInput {
-            session_id: self.session.id.clone(),
-            transcript_path: None,
-            cwd: std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            permission_mode: None,
-            hook_event_name: "PreToolUse".into(),
-            tool_name: Some(tool_name.clone()),
-            tool_input: Some(input.clone()),
-            tool_use_id: Some(tu.id.clone()),
-            tool_response: None,
-            source: None,
-            model: None,
-            message: None,
-            agent_id: None,
-            stop_hook_active: None,
-            last_assistant_message: None,
-        };
+        let hook_input = HookInput::base(self.session.id.clone(), "PreToolUse").with_tool(tu);
         let hook_result = self.hooks.run("PreToolUse", &hook_input, cancel).await;
         if hook_result.blocked {
             let msg = hook_result
@@ -604,26 +568,7 @@ async fn fire_permission_request(
     tu: &ToolUseBlock,
     cancel: &CancellationToken,
 ) -> cc_hooks::HookRunResult {
-    let input = HookInput {
-        session_id: session_id.to_string(),
-        transcript_path: None,
-        cwd: std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
-        permission_mode: None,
-        hook_event_name: "PermissionRequest".into(),
-        tool_name: Some(tu.name.clone()),
-        tool_input: Some(tu.input.clone()),
-        tool_use_id: Some(tu.id.clone()),
-        tool_response: None,
-        source: None,
-        model: None,
-        message: None,
-        agent_id: None,
-        stop_hook_active: None,
-        last_assistant_message: None,
-    };
+    let input = HookInput::base(session_id, "PermissionRequest").with_tool(tu);
     hooks.run("PermissionRequest", &input, cancel).await
 }
 
@@ -638,26 +583,9 @@ async fn fire_permission_denied(
     reason_tag: &str,
     cancel: &CancellationToken,
 ) {
-    let input = HookInput {
-        session_id: session_id.to_string(),
-        transcript_path: None,
-        cwd: std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
-        permission_mode: None,
-        hook_event_name: "PermissionDenied".into(),
-        tool_name: Some(tu.name.clone()),
-        tool_input: Some(tu.input.clone()),
-        tool_use_id: Some(tu.id.clone()),
-        tool_response: None,
-        source: None,
-        model: None,
-        message: Some(reason_tag.to_string()),
-        agent_id: None,
-        stop_hook_active: None,
-        last_assistant_message: None,
-    };
+    let input = HookInput::base(session_id, "PermissionDenied")
+        .with_tool(tu)
+        .with_message(reason_tag);
     let _ = hooks.run("PermissionDenied", &input, cancel).await;
 }
 
@@ -676,26 +604,9 @@ async fn run_post_tool_hook(
     } else {
         "PostToolUse"
     };
-    let hook_input = HookInput {
-        session_id: session_id.to_string(),
-        transcript_path: None,
-        cwd: std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
-        permission_mode: None,
-        hook_event_name: event.into(),
-        tool_name: Some(tu.name.clone()),
-        tool_input: Some(tu.input.clone()),
-        tool_use_id: Some(tu.id.clone()),
-        tool_response: result.content.clone(),
-        source: None,
-        model: None,
-        message: None,
-        agent_id: None,
-        stop_hook_active: None,
-        last_assistant_message: None,
-    };
+    let hook_input = HookInput::base(session_id, event)
+        .with_tool(tu)
+        .with_tool_response(result.content.clone());
     let _ = hooks.run(event, &hook_input, cancel).await;
 }
 

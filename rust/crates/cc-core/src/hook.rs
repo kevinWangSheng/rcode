@@ -238,6 +238,94 @@ pub struct HookInput {
     pub last_assistant_message: Option<String>,
 }
 
+impl HookInput {
+    /// Construct a HookInput with `cwd` populated from the current directory
+    /// and every optional field set to `None`. Callers chain the `with_*`
+    /// setters to fill in event-specific fields.
+    ///
+    /// This exists because HookInput has 15 fields and the 9+ construction
+    /// sites otherwise repeat ~12 `None`s each, obscuring which fields the
+    /// event actually uses.
+    pub fn base(session_id: impl Into<String>, event: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            transcript_path: None,
+            cwd: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            permission_mode: None,
+            hook_event_name: event.into(),
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            tool_response: None,
+            source: None,
+            model: None,
+            message: None,
+            agent_id: None,
+            stop_hook_active: None,
+            last_assistant_message: None,
+        }
+    }
+
+    /// Populate `tool_name`, `tool_input`, and `tool_use_id` from a
+    /// `ToolUseBlock` — the pattern every tool-lifecycle hook uses.
+    pub fn with_tool(mut self, tu: &crate::ToolUseBlock) -> Self {
+        self.tool_name = Some(tu.name.clone());
+        self.tool_input = Some(tu.input.clone());
+        self.tool_use_id = Some(tu.id.clone());
+        self
+    }
+
+    pub fn with_transcript_path(mut self, path: impl Into<String>) -> Self {
+        self.transcript_path = Some(path.into());
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = Some(agent_id.into());
+        self
+    }
+
+    pub fn with_stop_hook_active(mut self, active: bool) -> Self {
+        self.stop_hook_active = Some(active);
+        self
+    }
+
+    pub fn with_last_assistant_message(mut self, last: Option<impl Into<String>>) -> Self {
+        self.last_assistant_message = last.map(Into::into);
+        self
+    }
+
+    pub fn with_tool_response(mut self, response: Option<Value>) -> Self {
+        self.tool_response = response;
+        self
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Override cwd (defaults to `current_dir`). Needed by sub-agent runners
+    /// that capture the cwd before spawning.
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = cwd.into();
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

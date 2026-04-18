@@ -169,24 +169,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Fire SessionStart hook (§4 contract: trigger='resume' when resuming)
     {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let session_start_input = cc_core::hook::HookInput {
-            session_id: session.id.clone(),
-            transcript_path: Some(session.transcript_path().to_string_lossy().to_string()),
-            cwd: cwd.to_string_lossy().to_string(),
-            permission_mode: None,
-            hook_event_name: "SessionStart".to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: Some(model.clone()),
-            message: resume_id.as_ref().map(|_| "resume".to_string()),
-            agent_id: None,
-            stop_hook_active: None,
-            last_assistant_message: None,
-        };
+        let mut session_start_input =
+            cc_core::hook::HookInput::base(session.id.clone(), "SessionStart")
+                .with_transcript_path(session.transcript_path().to_string_lossy())
+                .with_model(model.clone());
+        if resume_id.is_some() {
+            session_start_input = session_start_input.with_message("resume");
+        }
         // Build a temporary hook runner just for the SessionStart event.
         // We'll re-build the real one below with the same config.
         let hooks_raw_pre = settings
@@ -542,24 +531,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// behavior contract (§5.2).  Uses `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`
 /// for override.
 async fn fire_session_end(hook_runner: &HookRunner, session_id: &str) {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let input = cc_core::hook::HookInput {
-        session_id: session_id.to_string(),
-        transcript_path: None,
-        cwd: cwd.to_string_lossy().to_string(),
-        permission_mode: None,
-        hook_event_name: "SessionEnd".to_string(),
-        tool_name: None,
-        tool_input: None,
-        tool_use_id: None,
-        tool_response: None,
-        source: None,
-        model: None,
-        message: None,
-        agent_id: None,
-        stop_hook_active: None,
-        last_assistant_message: None,
-    };
+    let input = cc_core::hook::HookInput::base(session_id, "SessionEnd");
     hook_runner.run_session_end(&input).await;
 }
 

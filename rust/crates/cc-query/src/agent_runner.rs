@@ -51,30 +51,12 @@ impl SubAgentRunner for SubAgentRunnerImpl {
         // effects per subagent. Frontmatter hooks in TS are keyed off this.
         let agent_id = Uuid::new_v4().to_string();
 
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
         // Fire SubagentStart — hooks may inject additional_context that we
         // prepend as a user message (consistent with TS `runAgent.ts`).
-        let start_input = HookInput {
-            session_id: session.id.clone(),
-            transcript_path: Some(session.transcript_path().to_string_lossy().to_string()),
-            cwd: cwd.clone(),
-            permission_mode: None,
-            hook_event_name: "SubagentStart".to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: Some(self.options.model.clone()),
-            message: None,
-            agent_id: Some(agent_id.clone()),
-            stop_hook_active: None,
-            last_assistant_message: None,
-        };
+        let start_input = HookInput::base(session.id.clone(), "SubagentStart")
+            .with_transcript_path(session.transcript_path().to_string_lossy())
+            .with_model(self.options.model.clone())
+            .with_agent_id(agent_id.clone());
         let start_result = self.hooks.run("SubagentStart", &start_input, &cancel).await;
 
         // Prepend SubagentStart's injected contexts as a user message, matching
@@ -113,23 +95,16 @@ impl SubAgentRunner for SubAgentRunnerImpl {
         // Fire SubagentStop regardless of turn outcome — mirrors TS behavior
         // where Stop hooks run in the agent's finally path. We don't act on
         // the return value here (no re-entry loop for subagents in Rust yet).
-        let stop_input = HookInput {
-            session_id: start_input.session_id.clone(),
-            transcript_path: start_input.transcript_path.clone(),
-            cwd,
-            permission_mode: None,
-            hook_event_name: "SubagentStop".to_string(),
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_response: None,
-            source: None,
-            model: Some(self.options.model.clone()),
-            message: None,
-            agent_id: Some(agent_id),
-            stop_hook_active: Some(true),
-            last_assistant_message: result.as_ref().ok().cloned(),
-        };
+        let mut stop_input = HookInput::base(start_input.session_id.clone(), "SubagentStop")
+            .with_model(self.options.model.clone())
+            .with_agent_id(agent_id)
+            .with_stop_hook_active(true)
+            .with_last_assistant_message(result.as_ref().ok().cloned());
+        // Reuse the start-input's transcript path (and its cwd snapshot) so
+        // start/stop carry the same file reference even if cwd has shifted
+        // underneath us since SubagentStart.
+        stop_input.transcript_path = start_input.transcript_path.clone();
+        stop_input.cwd = start_input.cwd.clone();
         let _ = self.hooks.run("SubagentStop", &stop_input, &cancel).await;
 
         result
