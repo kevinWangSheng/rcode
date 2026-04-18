@@ -1,6 +1,54 @@
-use cc_core::{ContentBlock, StopReason, Usage};
+use cc_core::{CcError, ContentBlock, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
+
+/// Maximum size of the raw JSON buffer preserved in a [`StreamError::ToolInputNotJson`]
+/// error. Buffers longer than this are truncated with a `"...(truncated)"` suffix
+/// so logs and `is_error` tool_result payloads stay bounded.
+const TOOL_INPUT_RAW_MAX: usize = 2048;
+
+/// Errors that arise while converting an accumulated SSE stream into its final
+/// content blocks. These are structured on purpose so callers (notably
+/// `cc-query`) can translate them into user-visible retry feedback rather than
+/// passing silent garbage (e.g. empty tool arguments) back to the model.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum StreamError {
+    /// The accumulated JSON buffer for a `tool_use` block could not be parsed
+    /// at end-of-stream. `raw` is truncated to `TOOL_INPUT_RAW_MAX` bytes.
+    #[error("tool_use input for tool '{name}' (id {id}) was not valid JSON: {raw}")]
+    ToolInputNotJson { id: String, name: String, raw: String },
+}
+
+impl From<StreamError> for CcError {
+    fn from(e: StreamError) -> Self {
+        CcError::api(e.to_string())
+    }
+}
+
+impl StreamError {
+    /// Access the `ToolInputNotJson` fragment for retry synthesis in the
+    /// engine. Returns `None` for other variants.
+    pub fn as_tool_input_not_json(&self) -> Option<(&str, &str, &str)> {
+        match self {
+            StreamError::ToolInputNotJson { id, name, raw } => Some((id, name, raw)),
+        }
+    }
+}
+
+fn truncate_raw(raw: &str) -> String {
+    if raw.len() <= TOOL_INPUT_RAW_MAX {
+        raw.to_string()
+    } else {
+        // Truncate on a char boundary to avoid splitting a multi-byte scalar.
+        let mut end = TOOL_INPUT_RAW_MAX;
+        while end > 0 && !raw.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...(truncated)", &raw[..end])
+    }
+}
 
 /// All event types emitted by the Anthropic streaming API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,30 +205,45 @@ impl StreamAccumulator {
     }
 
     /// Convert accumulated state into final content blocks.
-    pub fn into_content(self) -> Vec<ContentBlock> {
-        self.blocks
-            .into_iter()
-            .filter_map(|b| match b {
+    ///
+    /// Returns `StreamError::ToolInputNotJson` if any `tool_use` block's
+    /// accumulated JSON buffer fails to parse at end-of-stream. We surface
+    /// this as an explicit error rather than falling back to `{}`, because
+    /// an empty object silently turns into `bash -c ""`, `Write` with no
+    /// path, etc. The caller (`cc-query`) translates this into a
+    /// `tool_result` with `is_error: true` so the model can self-correct.
+    pub fn into_content(self) -> Result<Vec<ContentBlock>, StreamError> {
+        let mut out = Vec::with_capacity(self.blocks.len());
+        for b in self.blocks {
+            match b {
                 BlockState::Text { text } if !text.is_empty() => {
-                    Some(ContentBlock::text(text))
+                    out.push(ContentBlock::text(text));
                 }
+                BlockState::Text { .. } => {}
                 BlockState::Thinking { thinking, signature } if !thinking.is_empty() => {
-                    Some(ContentBlock::Thinking(cc_core::ThinkingBlock {
+                    out.push(ContentBlock::Thinking(cc_core::ThinkingBlock {
                         thinking,
                         signature,
-                    }))
+                    }));
                 }
+                BlockState::Thinking { .. } => {}
                 BlockState::ToolUse { id, name, json } => {
-                    let input: Value = serde_json::from_str(&json).unwrap_or(Value::Object(Default::default()));
-                    Some(ContentBlock::ToolUse(cc_core::ToolUseBlock {
+                    let input: Value = serde_json::from_str(&json).map_err(|_| {
+                        StreamError::ToolInputNotJson {
+                            id: id.clone(),
+                            name: name.clone(),
+                            raw: truncate_raw(&json),
+                        }
+                    })?;
+                    out.push(ContentBlock::ToolUse(cc_core::ToolUseBlock {
                         id,
                         name,
                         input,
-                    }))
+                    }));
                 }
-                _ => None,
-            })
-            .collect()
+            }
+        }
+        Ok(out)
     }
 
     /// Return the accumulated text (joining all text blocks).
@@ -200,6 +263,32 @@ impl StreamAccumulator {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn drive_events(acc: &mut StreamAccumulator, events: &[StreamEvent]) {
+        for ev in events {
+            acc.apply(ev);
+        }
+    }
+
+    fn tool_use_start(index: u32, id: &str, name: &str) -> StreamEvent {
+        StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockStartData::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: Value::Object(Default::default()),
+            },
+        }
+    }
+
+    fn input_json_delta(index: u32, partial: &str) -> StreamEvent {
+        StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: partial.to_string(),
+            },
+        }
+    }
 
     #[test]
     fn accumulator_text_deltas() {
@@ -280,7 +369,7 @@ mod tests {
             delta: ContentBlockDelta::InputJsonDelta { partial_json: r#"mand":"ls"}"#.into() },
         });
 
-        let content = acc.into_content();
+        let content = acc.into_content().expect("tool_use JSON parses");
         assert_eq!(content.len(), 1);
         match &content[0] {
             ContentBlock::ToolUse(tu) => {
@@ -306,5 +395,122 @@ mod tests {
         let json = r#"{"type":"future_event_2026"}"#;
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, StreamEvent::Unknown));
+    }
+
+    /// Crafted SSE stream with a truncated tool_use JSON buffer: the
+    /// accumulated `partial_json` deltas never close the outer object
+    /// (ends mid-string). The fallback `unwrap_or({})` would have silently
+    /// handed the tool an empty-args call; this test asserts we now surface
+    /// a typed `ToolInputNotJson` error carrying the raw fragment.
+    #[test]
+    fn malformed_tool_use_json_returns_error_instead_of_empty_object() {
+        let mut acc = StreamAccumulator::default();
+        drive_events(
+            &mut acc,
+            &[
+                tool_use_start(0, "tool_abc", "Write"),
+                input_json_delta(0, r#"{"file_path":"/tmp/x","content"#),
+                // Stream ends here — JSON is truncated.
+            ],
+        );
+
+        let err = acc.into_content().expect_err("malformed JSON must error");
+        match err {
+            StreamError::ToolInputNotJson { id, name, raw } => {
+                assert_eq!(id, "tool_abc");
+                assert_eq!(name, "Write");
+                assert!(raw.contains("/tmp/x"), "raw should include buffer fragment: {raw}");
+                assert!(raw.contains("\"content"), "raw should show truncation point: {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn well_formed_tool_use_json_parses_normally() {
+        let mut acc = StreamAccumulator::default();
+        drive_events(
+            &mut acc,
+            &[
+                tool_use_start(0, "tool_1", "Bash"),
+                input_json_delta(0, r#"{"command":"ls"}"#),
+            ],
+        );
+        let blocks = acc.into_content().expect("well-formed JSON must succeed");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::ToolUse(tu) => {
+                assert_eq!(tu.id, "tool_1");
+                assert_eq!(tu.name, "Bash");
+                assert_eq!(tu.input["command"], "ls");
+            }
+            _ => panic!("expected ToolUse block"),
+        }
+    }
+
+    #[test]
+    fn text_block_before_malformed_tool_use_still_errors() {
+        // The first text block is well-formed, but the trailing tool_use
+        // is malformed. `into_content` returns the error (per proposal,
+        // the engine catches it and synthesizes a tool_result). The raw
+        // fragment must be preserved so the engine can surface it.
+        let mut acc = StreamAccumulator::default();
+        drive_events(
+            &mut acc,
+            &[
+                StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ContentBlockStartData::Text { text: String::new() },
+                },
+                StreamEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: ContentBlockDelta::TextDelta {
+                        text: "Calling tool now...".to_string(),
+                    },
+                },
+                tool_use_start(1, "tool_xyz", "Edit"),
+                input_json_delta(1, r#"{"file_path":"a","old_stri"#),
+            ],
+        );
+        let err = acc.into_content().expect_err("must error");
+        let StreamError::ToolInputNotJson { id, name, raw } = err;
+        assert_eq!(id, "tool_xyz");
+        assert_eq!(name, "Edit");
+        assert!(raw.contains("old_stri"));
+    }
+
+    #[test]
+    fn truncate_raw_caps_at_two_kb_on_char_boundary() {
+        let long = "a".repeat(5_000);
+        let out = truncate_raw(&long);
+        assert!(out.len() <= TOOL_INPUT_RAW_MAX + "...(truncated)".len());
+        assert!(out.ends_with("...(truncated)"));
+
+        // Short input is passed through untouched.
+        let short = "short";
+        assert_eq!(truncate_raw(short), "short");
+
+        // Multi-byte boundary: build a string whose 2048th byte falls mid-glyph.
+        // A 3-byte character (e.g. 'é' is 2 bytes, 'あ' is 3 bytes) lets us
+        // exercise the char-boundary walk-back.
+        let mut s = "a".repeat(TOOL_INPUT_RAW_MAX - 1);
+        s.push('あ'); // straddles the 2048-byte mark
+        let out = truncate_raw(&s);
+        assert!(out.ends_with("...(truncated)"));
+        // Must still be valid UTF-8 and no split scalar.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn stream_error_converts_into_cc_error() {
+        let e = StreamError::ToolInputNotJson {
+            id: "t1".into(),
+            name: "Bash".into(),
+            raw: "{\"cmd".into(),
+        };
+        let converted: CcError = e.into();
+        match converted {
+            CcError::Api { message, .. } => assert!(message.contains("not valid JSON")),
+            other => panic!("unexpected CcError variant: {other:?}"),
+        }
     }
 }

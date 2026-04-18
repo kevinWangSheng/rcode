@@ -272,13 +272,13 @@ mod tests {
 
         tokio::spawn(async move {
             in_tx.send(Ok(text_delta("partial"))).await.unwrap();
-            in_tx.send(Err(CcError::Api("boom".into()))).await.unwrap();
+            in_tx.send(Err(CcError::api("boom"))).await.unwrap();
             drop(in_tx);
         });
 
         let err = forward_stream_events(&mut in_rx, &out_tx)
             .await
             .expect_err("should surface transport error");
-        assert!(matches!(err, CcError::Api(msg) if msg.contains("boom")));
+        assert!(matches!(err, CcError::Api { message, .. } if message.contains("boom")));
     }
 }

@@ -2,13 +2,40 @@ use cc_core::{CcError, CcResult, Message, Usage};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::request::CreateMessageRequest;
 use crate::retry::RetryPolicy;
-use crate::stream::{ContentBlockDelta, StreamAccumulator, StreamEvent};
+use crate::stream::{ContentBlockDelta, StreamAccumulator, StreamError, StreamEvent};
+
+/// Errors returned by [`ApiClient::complete_message`].
+///
+/// Split into `Core` (HTTP / IO / auth / parse-of-envelope) and `Stream`
+/// (semantic problems in the accumulated SSE payload, such as a `tool_use`
+/// block whose JSON buffer is not valid JSON at end-of-stream). Keeping
+/// `Stream` structured lets `cc-query` translate it into a synthetic
+/// `tool_result` with `is_error: true` instead of forwarding silent garbage
+/// to the model.
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error(transparent)]
+    Core(#[from] CcError),
+
+    #[error(transparent)]
+    Stream(#[from] StreamError),
+}
+
+impl From<ApiError> for CcError {
+    fn from(e: ApiError) -> Self {
+        match e {
+            ApiError::Core(c) => c,
+            ApiError::Stream(s) => s.into(),
+        }
+    }
+}
 
 /// Anthropic API base URL.
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com";
@@ -230,7 +257,17 @@ impl ApiClient {
     }
 
     /// Stream and accumulate a complete message.
-    /// Calls `on_delta` for each streaming delta (for real-time display).
+    ///
+    /// Calls `on_delta` for each streaming delta (text / thinking / tool-use
+    /// start / input JSON delta) so the TUI can paint tokens as they arrive.
+    ///
+    /// Returns the fully-assembled `Message` + `Usage`. When the accumulated
+    /// payload is structurally invalid at end-of-stream (e.g. a `tool_use`
+    /// block whose JSON buffer never parses — the H1 fix behind
+    /// `StreamError::ToolInputNotJson`) the error is surfaced as
+    /// `CcError::Api`; callers can translate it into a synthetic
+    /// `tool_result` with `is_error: true` so the model retries with
+    /// well-formed arguments.
     pub async fn complete_message(
         &self,
         request: CreateMessageRequest,
@@ -278,7 +315,12 @@ impl ApiClient {
             cache_creation_input_tokens: acc.cache_creation_input_tokens,
             cache_read_input_tokens: acc.cache_read_input_tokens,
         };
-        let content = acc.into_content();
+        // `into_content` is fallible after the H1 fix — a `tool_use` block
+        // whose JSON never parsed returns `StreamError::ToolInputNotJson`.
+        // Convert to `CcError::Api` so callers get the raw context.
+        let content = acc
+            .into_content()
+            .map_err(|e| CcError::api(format!("stream accumulator: {e}")))?;
 
         let message = Message {
             id,
