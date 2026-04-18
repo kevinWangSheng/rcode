@@ -4,4 +4,7 @@ pub mod stream;
 
 pub use client::ApiClient;
 pub use request::CreateMessageRequest;
-pub use stream::StreamEvent;
+pub use stream::{
+    ContentBlockDelta, ContentBlockStartData, MessageDeltaData, MessageDeltaUsage,
+    MessageStartData, StreamAccumulator, StreamEvent,
+};
