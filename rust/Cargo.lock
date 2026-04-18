@@ -168,6 +168,7 @@ name = "cc-agents"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "chrono",
  "regex",
  "reqwest",
  "serde",
