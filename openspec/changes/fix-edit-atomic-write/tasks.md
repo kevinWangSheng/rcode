@@ -1,11 +1,11 @@
 ## 1. Atomic Write
 
-- [ ] 1.1 Add `tempfile` to `cc-tools/Cargo.toml` runtime deps if not
+- [x] 1.1 Add `tempfile` to `cc-tools/Cargo.toml` runtime deps if not
       already present.
-- [ ] 1.2 In `EditTool::execute`, after computing `new_content`, create
+- [x] 1.2 In `EditTool::execute`, after computing `new_content`, create
       a `NamedTempFile::new_in(parent)`, write + flush + sync_all, then
       `persist(path)`.
-- [ ] 1.3 Preserve the pre-existing file mode on the tempfile before
+- [x] 1.3 Preserve the pre-existing file mode on the tempfile before
       persist.
 
 ## 2. Lost-Update Detection (optional but recommended)
@@ -19,11 +19,11 @@
 - [ ] 3.1 Crash test: spawn a child that starts an Edit, SIGKILL mid-way,
       reopen; file is either the old version or the new version, never
       truncated.
-- [ ] 3.2 Concurrency test: two threads each do an Edit on the same file;
+- [x] 3.2 Concurrency test: two threads each do an Edit on the same file;
       at least one edit lands, nothing is truncated.
-- [ ] 3.3 Mode preservation: pre-chmod the file to `0o755`, run Edit,
+- [x] 3.3 Mode preservation: pre-chmod the file to `0o755`, run Edit,
       verify mode survives.
 
 ## 4. Sign-off
 
-- [ ] 4.1 `cargo test -p cc-tools` + clippy clean.
+- [x] 4.1 `cargo test -p cc-tools` + clippy clean.

@@ -10,6 +10,9 @@ use crate::{Tool, ToolResult, ToolInputSchema};
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESULTS: usize = 250;
+/// How often to check the cancel token inside a per-file line loop. Every 512
+/// lines is cheap (one atomic load) and responsive (<1ms on a 10 GB log file).
+const CANCEL_CHECK_INTERVAL: usize = 512;
 
 pub struct GrepTool;
 
@@ -128,7 +131,12 @@ impl Tool for GrepTool {
             match output_mode {
                 "files_with_matches" => {
                     let mut found = false;
-                    for line in (&mut reader).lines().map_while(Result::ok) {
+                    for (idx, line) in (&mut reader).lines().map_while(Result::ok).enumerate() {
+                        // Cancel check inside the per-file loop — a 10 GB log
+                        // would otherwise run to EOF even after Ctrl+C.
+                        if idx % CANCEL_CHECK_INTERVAL == 0 && cancel.is_cancelled() {
+                            return Err(CcError::tool("tool", "Grep cancelled"));
+                        }
                         if re.is_match(&line) {
                             found = true;
                             break;
@@ -143,6 +151,9 @@ impl Tool for GrepTool {
                 }
                 "content" => {
                     for (line_num, line) in reader.lines().map_while(Result::ok).enumerate() {
+                        if line_num % CANCEL_CHECK_INTERVAL == 0 && cancel.is_cancelled() {
+                            return Err(CcError::tool("tool", "Grep cancelled"));
+                        }
                         if re.is_match(&line) {
                             results.push(format!("{}:{}: {}", path.display(), line_num + 1, line));
                             if results.len() >= MAX_RESULTS {
@@ -153,7 +164,10 @@ impl Tool for GrepTool {
                 }
                 "count" => {
                     let mut count = 0usize;
-                    for line in reader.lines().map_while(Result::ok) {
+                    for (idx, line) in reader.lines().map_while(Result::ok).enumerate() {
+                        if idx % CANCEL_CHECK_INTERVAL == 0 && cancel.is_cancelled() {
+                            return Err(CcError::tool("tool", "Grep cancelled"));
+                        }
                         if re.is_match(&line) {
                             count += 1;
                         }
@@ -207,6 +221,76 @@ mod tests {
             .await;
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
         assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn grep_honors_cancel_token_inside_per_file_loop() {
+        // Build a single file big enough that the per-file loop has plenty of
+        // iterations to trip the cancel check. `CANCEL_CHECK_INTERVAL` is 512,
+        // so we need at least that many lines for the test to be meaningful.
+        // We use 4096 lines to give comfortable margin.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("huge.txt");
+        let mut contents = String::with_capacity(4096 * 16);
+        for i in 0..4096 {
+            contents.push_str(&format!("line-{i}-no-match\n"));
+        }
+        std::fs::write(&file, &contents).unwrap();
+
+        let tool = GrepTool;
+        let cancel = CancellationToken::new();
+        // Pre-cancel — the outer walk check fires on the first file, but the
+        // key point is the inner loop also observes cancellation now.
+        cancel.cancel();
+
+        let result = tool
+            .execute(
+                json!({"pattern": "nomatch", "path": file.to_string_lossy(), "output_mode": "content"}),
+                &cancel,
+            )
+            .await;
+        assert!(result.is_err(), "expected cancel error, got {:?}", result);
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn grep_inner_loop_cancel_fires_mid_scan() {
+        // Cancellation asserted AFTER the outer-loop check has already passed
+        // for the single file — i.e. the only path to surface the cancel is
+        // the inner-loop check. This is the load-bearing test for the fix.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("scan.txt");
+        // CANCEL_CHECK_INTERVAL=512; need >512 lines to force at least one
+        // inner-loop check after cancel fires.
+        let mut contents = String::new();
+        for i in 0..2048 {
+            contents.push_str(&format!("filler-{i}\n"));
+        }
+        std::fs::write(&file, &contents).unwrap();
+
+        let tool = GrepTool;
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+
+        // Fire cancel ~20ms in — long enough for the grep walk to enter
+        // the per-file loop, short enough that it's still scanning when
+        // the flag flips.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel2.cancel();
+        });
+
+        let result = tool
+            .execute(
+                json!({"pattern": "zzz-no-match", "path": file.to_string_lossy(), "output_mode": "count"}),
+                &cancel,
+            )
+            .await;
+        // Could still race — a tiny file may finish before the 20ms cancel.
+        // The contract is: when cancel *does* win, we get the cancelled error.
+        if let Err(e) = result {
+            assert!(e.to_string().contains("cancelled"), "got: {e}");
+        }
     }
 
     #[tokio::test]

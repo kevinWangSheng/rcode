@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 
+use crate::web_fetch::ssrf;
 use crate::{Tool, ToolResult, ToolInputSchema};
 use tokio_util::sync::CancellationToken;
 
@@ -86,9 +87,26 @@ impl Tool for WebSearchTool {
             }
         };
 
-        let client = reqwest::Client::builder()
+        // SSRF guard for the Brave endpoint too. Normally it resolves to a
+        // public IP, but a compromised DNS / hosts file that points
+        // api.search.brave.com at 127.0.0.1 would otherwise let the tool
+        // loop talk to a local attacker-controlled service.
+        let parsed_url = url::Url::parse(BRAVE_SEARCH_URL)
+            .map_err(|e| CcError::tool("tool", format!("WebSearch URL parse: {e}")))?;
+        let guard = match ssrf::guard_url(&parsed_url).await {
+            Ok(g) => g,
+            Err(e) => {
+                return Ok(ToolResult::error(e.to_string()));
+            }
+        };
+
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .user_agent("claude-code-rust/0.1")
+            .user_agent("claude-code-rust/0.1");
+        if let Some(host) = parsed_url.host_str() {
+            builder = builder.resolve(host, guard.resolved);
+        }
+        let client = builder
             .build()
             .map_err(|e| CcError::tool("tool", format!("failed to build http client: {e}")))?;
 

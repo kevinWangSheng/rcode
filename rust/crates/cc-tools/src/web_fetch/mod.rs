@@ -11,6 +11,8 @@
 //! lightweight regex pass — we deliberately avoid pulling a full HTML parser
 //! crate for this MVP.
 
+pub mod ssrf;
+
 use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
@@ -69,9 +71,34 @@ impl Tool for WebFetchTool {
             )));
         }
 
-        let client = reqwest::Client::builder()
+        // SSRF guard: resolve the hostname and reject any address pointing at
+        // loopback, RFC1918, link-local (including 169.254.169.254 cloud
+        // metadata), CGNAT, or unique-local IPv6. Returns the resolved
+        // socket address so we can pin reqwest to that IP and defeat DNS
+        // rebinding between the check and the fetch.
+        let parsed = url::Url::parse(&url)
+            .map_err(|e| CcError::tool("tool", format!("WebFetch refused: invalid URL: {e}")))?;
+        let guard = match ssrf::guard_url(&parsed).await {
+            Ok(g) => g,
+            Err(e) => {
+                // Return as a tool error (not an Err) so the model sees a
+                // clear refusal and doesn't try a different encoding.
+                return Ok(ToolResult::error(e.to_string()));
+            }
+        };
+
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .user_agent("claude-code-rust/0.1")
+            .user_agent("claude-code-rust/0.1");
+
+        // Pin the outbound connection to the IP we just vetted. Even if the
+        // authoritative DNS server rebinds between guard_url and send(),
+        // reqwest will still connect to this address.
+        if let Some(host) = parsed.host_str() {
+            builder = builder.resolve(host, guard.resolved);
+        }
+
+        let client = builder
             .build()
             .map_err(|e| CcError::tool("tool", format!("failed to build http client: {e}")))?;
 
@@ -222,7 +249,14 @@ mod tests {
         // Spin up a TCP listener that accepts the connection but never sends
         // any response. WebFetch would normally wait the full 30s timeout
         // before erroring; with cancel wiring, 100ms is enough.
+        //
+        // NOTE: after the SSRF fix, WebFetch refuses 127.0.0.1 by default.
+        // Set the opt-out env var so we can still exercise the cancel path
+        // against a local test server.
         use tokio::net::TcpListener;
+        // Serialize with any other test that mutates CC_WEBFETCH_ALLOW_PRIVATE.
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::set_var("CC_WEBFETCH_ALLOW_PRIVATE", "1");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let _hang = tokio::spawn(async move {
@@ -241,10 +275,102 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/hang");
         let start = std::time::Instant::now();
-        let err = tool.execute(json!({"url": url}), &cancel).await.unwrap_err();
+        let result = tool.execute(json!({"url": url}), &cancel).await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+        let err = result.unwrap_err();
         let elapsed = start.elapsed();
         assert!(err.to_string().contains("cancelled"), "got: {err}");
         // Must have bailed well before the 30s reqwest timeout.
         assert!(elapsed < std::time::Duration::from_secs(5), "took {:?}", elapsed);
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_aws_metadata_address() {
+        // Crucial test: http://169.254.169.254/... must be refused BEFORE any
+        // socket is opened. We use a connection counter via a sentinel
+        // TcpListener bound on a different IP; if our code were to actually
+        // attempt the connect, we'd see a TCP-level error rather than our
+        // refusal message. Either way the content must contain "refused".
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+        let tool = WebFetchTool;
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(
+                json!({"url": "http://169.254.169.254/latest/meta-data/iam/"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error, "metadata endpoint must be refused");
+        assert!(
+            result.content.contains("refused") && result.content.contains("169.254"),
+            "error should mention refusal + host: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_local_http_server() {
+        // Boot a local HTTP server on a random loopback port and assert that
+        // WebFetch refuses it by default (no opt-out env var).
+        use tokio::net::TcpListener;
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts2 = accepts.clone();
+        let _server = tokio::spawn(async move {
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    accepts2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    drop(sock);
+                }
+            }
+        });
+
+        let tool = WebFetchTool;
+        let cancel = CancellationToken::new();
+        let url = format!("http://127.0.0.1:{port}/");
+        let result = tool.execute(json!({"url": url}), &cancel).await.unwrap();
+        assert!(result.is_error, "loopback fetch must be refused");
+        assert!(result.content.contains("refused"), "got: {}", result.content);
+        // Critical: no socket was opened. The counter must stay at 0.
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "guard must refuse BEFORE opening a socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_rfc1918_host() {
+        // Direct literal-IP check — we can't hit the box so there's no risk
+        // of flakiness from DNS or network.
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+        let tool = WebFetchTool;
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(json!({"url": "http://10.0.0.1/admin"}), &cancel)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("refused"));
+    }
+
+    #[tokio::test]
+    async fn execute_refuses_ipv6_loopback() {
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+        let tool = WebFetchTool;
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(json!({"url": "http://[::1]:8080/"}), &cancel)
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("refused"));
     }
 }
