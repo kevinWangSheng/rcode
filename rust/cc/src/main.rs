@@ -167,6 +167,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         (s, Vec::<MessageParam>::new())
     };
 
+    // Build the real hook runner up-front (used by both SessionStart below
+    // and every later hook-firing site). Building it once here removes a
+    // throwaway pre-runner that used to live only to fire SessionStart.
+    let hooks_raw = settings
+        .extra
+        .get("hooks")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let hooks_config: HooksSettings = if hooks_raw.is_null() {
+        HooksSettings::new()
+    } else {
+        serde_json::from_value(hooks_raw).unwrap_or_default()
+    };
+    let http_config = cc_http::HttpClientConfig::from_env();
+    let http = cc_http::build_client(&http_config).unwrap_or_default();
+    let hook_runner = Arc::new(HookRunner::new(&hooks_config, http.clone()));
+
     // Fire SessionStart hook (§4 contract: trigger='resume' when resuming)
     {
         let mut session_start_input =
@@ -176,23 +193,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         if resume_id.is_some() {
             session_start_input = session_start_input.with_message("resume");
         }
-        // Build a temporary hook runner just for the SessionStart event.
-        // We'll re-build the real one below with the same config.
-        let hooks_raw_pre = settings
-            .extra
-            .get("hooks")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let hooks_config_pre: cc_hooks::HooksSettings = if hooks_raw_pre.is_null() {
-            cc_hooks::HooksSettings::new()
-        } else {
-            serde_json::from_value(hooks_raw_pre).unwrap_or_default()
-        };
-        let http_pre =
-            cc_http::build_client(&cc_http::HttpClientConfig::from_env()).unwrap_or_default();
-        let pre_runner = HookRunner::new(&hooks_config_pre, http_pre);
         let cancel_pre = tokio_util::sync::CancellationToken::new();
-        let _ = pre_runner
+        let _ = hook_runner
             .run("SessionStart", &session_start_input, &cancel_pre)
             .await;
     }
@@ -253,21 +255,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or_default();
     let permission_engine = PermissionEngine::from_settings(allow_rules, deny_rules);
-
-    // Build hook runner
-    let hooks_raw = settings
-        .extra
-        .get("hooks")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let hooks_config: HooksSettings = if hooks_raw.is_null() {
-        HooksSettings::new()
-    } else {
-        serde_json::from_value(hooks_raw).unwrap_or_default()
-    };
-    let http_config = cc_http::HttpClientConfig::from_env();
-    let http = cc_http::build_client(&http_config).unwrap_or_default();
-    let hook_runner = Arc::new(HookRunner::new(&hooks_config, http.clone()));
 
     // Build tools (built-in + task management + MCP servers from settings.json `mcpServers`).
     let (mut tools, _todo_list, _todo_write_list, _task_registry, teammate_dir) = all_tools();
