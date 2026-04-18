@@ -9,7 +9,7 @@ pub use skills::{discover_skills, SkillDef};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Memory type (determines loading priority and source gating).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,25 +130,84 @@ fn walk_up_dirs(cwd: &Path, root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Stable dedup key for cycle detection of `@`-includes.
+///
+/// On Unix we prefer `(device, inode)` from `metadata()` — that catches
+/// symlink cycles even when `canonicalize()` returns `Err` (e.g. permission
+/// denied on a link target). When `metadata()` fails we fall back to a
+/// lexically-normalized path key so the cycle detector still makes forward
+/// progress instead of silently de-duping to the same un-canonicalized path
+/// twice and entering an infinite recursion through a different syntactic
+/// include form.
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+enum IncludeKey {
+    #[cfg(unix)]
+    DevIno(u64, u64),
+    Lexical(PathBuf),
+}
+
+fn include_dedup_key(path: &Path) -> IncludeKey {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            return IncludeKey::DevIno(md.dev(), md.ino());
+        }
+    }
+    IncludeKey::Lexical(lexical_normalize(path))
+}
+
+/// Lexical path normalization (no filesystem calls) used as the cycle-key
+/// fallback when metadata/canonicalize fail.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out: Vec<std::path::Component<'_>> = Vec::new();
+    for comp in path.components() {
+        use std::path::Component::*;
+        match comp {
+            CurDir => {}
+            ParentDir => match out.last() {
+                Some(Normal(_)) => {
+                    out.pop();
+                }
+                Some(RootDir) | Some(Prefix(_)) => {}
+                _ => out.push(comp),
+            },
+            other => out.push(other),
+        }
+    }
+    let mut buf = PathBuf::new();
+    for c in out {
+        buf.push(c.as_os_str());
+    }
+    buf
+}
+
 /// Resolve @-includes in a memory file's content.
 fn resolve_includes(
     content: &str,
     file_dir: &Path,
     memory_type: MemoryType,
-    processed: &mut HashSet<PathBuf>,
+    processed: &mut HashSet<IncludeKey>,
 ) -> Vec<MemoryFile> {
     let mut included = Vec::new();
 
     for line in content.lines() {
         if let Some(path_ref) = parse_include_directive(line) {
-            let resolved = resolve_include_path(path_ref, file_dir);
-            let Some(resolved) = resolved else {
+            let Some(resolved) = resolve_include_path(path_ref, file_dir) else {
+                warn!(
+                    token = path_ref,
+                    base = %file_dir.display(),
+                    "cc-memory: @-include could not be resolved"
+                );
                 continue;
             };
 
-            // Circular reference prevention
-            let canonical = resolved.canonicalize().unwrap_or(resolved.clone());
-            if !processed.insert(canonical) {
+            // Cycle detection: dev+ino on Unix, lexical fallback otherwise.
+            // Using this instead of `canonicalize().unwrap_or(path)` means a
+            // symlink with an unreadable target does NOT silently bypass
+            // dedup and loop forever.
+            let key = include_dedup_key(&resolved);
+            if !processed.insert(key) {
                 continue;
             }
 
@@ -547,5 +606,53 @@ mod tests {
         let fm2 = "globs:\n  - *.py\n  - *.go\nname: test";
         let globs2 = extract_yaml_list(fm2, "globs").unwrap();
         assert_eq!(globs2, vec!["*.py", "*.go"]);
+    }
+
+    // M6 regression: `@/abs/path` resolves and reads the file.
+    #[test]
+    fn at_include_absolute_path_is_expanded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let inc = dir.path().join("abs.md");
+        std::fs::write(&inc, "ABSOLUTE-BODY").unwrap();
+
+        let claudemd = dir.path().join("CLAUDE.md");
+        std::fs::write(&claudemd, format!("@{}\ntail", inc.display())).unwrap();
+
+        let mut processed = HashSet::new();
+        let included = resolve_includes(
+            &std::fs::read_to_string(&claudemd).unwrap(),
+            dir.path(),
+            MemoryType::Project,
+            &mut processed,
+        );
+        assert_eq!(included.len(), 1);
+        assert!(
+            included[0].content.contains("ABSOLUTE-BODY"),
+            "expected absolute-form @-include to be read; got: {:?}",
+            included[0].content
+        );
+    }
+
+    // M6 regression: the dedup key falls back to a lexical path when the
+    // file doesn't exist (so `canonicalize()` / `metadata()` would both
+    // fail). Prior code used `canonicalize().unwrap_or(path)` which could
+    // yield distinct keys for the same logical path accessed via different
+    // syntactic forms, silently bypassing cycle detection.
+    #[test]
+    fn include_dedup_key_lexical_fallback_on_missing_file() {
+        let key = include_dedup_key(Path::new("/definitely/not/a/real/path.md"));
+        assert!(matches!(key, IncludeKey::Lexical(_)));
+    }
+
+    #[test]
+    fn lexical_normalize_collapses_dot_and_dotdot() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/./c")),
+            PathBuf::from("/a/b/c")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
     }
 }
