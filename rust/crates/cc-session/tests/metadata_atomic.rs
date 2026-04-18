@@ -90,7 +90,10 @@ fn write_metadata_two_writes_roundtrip_cleanly() {
         cwd: Some("/proj/one".into()),
     };
     session.write_metadata(&m1).expect("first write_metadata");
-    let loaded1 = session.load_metadata().expect("load after first write");
+    let loaded1 = session
+        .load_metadata()
+        .expect("load after first write")
+        .expect("metadata present after first write_metadata");
     assert_eq!(loaded1.model, "claude-sonnet-4-6");
     assert_eq!(loaded1.project_path.as_deref(), Some("/proj/one"));
 
@@ -102,7 +105,10 @@ fn write_metadata_two_writes_roundtrip_cleanly() {
         cwd: None,
     };
     session.write_metadata(&m2).expect("second write_metadata");
-    let loaded2 = session.load_metadata().expect("load after second write");
+    let loaded2 = session
+        .load_metadata()
+        .expect("load after second write")
+        .expect("metadata present after second write_metadata");
     assert_eq!(loaded2.model, "claude-opus-4-7");
     assert_eq!(loaded2.project_path.as_deref(), Some("/proj/two"));
     assert!(loaded2.cwd.is_none());
@@ -156,7 +162,10 @@ fn crashed_sibling_tempfile_does_not_corrupt_metadata() {
         "metadata.json was mutated by an unrelated sibling tempfile"
     );
 
-    let reloaded = session.load_metadata().expect("reload after sibling crash");
+    let reloaded = session
+        .load_metadata()
+        .expect("reload after sibling crash")
+        .expect("metadata.json still present after sibling crash");
     assert_eq!(reloaded.model, "claude-opus-4-7");
     assert_eq!(reloaded.project_path.as_deref(), Some("/keep/me"));
 }
@@ -241,7 +250,10 @@ fn concurrent_reader_never_sees_truncated_metadata() {
          write_metadata is not atomic"
     );
 
-    let final_meta = session.load_metadata().expect("final load_metadata");
+    let final_meta = session
+        .load_metadata()
+        .expect("final load_metadata")
+        .expect("final metadata.json present");
     assert_eq!(final_meta.model, "iter-199");
 }
 

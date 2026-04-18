@@ -88,15 +88,25 @@ pub fn generate_state() -> String {
 }
 
 /// Build the authorize URL matching `buildAuthUrl` in client.ts (automatic flow).
+///
+/// Returns `CcError::Auth` when `cfg.authorize_url` is not a parseable URL.
+/// The production `OAuthConfig::default()` constant is valid, but configs
+/// sourced from settings.json / env vars reach this helper unvalidated, so
+/// surfacing the parse error beats an `.expect` panic at login time.
 pub fn build_authorize_url(
     cfg: &OAuthConfig,
     code_challenge: &str,
     state: &str,
     port: u16,
-) -> String {
+) -> CcResult<String> {
     let redirect_uri = format!("http://localhost:{port}/callback");
     let scope = cfg.scopes.join(" ");
-    let mut url = reqwest::Url::parse(&cfg.authorize_url).expect("valid authorize_url");
+    let mut url = reqwest::Url::parse(&cfg.authorize_url).map_err(|e| {
+        CcError::Auth(format!(
+            "invalid OAuth authorize_url {:?}: {e}",
+            cfg.authorize_url
+        ))
+    })?;
     url.query_pairs_mut()
         .append_pair("code", "true")
         .append_pair("client_id", &cfg.client_id)
@@ -106,7 +116,7 @@ pub fn build_authorize_url(
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", state);
-    url.to_string()
+    Ok(url.to_string())
 }
 
 /// Spawn a localhost HTTP listener on an OS-assigned port. Returns the listener
@@ -387,7 +397,7 @@ pub async fn run_login_flow(cfg: OAuthConfig) -> CcResult<std::path::PathBuf> {
     let challenge = generate_code_challenge(&verifier);
     let state = generate_state();
     let (listener, port) = start_callback_listener().await?;
-    let auth_url = build_authorize_url(&cfg, &challenge, &state, port);
+    let auth_url = build_authorize_url(&cfg, &challenge, &state, port)?;
 
     println!("Opening your browser to:\n  {auth_url}\n");
     println!("If the browser doesn't open automatically, copy the URL above.");
@@ -465,7 +475,7 @@ mod tests {
     #[test]
     fn authorize_url_includes_required_params() {
         let cfg = OAuthConfig::default();
-        let url = build_authorize_url(&cfg, "chal", "st", 54321);
+        let url = build_authorize_url(&cfg, "chal", "st", 54321).expect("default cfg parses");
         assert!(url.contains("client_id="));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback"));
@@ -473,6 +483,22 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("state=st"));
         assert!(url.contains("scope="));
+    }
+
+    /// Malformed `authorize_url` in settings MUST surface as `CcError::Auth`
+    /// rather than panicking at login time (close fix-phase3-audit LOW-4).
+    #[test]
+    fn authorize_url_surfaces_parse_error() {
+        let cfg = OAuthConfig {
+            authorize_url: "not a url".into(),
+            ..OAuthConfig::default()
+        };
+        let err = build_authorize_url(&cfg, "chal", "st", 54321).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid OAuth authorize_url"),
+            "expected auth-error message, got: {msg}"
+        );
     }
 
     #[tokio::test]

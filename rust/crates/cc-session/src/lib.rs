@@ -276,14 +276,35 @@ impl Session {
     }
 
     /// Load session metadata.
-    pub fn load_metadata(&self) -> CcResult<SessionMetadata> {
+    ///
+    /// Returns:
+    ///   - `Ok(None)` when the session has no `metadata.json` yet (fresh
+    ///     session, or `metadata.json` was deleted). Callers treat this as
+    ///     "use defaults".
+    ///   - `Ok(Some(meta))` when the file exists and parses.
+    ///   - `Err(CcError)` when the file exists but cannot be read (I/O
+    ///     failure other than NotFound) or cannot be deserialized (JSON
+    ///     corruption — surfaces as `CcError::Json` so the operator knows
+    ///     to repair rather than silently continuing with defaults).
+    ///
+    /// Closes AUDIT-phase3.md LOW: prior signature returned
+    /// `CcError::Io(NotFound)` for a missing file, forcing callers into
+    /// `.unwrap_or_default()` patterns that also swallowed real I/O errors.
+    pub fn load_metadata(&self) -> CcResult<Option<SessionMetadata>> {
         let Some(dir) = self.session_dir() else {
             return Err(CcError::io("no session directory"));
         };
         let path = dir.join("metadata.json");
-        let content = fs::read_to_string(&path)
-            .map_err(|e| CcError::io(format!("failed to read metadata: {e}")))?;
-        serde_json::from_str(&content).map_err(CcError::Json)
+        let content = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(CcError::io(format!("failed to read metadata: {e}")));
+            }
+        };
+        serde_json::from_str(&content)
+            .map(Some)
+            .map_err(CcError::Json)
     }
 }
 
@@ -679,9 +700,28 @@ mod tests {
             cwd: None,
         };
         session.write_metadata(&meta).unwrap();
-        let loaded = session.load_metadata().unwrap();
+        let loaded = session
+            .load_metadata()
+            .unwrap()
+            .expect("metadata.json exists after write_metadata");
         assert_eq!(loaded.model, "claude-sonnet-4-6");
         assert_eq!(loaded.project_path.as_deref(), Some("/home/user/project"));
+    }
+
+    /// Missing metadata.json MUST return `Ok(None)`, not `Err(Io::NotFound)`
+    /// (AUDIT-phase3.md LOW-3 close).
+    #[test]
+    fn load_metadata_returns_none_when_file_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempdir().unwrap();
+        let _hg = HomeGuard::set(home.path());
+        let session = Session::new().unwrap();
+        // write_metadata has never been called — metadata.json does not exist.
+        let loaded = session.load_metadata().unwrap();
+        assert!(
+            loaded.is_none(),
+            "missing metadata should be Ok(None), got {loaded:?}"
+        );
     }
 
     #[test]

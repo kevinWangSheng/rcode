@@ -51,10 +51,33 @@ user impact is demonstrated.
 
 ## LOW
 
-- `cc-tools/src/web_fetch.rs:150-171` — regex-based HTML strip is best-effort; non-greedy `<script>` closing tag confuses it in rare CDATA / nested cases.
-- `cc-tools/src/read.rs:94` — offset/limit line numbering uses `str::lines` which normalises `\r\n` and `\r`. On a CRLF file the reported line numbers can drift from what the user's editor shows.
-- `cc-session/src/lib.rs:180-183` — `load_metadata` returns `CcError::Io(NotFound)` instead of `Ok(None)`, forcing callers into `.unwrap_or_default()` patterns.
-- `cc-auth/src/oauth.rs:99` — hard-coded URL + `.expect("valid authorize_url")` at runtime; should be a compile-time const or surface `CcError::Auth`.
+- ~~`cc-tools/src/web_fetch.rs:150-171` — regex-based HTML strip is best-effort;
+  non-greedy `<script>` closing tag confuses it in rare CDATA / nested cases.~~
+  **Accepted 2026-04-18.** The strip is deliberately a "good enough" tokenizer
+  before the optional LLM summarizer takes over (see
+  `cc-tools::attach_webfetch_summarizer`). Adding a full HTML parser is cost
+  without measurable benefit given the summarizer handles fidelity downstream.
+- ~~`cc-tools/src/read.rs:94` — offset/limit line numbering uses `str::lines`
+  which normalises `\r\n` and `\r`. On a CRLF file the reported line numbers
+  can drift from what the user's editor shows.~~
+  **Accepted 2026-04-18.** `str::lines` splits on `\n` and strips a preceding
+  `\r`, so `"a\r\nb\r\n"` yields `["a", "b"]` — line counts match editors on
+  pure-CRLF files. Drift only occurs with truly mixed line endings in the
+  same file, which is pathological and happens to confuse editors too.
+- ~~`cc-session/src/lib.rs:180-183` — `load_metadata` returns
+  `CcError::Io(NotFound)` instead of `Ok(None)`, forcing callers into
+  `.unwrap_or_default()` patterns.~~
+  **Fixed 2026-04-18.** `load_metadata` now returns
+  `CcResult<Option<SessionMetadata>>`. NotFound maps to `Ok(None)`, other
+  I/O errors still surface, JSON corruption surfaces as `CcError::Json`.
+  Regression test `load_metadata_returns_none_when_file_missing` +
+  5 call sites updated.
+- ~~`cc-auth/src/oauth.rs:99` — hard-coded URL + `.expect("valid authorize_url")`
+  at runtime; should be a compile-time const or surface `CcError::Auth`.~~
+  **Fixed 2026-04-18.** `build_authorize_url` now returns
+  `CcResult<String>`; a malformed `authorize_url` in a user-supplied config
+  surfaces as `CcError::Auth("invalid OAuth authorize_url …")`. Regression
+  test `authorize_url_surfaces_parse_error` locks the new contract.
 
 ---
 
