@@ -870,7 +870,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("req.txt");
         let settings: HooksSettings = serde_json::from_str(&format!(
-            r#"{{"PermissionRequest": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}]}}"#,
+            r#"{{"PermissionRequest": [{{"hooks": [{{"type": "command", "command": "touch {}", "unsafe_shell": true}}]}}]}}"#,
             marker.display()
         ))
         .unwrap();
@@ -892,7 +892,7 @@ mod tests {
         // letting the engine deny the tool without calling the interactive prompter.
         use cc_core::hook::HooksSettings;
         let settings: HooksSettings = serde_json::from_str(
-            r#"{"PermissionRequest": [{"hooks": [{"type": "command", "command": "printf 'nope' && exit 2"}]}]}"#,
+            r#"{"PermissionRequest": [{"hooks": [{"type": "command", "command": "printf 'nope' && exit 2", "unsafe_shell": true}]}]}"#,
         )
         .unwrap();
         let hooks = HookRunner::new(&settings, reqwest::Client::new());
@@ -913,7 +913,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("denied.txt");
         let settings: HooksSettings = serde_json::from_str(&format!(
-            r#"{{"PermissionDenied": [{{"hooks": [{{"type": "command", "command": "cat > {} <<< \"$CLAUDE_SESSION_ID\""}}]}}]}}"#,
+            r#"{{"PermissionDenied": [{{"hooks": [{{"type": "command", "command": "cat > {} <<< \"$CLAUDE_SESSION_ID\"", "unsafe_shell": true}}]}}]}}"#,
             marker.display()
         ))
         .unwrap();
@@ -939,7 +939,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("fired.txt");
         let settings: HooksSettings = serde_json::from_str(&format!(
-            r#"{{"PostToolUse": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}]}}"#,
+            r#"{{"PostToolUse": [{{"hooks": [{{"type": "command", "command": "touch {}", "unsafe_shell": true}}]}}]}}"#,
             marker.display()
         ))
         .unwrap();
@@ -967,8 +967,8 @@ mod tests {
         let failure_marker = dir.path().join("failure.txt");
         let settings: HooksSettings = serde_json::from_str(&format!(
             r#"{{
-                "PostToolUse": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}],
-                "PostToolUseFailure": [{{"hooks": [{{"type": "command", "command": "touch {}"}}]}}]
+                "PostToolUse": [{{"hooks": [{{"type": "command", "command": "touch {}", "unsafe_shell": true}}]}}],
+                "PostToolUseFailure": [{{"hooks": [{{"type": "command", "command": "touch {}", "unsafe_shell": true}}]}}]
             }}"#,
             success_marker.display(),
             failure_marker.display()

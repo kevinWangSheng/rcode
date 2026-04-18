@@ -310,11 +310,38 @@ async fn execute_one_hook(
 ) -> (HookOutcome, Option<String>) {
     match &hook.kind {
         HookKind::Command => {
-            let Some(command) = hook.command.as_deref().filter(|s| !s.is_empty()) else {
+            let Some(command) = hook.command.as_ref() else {
                 return (HookOutcome::Ok, None); // silently skip
             };
-            let shell = hook.shell.as_deref().unwrap_or("bash");
-            run_command_hook(command, input_json, shell, env_file_path, session_id, cwd).await
+            match command {
+                cc_core::hook::HookCommand::Argv(argv) if !argv.is_empty() => {
+                    run_argv_hook(argv, input_json, env_file_path, session_id, cwd).await
+                }
+                cc_core::hook::HookCommand::Argv(_) => {
+                    // Empty argv — treat as unconfigured.
+                    (HookOutcome::Ok, None)
+                }
+                cc_core::hook::HookCommand::Shell(s) if s.is_empty() => (HookOutcome::Ok, None),
+                cc_core::hook::HookCommand::Shell(s) => {
+                    if !hook.unsafe_shell {
+                        // Gate the shell-injection surface. The user can opt
+                        // in by adding `"unsafe_shell": true` to the hook
+                        // entry — but most hooks should just migrate to the
+                        // array form. See fix-hook-command-injection.
+                        return (
+                            HookOutcome::Failed(
+                                "hook: string-form `command` requires `unsafe_shell: true` \
+                                 in the same entry. Prefer migrating to `command: [\"argv[0]\", \
+                                 \"argv[1]\", ...]` which skips the shell entirely."
+                                    .into(),
+                            ),
+                            None,
+                        );
+                    }
+                    let shell = hook.shell.as_deref().unwrap_or("bash");
+                    run_command_hook(s, input_json, shell, env_file_path, session_id, cwd).await
+                }
+            }
         }
         HookKind::Prompt => {
             // cc-core uses `text` field (with `prompt` as serde alias)
@@ -342,6 +369,20 @@ async fn execute_one_hook(
     }
 }
 
+/// Run a hook in argv form — no intervening shell. `argv[0]` is the
+/// executable, `argv[1..]` are literal args. Nothing is interpreted.
+async fn run_argv_hook(
+    argv: &[String],
+    input_json: &str,
+    env_file_path: Option<&Path>,
+    session_id: &str,
+    cwd: &str,
+) -> (HookOutcome, Option<String>) {
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    run_prepared_hook(cmd, input_json, env_file_path, session_id, cwd).await
+}
+
 async fn run_command_hook(
     command: &str,
     input_json: &str,
@@ -351,9 +392,20 @@ async fn run_command_hook(
     cwd: &str,
 ) -> (HookOutcome, Option<String>) {
     let mut cmd = Command::new(shell);
-    cmd.arg("-c")
-        .arg(command)
-        .stdin(std::process::Stdio::piped())
+    cmd.arg("-c").arg(command);
+    run_prepared_hook(cmd, input_json, env_file_path, session_id, cwd).await
+}
+
+/// Inner runner that takes a pre-configured `Command` (argv or `sh -c`)
+/// and runs the common stdin-feed / wait / parse-output pipeline.
+async fn run_prepared_hook(
+    mut cmd: Command,
+    input_json: &str,
+    env_file_path: Option<&Path>,
+    session_id: &str,
+    cwd: &str,
+) -> (HookOutcome, Option<String>) {
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // §5.3: inject hook environment variables (TS: hooks.ts:815-926)
@@ -428,7 +480,9 @@ async fn run_command_hook(
     if exit_code == 2 {
         (HookOutcome::Block(stdout.trim().to_string()), None)
     } else if exit_code != 0 {
-        debug!("hook exited {exit_code}: {command}");
+        // The refactor to shared argv/shell runner means we no longer have
+        // a `command` identifier here — the caller knows what it ran.
+        debug!("hook exited {exit_code}");
         (HookOutcome::Failed(format!("exit {exit_code}")), None)
     } else {
         (HookOutcome::Ok, None)
@@ -493,10 +547,13 @@ async fn run_http_hook(
 
 /// Build a deduplication key for a hook config.
 fn hook_key(h: &HookConfig) -> HookKey {
+    // For dedup purposes collapse both HookCommand variants into a stable
+    // preview string. Two different shapes that happen to preview the same
+    // still dedup — fine, because they'd also be identical to a user
+    // reading the settings file.
+    let command_preview = h.command.as_ref().map(|c| c.preview());
     HookKey {
-        command_or_url: h
-            .command
-            .clone()
+        command_or_url: command_preview
             .or_else(|| h.url.clone())
             .unwrap_or_default(),
         if_condition: h.if_condition.clone(),
@@ -618,6 +675,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_command_as_argv_array() {
+        let json = r#"{"type":"command","command":["/bin/echo","hello","world"]}"#;
+        let cfg: HookConfig = serde_json::from_str(json).unwrap();
+        match cfg.command.as_ref().expect("command set") {
+            cc_core::hook::HookCommand::Argv(argv) => {
+                assert_eq!(argv, &["/bin/echo", "hello", "world"]);
+            }
+            other => panic!("expected Argv, got {other:?}"),
+        }
+        assert!(!cfg.unsafe_shell, "argv form doesn't need unsafe_shell");
+    }
+
+    #[test]
+    fn parses_command_as_shell_string() {
+        let json = r#"{"type":"command","command":"echo hi","unsafe_shell":true}"#;
+        let cfg: HookConfig = serde_json::from_str(json).unwrap();
+        match cfg.command.as_ref().expect("command set") {
+            cc_core::hook::HookCommand::Shell(s) => {
+                assert_eq!(s, "echo hi");
+            }
+            other => panic!("expected Shell, got {other:?}"),
+        }
+        assert!(cfg.unsafe_shell);
+    }
+
+    #[tokio::test]
+    async fn argv_hook_runs_without_shell() {
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": ["/bin/sh", "-c", "exit 2"]}]}]
+        }"#,
+        )
+        .unwrap();
+        let runner = HookRunner::new(&settings, reqwest::Client::new());
+        let input = test_input("PreToolUse");
+        let cancel = CancellationToken::new();
+        let result = runner.run("PreToolUse", &input, &cancel).await;
+        assert!(result.blocked, "exit 2 → block");
+    }
+
+    #[tokio::test]
+    async fn string_command_without_unsafe_shell_is_rejected() {
+        // Default `unsafe_shell: false` — the runner must refuse to exec
+        // the string form and record a failure, not silently run it.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "echo danger; rm -rf /"}]}]
+        }"#,
+        )
+        .unwrap();
+        let runner = HookRunner::new(&settings, reqwest::Client::new());
+        let input = test_input("PreToolUse");
+        let cancel = CancellationToken::new();
+        let result = runner.run("PreToolUse", &input, &cancel).await;
+        // Not blocked (block is a semantic decision the hook never got to make).
+        // Must record as failure so the caller can surface the gate.
+        assert!(!result.blocked);
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|f| f.contains("unsafe_shell")),
+            "expected an unsafe_shell failure, got {:?}",
+            result.failures
+        );
+    }
+
+    #[test]
     fn matcher_group_deserialization() {
         let json = r#"{"matcher":"Bash(git *)","hooks":[{"type":"command","command":"echo hi"}]}"#;
         let group: HookMatcherGroup = serde_json::from_str(json).unwrap();
@@ -664,7 +789,7 @@ mod tests {
     async fn command_hook_exit_2_blocks() {
         let settings: HooksSettings = serde_json::from_str(
             r#"{
-            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'no go' && exit 2"}]}]
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'no go' && exit 2", "unsafe_shell": true}]}]
         }"#,
         )
         .unwrap();
@@ -680,7 +805,7 @@ mod tests {
     async fn once_hook_fires_only_once() {
         let settings: HooksSettings = serde_json::from_str(
             r#"{
-            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'blocked' && exit 2", "once": true}]}]
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'blocked' && exit 2", "once": true, "unsafe_shell": true}]}]
         }"#,
         )
         .unwrap();
@@ -736,7 +861,7 @@ mod tests {
         // an empty line, not fail, so we use `test -n "$VAR"` instead).
         let settings: HooksSettings = serde_json::from_str(
             r#"{
-            "PreToolUse": [{"hooks": [{"type": "command", "command": "test -n \"$CLAUDE_SESSION_ID\" && test -n \"$CLAUDE_CWD\""}]}]
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "test -n \"$CLAUDE_SESSION_ID\" && test -n \"$CLAUDE_CWD\"", "unsafe_shell": true}]}]
         }"#,
         )
         .unwrap();
@@ -787,7 +912,7 @@ mod tests {
         // SubagentStart / SessionStart / UserPromptSubmit hooks use this to inject context.
         let settings: HooksSettings = serde_json::from_str(
             r#"{
-            "SubagentStart": [{"hooks": [{"type": "command", "command": "printf '{\"hook_specific_output\":{\"additional_context\":\"context from hook\"}}'"}]}]
+            "SubagentStart": [{"hooks": [{"type": "command", "command": "printf '{\"hook_specific_output\":{\"additional_context\":\"context from hook\"}}'", "unsafe_shell": true}]}]
         }"#,
         )
         .unwrap();
@@ -808,7 +933,7 @@ mod tests {
         // We use a 100ms override via env var to keep the test fast.
         std::env::set_var("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS", "100");
         let settings: HooksSettings = serde_json::from_str(
-            r#"{"SessionEnd": [{"hooks": [{"type": "command", "command": "sleep 10", "timeout": 30}]}]}"#,
+            r#"{"SessionEnd": [{"hooks": [{"type": "command", "command": "sleep 10", "timeout": 30, "unsafe_shell": true}]}]}"#,
         )
         .unwrap();
         let runner = HookRunner::new(&settings, reqwest::Client::new());
