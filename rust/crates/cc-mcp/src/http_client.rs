@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
 use reqwest::{header, Client, Response, StatusCode};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -50,6 +50,77 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Default per-request timeout. Matches the TS MCP client's 30s default.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// Versioned session state for an HTTP MCP connection.
+///
+/// Every outbound request `acquire()`s a snapshot `(id, version)`. When the
+/// server returns 404 (session expired), the client calls
+/// `reconnect_if_stale(snapshot_version)`:
+///
+///   - If the stored `version` has already advanced past the caller's
+///     snapshot, another task has already reconnected; the caller just
+///     retries with the fresh session.
+///   - Otherwise, the caller bumps `version`, clears `id`, replays
+///     `initialize`, and subsequent 404'd in-flight requests see the new
+///     version and skip the reconnect.
+///
+/// The `reconnect_lock` serializes reconnect attempts so concurrent 404s
+/// don't produce a thundering herd of parallel `initialize` calls.
+struct McpSession {
+    id: RwLock<Option<String>>,
+    version: AtomicU64,
+    reconnect_lock: Mutex<()>,
+}
+
+impl McpSession {
+    fn new() -> Self {
+        Self {
+            id: RwLock::new(None),
+            version: AtomicU64::new(0),
+            reconnect_lock: Mutex::new(()),
+        }
+    }
+
+    /// Snapshot of (session_id, version) for an outbound request.
+    async fn acquire(&self) -> (Option<String>, u64) {
+        let id = self.id.read().await.clone();
+        let version = self.version.load(Ordering::Acquire);
+        (id, version)
+    }
+
+    /// Current version number (for tests + debugging).
+    fn current_version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Update the stored session id, if it differs from what we have.
+    /// Returns `true` if the value changed.
+    async fn set_id(&self, sid: String) -> bool {
+        let mut guard = self.id.write().await;
+        if guard.as_deref() != Some(sid.as_str()) {
+            *guard = Some(sid);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the stored session id and return the previous value.
+    async fn take_id(&self) -> Option<String> {
+        self.id.write().await.take()
+    }
+
+    /// Current session id, if any.
+    async fn id(&self) -> Option<String> {
+        self.id.read().await.clone()
+    }
+
+    /// Bump the version + clear the id. Called under `reconnect_lock`.
+    async fn invalidate(&self) {
+        *self.id.write().await = None;
+        self.version.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// HTTP-based MCP client.
 pub struct McpHttpClient {
     pub server_name: String,
@@ -59,10 +130,9 @@ pub struct McpHttpClient {
     /// Bearer <token>` for OAuth-protected MCP servers. Sourced from the
     /// per-server `headers` map in settings.json.
     extra_headers: HashMap<String, String>,
-    /// Session ID captured from the initialize response. Echoed on every
-    /// subsequent request. Cleared when the server returns 404 (session
-    /// expired) so the next call re-initializes.
-    session_id: tokio::sync::Mutex<Option<String>>,
+    /// Session state (id + version + reconnect serializer). See
+    /// [`McpSession`] for the 404-reconnect contract.
+    session: McpSession,
     /// Most recent SSE `id:` seen on any response. Exposed for future
     /// resumable-stream work — not currently sent as a `Last-Event-Id`
     /// request header because we don't reconnect mid-request. Having it
@@ -109,7 +179,7 @@ impl McpHttpClient {
             url: url.into(),
             http,
             extra_headers,
-            session_id: tokio::sync::Mutex::new(None),
+            session: McpSession::new(),
             last_event_id: tokio::sync::Mutex::new(None),
         };
 
@@ -121,33 +191,47 @@ impl McpHttpClient {
             redact_headers(&client.extra_headers)
         );
 
+        client
+            .perform_initialize()
+            .await
+            .map_err(|e| format!("MCP HTTP initialize failed: {e}"))?;
+
+        debug!(
+            "MCP HTTP server '{}' initialized (session_id={:?})",
+            client.server_name,
+            client.session.id().await,
+        );
+
+        Ok(client)
+    }
+
+    /// Run the `initialize` JSON-RPC call + `notifications/initialized`
+    /// follow-up. Factored out so both initial connect and the post-404
+    /// reconnect path can share the handshake.
+    ///
+    /// Sends the `initialize` call via the non-retrying low-level path —
+    /// a 404 during `initialize` means the server rejected the fresh
+    /// handshake, which is a hard failure, not something to retry.
+    async fn perform_initialize(&self) -> Result<(), String> {
         let init_params = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "claude-code", "version": "0.1.0"}
         });
-        let resp = client
-            .send_request("initialize", Some(init_params))
-            .await
-            .map_err(|e| format!("MCP HTTP initialize failed: {e}"))?;
-
+        let resp = self
+            .send_request_inner("initialize", Some(init_params))
+            .await?;
         if let Some(err) = resp.error {
-            return Err(format!("MCP HTTP initialize error: {} ({})", err.message, err.code));
+            return Err(format!(
+                "MCP HTTP initialize error: {} ({})",
+                err.message, err.code
+            ));
         }
 
-        debug!(
-            "MCP HTTP server '{}' initialized (session_id={:?})",
-            client.server_name,
-            client.session_id.lock().await
-        );
-
-        // Best-effort initialized notification — many servers ignore it but the
-        // spec says clients MUST send it.
-        let _ = client
-            .send_notification("notifications/initialized", None)
-            .await;
-
-        Ok(client)
+        // Best-effort initialized notification — many servers ignore it but
+        // the spec says clients MUST send it.
+        let _ = self.send_notification("notifications/initialized", None).await;
+        Ok(())
     }
 
     pub async fn list_tools(&mut self) -> Result<Vec<McpTool>, String> {
@@ -218,7 +302,14 @@ impl McpHttpClient {
     /// Returns the currently-stored session ID, if any. Primarily for tests
     /// and debugging — production code doesn't need to read it directly.
     pub async fn session_id(&self) -> Option<String> {
-        self.session_id.lock().await.clone()
+        self.session.id().await
+    }
+
+    /// Returns the current session version counter. Every 404-driven
+    /// reconnect bumps this. Exposed for tests to assert that concurrent
+    /// 404s only produce one reconnect.
+    pub fn session_version(&self) -> u64 {
+        self.session.current_version()
     }
 
     /// Most recent SSE `id:` value observed across all responses. `None`
@@ -234,11 +325,7 @@ impl McpHttpClient {
     /// don't support explicit termination, in which case the session just
     /// times out on their side. Clears our local session_id either way.
     async fn terminate_session(&self) -> Result<(), String> {
-        let sid = {
-            let mut guard = self.session_id.lock().await;
-            guard.take()
-        };
-        let Some(sid) = sid else {
+        let Some(sid) = self.session.take_id().await else {
             return Ok(()); // No session to terminate.
         };
 
@@ -273,7 +360,74 @@ impl McpHttpClient {
         }
     }
 
+    /// Call a JSON-RPC method concurrently from multiple tasks sharing an
+    /// `Arc<McpHttpClient>`. This is the path tests use to exercise the
+    /// concurrent 404 race: unlike `list_tools` / `call_tool` (both `&mut
+    /// self`), this takes `&self` so many in-flight requests can be in
+    /// play at once — matching the real hazard the reconnect coordinator
+    /// protects against.
+    pub async fn call(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<JsonRpcResponse, String> {
+        self.send_request(method, params).await
+    }
+
+    /// Public send path — transparently handles a single 404 session-expiry
+    /// reconnect + retry (MCP 2025-03-26 §Session Management). The retry
+    /// is exactly-once: a second 404 (or any non-404 error on the retry)
+    /// bubbles up to the caller unchanged.
+    ///
+    /// Concurrent in-flight requests that all race into a 404 are
+    /// coordinated through [`McpSession`]: the first to see the 404 takes
+    /// the reconnect lock, bumps the version, and replays `initialize`.
+    /// The others observe the new version and skip the redundant
+    /// reconnect — they just retry with the fresh session id.
     async fn send_request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<JsonRpcResponse, String> {
+        // Capture a session snapshot before sending. If the response is
+        // 404, the snapshot tells us (a) whether a retry even makes sense
+        // — you can only lose a session you had — and (b) the version to
+        // check against when coordinating with other concurrent 404s.
+        let (snapshot_id, snapshot_version) = self.session.acquire().await;
+        match self.send_request_inner(method, params.clone()).await {
+            Ok(resp) => Ok(resp),
+            Err(e) if is_session_expired_err(&e) => {
+                // Only reconnect + retry if we *had* a live session when
+                // the request went out. A 404 on a request that never
+                // carried a session ID is either an uninitialized server
+                // or a misconfigured URL — retrying would infinite-loop.
+                if snapshot_id.is_none() {
+                    return Err(e);
+                }
+                self.reconnect_if_stale(snapshot_version).await?;
+                // Exactly one retry. Any error on this path (including a
+                // second 404) surfaces to the caller as-is.
+                match self.send_request_inner(method, params).await {
+                    Err(e) if is_session_expired_err(&e) => {
+                        // Second 404 in a row — the reconnect installed a
+                        // fresh id but the server rejected it too. Clear
+                        // that stale id so subsequent calls go through a
+                        // fresh `initialize` rather than replaying the
+                        // doomed session.
+                        let _ = self.session.take_id().await;
+                        Err(e)
+                    }
+                    other => other,
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Low-level send — does not retry on 404. Used by `send_request` (with
+    /// a retry wrapper) and by `perform_initialize` (which must not retry
+    /// because it's the thing the retry depends on).
+    async fn send_request_inner(
         &self,
         method: &str,
         params: Option<Value>,
@@ -283,23 +437,14 @@ impl McpHttpClient {
 
         let resp = self.post(&req, /*is_notification=*/ false).await?;
 
-        // 404 on a session-bound request → session expired. Drop our cached
-        // ID; the caller will bubble up an error and the next retry path
-        // (manager.reconnect, or the next `initialize` by a new client)
-        // will get a fresh session.
+        // 404 → surface a distinctive "session expired" marker and let the
+        // outer `send_request` decide whether to reconnect + retry (it
+        // only retries when the original request actually carried a
+        // session ID). Clearing the stored id happens centrally in
+        // `reconnect_if_stale` so concurrent 404s agree on a single
+        // invalidate + reconnect under `McpSession::reconnect_lock`.
         if resp.status() == StatusCode::NOT_FOUND {
-            let had_session = {
-                let mut guard = self.session_id.lock().await;
-                let had = guard.is_some();
-                *guard = None;
-                had
-            };
-            if had_session {
-                return Err(format!(
-                    "MCP session expired (404) for '{}'; caller must reconnect",
-                    self.server_name
-                ));
-            }
+            return Err(session_expired_msg(&self.server_name));
         }
 
         if !resp.status().is_success() {
@@ -314,10 +459,8 @@ impl McpHttpClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
         {
-            let mut guard = self.session_id.lock().await;
-            if guard.as_deref() != Some(sid.as_str()) {
+            if self.session.set_id(sid.clone()).await {
                 debug!("MCP '{}' session_id ← {}", self.server_name, sid);
-                *guard = Some(sid);
             }
         }
 
@@ -347,6 +490,31 @@ impl McpHttpClient {
         }
 
         Err(format!("unexpected content-type: {content_type}"))
+    }
+
+    /// Coordinate reconnects after a 404.
+    ///
+    /// Multiple in-flight requests can all receive 404 simultaneously when
+    /// a session expires. Each passes the version it captured *before*
+    /// sending. Under the reconnect lock we check: has the stored version
+    /// already advanced past that snapshot? If so, another task has
+    /// already performed the `initialize` — we just return so the caller
+    /// retries with the fresh session id. Otherwise we bump the version,
+    /// clear the id, and replay `initialize` ourselves.
+    async fn reconnect_if_stale(&self, snapshot_version: u64) -> Result<(), String> {
+        let _guard = self.session.reconnect_lock.lock().await;
+        if self.session.current_version() > snapshot_version {
+            // Someone beat us to it. Nothing to do — the caller will retry
+            // with the freshly-installed session id.
+            return Ok(());
+        }
+        self.session.invalidate().await;
+        debug!(
+            "MCP '{}' session expired (404) — reconnecting (version now {})",
+            self.server_name,
+            self.session.current_version()
+        );
+        self.perform_initialize().await
     }
 
     async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<(), String> {
@@ -384,7 +552,7 @@ impl McpHttpClient {
             .header(header::ACCEPT, "application/json, text/event-stream")
             .header("MCP-Protocol-Version", PROTOCOL_VERSION);
 
-        if let Some(sid) = self.session_id.lock().await.as_deref() {
+        if let Some(sid) = self.session.id().await {
             builder = builder.header("Mcp-Session-Id", sid);
         }
 
@@ -472,6 +640,21 @@ pub fn redact_headers(headers: &HashMap<String, String>) -> HashMap<String, Stri
             (k.clone(), value)
         })
         .collect()
+}
+
+/// Error message used when a request hits a 404 on a session-bound call.
+/// The outer `send_request` matches on this string to decide whether to
+/// reconnect + retry. Keeping it behind a helper makes the string easier
+/// to evolve without drifting between producer and consumer.
+fn session_expired_msg(server_name: &str) -> String {
+    format!("MCP session expired (404) for '{server_name}'; reconnecting")
+}
+
+/// Is `err` the distinctive session-expired marker we raise from
+/// `send_request_inner`? Returning `true` tells the outer send path it's
+/// safe to attempt a single reconnect + retry.
+fn is_session_expired_err(err: &str) -> bool {
+    err.contains("MCP session expired (404)")
 }
 
 /// Return the last non-empty SSE `id:` value observed in `body`, or `None`
