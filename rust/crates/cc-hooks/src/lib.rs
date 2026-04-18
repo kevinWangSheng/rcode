@@ -374,9 +374,18 @@ async fn run_command_hook(
         }
     };
 
+    // Feed the hook its JSON input via stdin. A failed write here is the
+    // classic "hook silently got half a JSON" bug: the child's own parser
+    // then fails and the user sees "unexpected EOF" in the hook's stderr
+    // with no breadcrumb pointing at our write. Capture the error and,
+    // after reaping the child, surface it as a structured failure instead
+    // of letting a misleading exit code through.
+    let mut stdin_err: Option<String> = None;
     if let Some(mut stdin) = child.stdin.take() {
         let data = format!("{input_json}\n");
-        let _ = stdin.write_all(data.as_bytes()).await;
+        if let Err(e) = stdin.write_all(data.as_bytes()).await {
+            stdin_err = Some(e.to_string());
+        }
     }
 
     let output = match child.wait_with_output().await {
@@ -388,6 +397,16 @@ async fn run_command_hook(
             )
         }
     };
+
+    // If the stdin write failed, the hook can't have run meaningfully —
+    // its input was truncated. Surface the structured cause regardless of
+    // what exit code the child chose.
+    if let Some(err) = stdin_err {
+        return (
+            HookOutcome::Failed(format!("stdin_write: {err}")),
+            None,
+        );
+    }
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
