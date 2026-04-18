@@ -64,10 +64,18 @@
 
 ## 4. Docs
 
-- [ ] 4.1 Update `.claude/plan/implementation-notes.md` with a line about
+- [x] 4.1 Update `.claude/plan/implementation-notes.md` with a line about
       the fsync contract so future refactors don't drop it. (Skipped:
       edit permission denied in this task's scope; contract is documented
       in the `append` method doc-comment instead.)
+      Fixed 2026-04-18: expanded `.claude/plan/implementation-notes.md`
+      with a new "Session / Persistence Layer (cc-session)" section
+      covering: (1) the `sync_all` contract + why BufWriter is banned,
+      (2) the `NamedTempFile::persist` metadata atomic-rename contract,
+      (3) for completeness, the WebFetch SSRF guard contract (overlaps
+      with fix-webfetch-ssrf §5.1). Future refactors now have a single
+      authoritative note next to the other cross-cutting "don't-break-this"
+      facts (OAuth beta header, Keychain shape, etc.).
 
 ## 5. Sign-off
 

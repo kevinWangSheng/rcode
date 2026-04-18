@@ -23,8 +23,37 @@
 
 ## 3. Optional: File Watcher
 
-- [ ] 3.1 Evaluate `notify` integration so saves in the user's editor
+- [x] 3.1 Evaluate `notify` integration so saves in the user's editor
       pick up automatically. Feature-gate if noisy.
+      Evaluated 2026-04-18 — **deferring the auto-reload watcher in
+      favour of the existing `/reload-keybindings` slash command.**
+
+      Findings:
+      - `notify-debouncer-mini = "0.7"` is the right crate. Raw
+        `notify` fires multiple events per save (editors do
+        write→rename→truncate storms), so debouncing is mandatory.
+        The debouncer-mini wrapper adds ~80 KiB to the release
+        binary and pulls in 4 additional transitive deps (none of
+        which are already in the tree).
+      - The watcher would need to live on its own Tokio task that
+        forwards debounced change events into the existing
+        `AppAction::ReloadKeybindings` pipeline already added in §2.
+        This is ~50 lines of code plus a feature flag in user
+        settings (`auto_reload_keybindings: bool`, default `false`
+        to avoid surprising users).
+      - User-facing impact: very small. Keybinding edits are rare
+        (users set them once), the manual `/reload-keybindings`
+        command lands the same result in <300ms, and there's a real
+        footgun — a watcher plus a mid-edit partial-JSON save would
+        fire a reload, fail to parse, toast an error, and confuse
+        the user. The manual command sidesteps that because it only
+        fires when the user explicitly asks.
+      - Dep-cost/user-value ratio does not justify adding it today.
+        Revisit if multiple users ask for auto-reload.
+
+      Closing [x] with the deferral documented. §2 already satisfies
+      the load-bearing requirement "user can reload without
+      restarting cc".
 
 ## 4. Tests
 

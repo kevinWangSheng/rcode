@@ -18,8 +18,33 @@
 
 ## 3. Optional Symlink Hardening
 
-- [ ] 3.1 Evaluate opening with `O_NOFOLLOW`. If the behaviour change
+- [x] 3.1 Evaluate opening with `O_NOFOLLOW`. If the behaviour change
       is acceptable, add it and document in `RUST_REWRITE_PLAN.md`.
+      Evaluated 2026-04-18 — **not applying O_NOFOLLOW by default.**
+
+      Reasoning:
+      - Real project layouts rely on symlinks (monorepo roots, vendor
+        dirs, `.venv/bin` shims, `node_modules` hoists, IDE workspace
+        shortcuts). A `Read` that refuses to follow symlinks would
+        silently break daily usage.
+      - The §1/§2 fix already neutralises the original TOCTOU attack:
+        `ReadTool::execute` opens the file once, calls `metadata()` on
+        the fd, enforces `MAX_FILE_BYTES` against the fd's size, and
+        reads through the same fd. A symlink swap between open() and
+        read() can no longer swap underlying inodes — the fd is pinned
+        to whatever was resolved at open() time.
+      - O_NOFOLLOW would only defend against the final-component
+        symlink case, and only when the symlink target changes between
+        a logical "user authored this path" moment and the actual open
+        — a scenario not currently exposed by the tool surface.
+      - If a future deployment needs hardened symlink rejection (e.g.,
+        running cc in a sandbox that forbids symlink traversal), a
+        one-line `custom_flags(libc::O_NOFOLLOW)` can be gated behind
+        an env var. Not adding speculative knobs until a real use case
+        materialises.
+
+      Net: fd-local stat+read (§1/§2) is the load-bearing defense;
+      O_NOFOLLOW is intentionally deferred. Marking [x].
 
 ## 4. Sign-off
 

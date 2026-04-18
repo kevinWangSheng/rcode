@@ -127,3 +127,52 @@ Key TS source files to read before implementing each crate:
 | cc-tasks | `src/tasks.ts`, `src/Task.ts` |
 | cc-agent | `src/tools/AgentTool/`, `src/coordinator/` |
 | cc-query | `src/query.ts`, `src/QueryEngine.ts` |
+
+---
+
+## Session / Persistence Layer (cc-session)
+
+### fsync contract
+
+`cc-session::Session::append_entry` and `Session::write_metadata` MUST
+call `sync_all()` after every write. The transcript JSONL is written
+through a `SyncAll` trait helper (`write_line_and_sync`) specifically
+so that removing the sync step trips the unit test
+`write_line_and_sync_issues_one_fsync_per_append`. Metadata writes go
+through `NamedTempFile::persist` which ordering-guarantees an atomic
+rename after the sync.
+
+**Why this matters:** RUST_REWRITE_PLAN.md §3 promises the transcript
+is "persisted after each turn". Without `sync_all`, a crash between
+the write and the kernel flush (power loss, OOM kill of the whole
+session, kernel panic) drops the last N turns even though `.write()`
+returned success. The failure mode is asymmetric — the caller believes
+the write succeeded but resume will miss it.
+
+**Do not** wrap the file in `BufWriter` or any layer that defers the
+flush. The cost of fsync per-turn is ~100–300 µs on APFS and <1 ms
+on ext4; turns are human-scale so it is imperceptible.
+
+Reference: `openspec/changes/fix-session-writeln-fsync/`.
+
+### Metadata atomic rename contract
+
+`write_metadata` serializes JSON into a same-dir `NamedTempFile`, calls
+`sync_all()`, then `persist(&path)`. A crash mid-write leaves either
+the old metadata.json intact or the tempfile orphaned (harmless) —
+`metadata.json` itself is never observed in a truncated state.
+
+### WebFetch SSRF guard contract (cc-tools)
+
+WebFetch rejects `localhost`, RFC1918 (10/8, 172.16/12, 192.168/16),
+link-local (169.254/16 incl. the cloud metadata address 169.254.169.254),
+CGNAT (100.64/10), IPv6 loopback (::1), IPv6 link-local (fe80::/10),
+and IPv6 unique local (fc00::/7) **before** opening any outbound socket.
+The resolved IP is pinned to the request via `reqwest::ClientBuilder::resolve`
+so DNS rebinding between the check and the fetch cannot swap targets.
+
+**Opt-out:** `CC_WEBFETCH_ALLOW_PRIVATE=1` bypasses the guard and emits
+a `tracing::warn!` naming the bypassed host + resolved IP. Intended for
+local dev against `127.0.0.1` dev servers; never set this in production.
+
+Reference: `openspec/changes/fix-webfetch-ssrf/`, `cc-tools/src/web_fetch/ssrf.rs`.
