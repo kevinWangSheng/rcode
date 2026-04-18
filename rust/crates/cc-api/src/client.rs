@@ -339,34 +339,12 @@ impl ApiClient {
             acc.apply(&event);
         }
 
-        let id = acc.message_id.clone();
-        let model = acc.model.clone();
-        let stop_reason = acc.stop_reason;
-        let usage = Usage {
-            input_tokens: acc.input_tokens,
-            output_tokens: acc.output_tokens,
-            cache_creation_input_tokens: acc.cache_creation_input_tokens,
-            cache_read_input_tokens: acc.cache_read_input_tokens,
-        };
-        // `into_content` is fallible after the H1 fix — a `tool_use` block
-        // whose JSON never parsed returns `StreamError::ToolInputNotJson`.
-        // Convert to `CcError::Api` so callers get the raw context.
-        let content = acc
-            .into_content()
-            .map_err(|e| CcError::api(format!("stream accumulator: {e}")))?;
-
-        let message = Message {
-            id,
-            kind: "message".into(),
-            role: cc_core::Role::Assistant,
-            content,
-            model,
-            stop_reason,
-            stop_sequence: None,
-            usage: usage.clone(),
-        };
-
-        Ok((message, usage))
+        // `into_message_and_usage` is fallible after the H1 fix — a
+        // `tool_use` block whose JSON never parsed surfaces as
+        // `StreamError::ToolInputNotJson`. Convert to `CcError::Api` so
+        // callers get the raw context.
+        acc.into_message_and_usage()
+            .map_err(|e| CcError::api(format!("stream accumulator: {e}")))
     }
 }
 

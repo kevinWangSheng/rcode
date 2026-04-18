@@ -187,8 +187,7 @@ impl QueryEngine {
             // deltas to `events_tx` with `.send().await`. Using async send
             // propagates TUI backpressure upstream instead of silently
             // dropping events under load (C3 regression guard in
-            // `openspec/AUDIT-phase3.md`; see also
-            // `cc_query::events::forward_stream_events`).
+            // `openspec/AUDIT-phase3.md`).
             let mut text_buf = String::new();
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
 
@@ -782,29 +781,8 @@ where
         acc.apply(&event);
     }
 
-    let id = acc.message_id.clone();
-    let model = acc.model.clone();
-    let stop_reason = acc.stop_reason;
-    let usage = Usage {
-        input_tokens: acc.input_tokens,
-        output_tokens: acc.output_tokens,
-        cache_creation_input_tokens: acc.cache_creation_input_tokens,
-        cache_read_input_tokens: acc.cache_read_input_tokens,
-    };
-    let content = acc
-        .into_content()
-        .map_err(|e| CcError::api(format!("stream accumulator: {e}")))?;
-    let message = Message {
-        id,
-        kind: "message".into(),
-        role: Role::Assistant,
-        content,
-        model,
-        stop_reason,
-        stop_sequence: None,
-        usage: usage.clone(),
-    };
-    Ok((message, usage))
+    acc.into_message_and_usage()
+        .map_err(|e| CcError::api(format!("stream accumulator: {e}")))
 }
 
 /// Auto-compact threshold (§4.5).

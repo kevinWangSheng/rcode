@@ -1,4 +1,4 @@
-use cc_core::{CcError, ContentBlock, StopReason, Usage};
+use cc_core::{CcError, ContentBlock, Message, Role, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -281,6 +281,35 @@ impl StreamAccumulator {
             }
         }
         Ok(out)
+    }
+
+    /// Consume the accumulator into a fully-assembled `(Message, Usage)`
+    /// pair. This is the "end of stream" view that both
+    /// `ApiClient::complete_message` and the TUI drain loop in
+    /// `cc-query::engine::drain_stream` need, so keep the field-lifting
+    /// logic here instead of duplicating it at each call site.
+    pub fn into_message_and_usage(self) -> Result<(Message, Usage), StreamError> {
+        let usage = Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+        };
+        let id = self.message_id.clone();
+        let model = self.model.clone();
+        let stop_reason = self.stop_reason;
+        let content = self.into_content()?;
+        let message = Message {
+            id,
+            kind: "message".into(),
+            role: Role::Assistant,
+            content,
+            model,
+            stop_reason,
+            stop_sequence: None,
+            usage: usage.clone(),
+        };
+        Ok((message, usage))
     }
 
     /// Return the accumulated text (joining all text blocks).
