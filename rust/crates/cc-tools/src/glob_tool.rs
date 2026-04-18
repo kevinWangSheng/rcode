@@ -40,7 +40,7 @@ impl Tool for GlobTool {
         true
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
         let pattern = input["pattern"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;
@@ -68,6 +68,12 @@ impl Tool for GlobTool {
             .map_err(|e| CcError::tool("tool", format!("invalid glob pattern: {e}")))?
             .flatten()
         {
+            // A huge repo with a broad glob (e.g. `**/*`) can iterate
+            // hundreds of thousands of entries before returning. Peek at
+            // the cancel token each iteration so Ctrl+C lands quickly.
+            if cancel.is_cancelled() {
+                return Err(CcError::tool("tool", "Glob cancelled"));
+            }
             if entry.is_file() {
                 let mtime = entry
                     .metadata()

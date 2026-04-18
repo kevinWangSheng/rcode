@@ -224,13 +224,22 @@ impl McpTransport for Mutex<McpClient> {
         &self,
         method: &str,
         params: Option<Value>,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> CcResult<Value> {
         let mut guard = self.lock().await;
-        let resp = guard
-            .send_request(method, params)
-            .await
-            .map_err(CcError::Other)?;
+        // A hung MCP stdio child (e.g. waiting on filesystem I/O) would
+        // otherwise block the tool loop forever. Race the child's response
+        // against the user cancel — the child is killed on Drop of McpClient
+        // when the manager shuts down, so abandoning the read is safe.
+        let resp = tokio::select! {
+            r = guard.send_request(method, params) => r.map_err(CcError::Other)?,
+            _ = cancel.cancelled() => {
+                return Err(CcError::Other(format!(
+                    "MCP stdio '{}' cancelled during request",
+                    guard.server_name
+                )));
+            }
+        };
         if let Some(err) = resp.error {
             return Err(CcError::Other(format!(
                 "MCP error {}: {}",

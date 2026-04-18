@@ -413,13 +413,20 @@ impl McpTransport for Mutex<McpHttpClient> {
         &self,
         method: &str,
         params: Option<Value>,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> CcResult<Value> {
         let guard = self.lock().await;
-        let resp = guard
-            .send_request(method, params)
-            .await
-            .map_err(CcError::Other)?;
+        // reqwest has a per-request timeout but no external abort — without
+        // racing cancel, a 30s server stall blocks Ctrl+C for a full 30s.
+        let resp = tokio::select! {
+            r = guard.send_request(method, params) => r.map_err(CcError::Other)?,
+            _ = cancel.cancelled() => {
+                return Err(CcError::Other(format!(
+                    "MCP http '{}' cancelled during request",
+                    guard.server_name
+                )));
+            }
+        };
         if let Some(err) = resp.error {
             return Err(CcError::Other(format!(
                 "MCP error {}: {}",
