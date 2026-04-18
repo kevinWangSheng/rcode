@@ -13,7 +13,7 @@ use cc_hooks::{HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryOptions},
-    StdinPrompter, SubAgentRunnerImpl, ToolRegistry,
+    ApiSummarizer, StdinPrompter, SubAgentRunnerImpl, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
 use cc_tools::{
@@ -308,6 +308,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Credentials::OAuthToken(t) => AuthCredential::OAuthToken(t),
     };
     let api = ApiClient::new(http, auth);
+
+    // Wire the WebFetch summarizer: replace the default (no-op prompt)
+    // WebFetchTool with one backed by the ApiClient so `WebFetch { url,
+    // prompt }` runs a single-turn summarization the same way the TS
+    // version does.
+    {
+        let summarizer: Arc<dyn cc_core::Summarizer> =
+            Arc::new(ApiSummarizer::new(api.clone(), model.clone()));
+        for tool in tools.iter_mut() {
+            if tool.name() == "WebFetch" {
+                *tool = Arc::new(cc_tools::web_fetch::WebFetchTool::with_summarizer(
+                    summarizer.clone(),
+                ));
+                break;
+            }
+        }
+    }
 
     // Add AskUserQuestionTool — wired with a StdinPrompter for headless and
     // TUI modes (TUI will get full dialog support via a future AppEvent variant).

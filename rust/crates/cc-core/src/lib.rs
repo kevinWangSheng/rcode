@@ -5,6 +5,7 @@ pub mod message;
 pub mod model;
 pub mod permission;
 pub mod state;
+pub mod summarizer;
 pub mod task;
 pub mod tool;
 
@@ -15,6 +16,7 @@ pub use message::*;
 pub use model::*;
 pub use permission::*;
 pub use state::*;
+pub use summarizer::Summarizer;
 pub use task::*;
 pub use tool::*;
 

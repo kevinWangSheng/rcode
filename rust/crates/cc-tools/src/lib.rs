@@ -44,7 +44,7 @@ pub fn default_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(edit::EditTool),
         Arc::new(glob_tool::GlobTool),
         Arc::new(grep::GrepTool),
-        Arc::new(web_fetch::WebFetchTool),
+        Arc::new(web_fetch::WebFetchTool::new()),
         Arc::new(web_search::WebSearchTool),
         Arc::new(sleep_tool::SleepTool),
         Arc::new(enter_plan_mode::EnterPlanModeTool),

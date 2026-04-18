@@ -1,10 +1,11 @@
 //! WebFetch — GET a URL, return its content as text.
 //!
-//! The TS Claude Code WebFetch tool also runs the body through a small model
-//! with a `prompt` field to summarize. We accept the `prompt` field for schema
-//! compatibility but currently return the raw fetched content; LLM-based
-//! summarization is a follow-up that depends on cc-api access from inside the
-//! tool layer (currently the tool layer is independent of cc-api by design).
+//! If a `Summarizer` is wired in (the concrete impl lives in `cc-query`
+//! and is injected from `main.rs`), the tool also honours the TS-compat
+//! `prompt` field: the fetched body is forwarded to the summarizer with
+//! the prompt and the summarizer's output replaces the raw body in the
+//! returned content. Without a summarizer, the `prompt` field is accepted
+//! for schema compatibility but ignored, matching the previous behaviour.
 //!
 //! Safety: only `http://` and `https://` URLs are allowed. Response bodies are
 //! capped at `MAX_RESPONSE_BYTES`. HTML responses are stripped of tags via a
@@ -13,8 +14,10 @@
 
 pub mod ssrf;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use cc_core::{CcError, CcResult};
+use cc_core::{CcError, CcResult, Summarizer};
 use serde_json::{json, Value};
 
 use crate::{Tool, ToolInputSchema, ToolResult};
@@ -23,7 +26,25 @@ use tokio_util::sync::CancellationToken;
 const MAX_RESPONSE_BYTES: usize = 1_000_000; // 1 MB
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
-pub struct WebFetchTool;
+/// WebFetch tool. Use `WebFetchTool::new()` for the no-summarizer default
+/// (returns raw body) or `WebFetchTool::with_summarizer(...)` to enable
+/// the LLM-summarization path for the TS-compat `prompt` field.
+#[derive(Default)]
+pub struct WebFetchTool {
+    summarizer: Option<Arc<dyn Summarizer>>,
+}
+
+impl WebFetchTool {
+    pub fn new() -> Self {
+        Self { summarizer: None }
+    }
+
+    pub fn with_summarizer(summarizer: Arc<dyn Summarizer>) -> Self {
+        Self {
+            summarizer: Some(summarizer),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for WebFetchTool {
@@ -48,7 +69,7 @@ impl Tool for WebFetchTool {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Optional summarization prompt (reserved; currently ignored)"
+                    "description": "Optional instruction. If provided and a summarizer is configured, the fetched body is transformed by a model call using this prompt; otherwise the raw body is returned."
                 }
             },
             "required": ["url"]
@@ -65,6 +86,12 @@ impl Tool for WebFetchTool {
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'url' field"))?
             .to_string();
+        let summary_prompt = input
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         if !is_allowed_url(&url) {
             return Ok(ToolResult::error(format!(
@@ -137,12 +164,11 @@ impl Tool for WebFetchTool {
 
         let truncated = bytes.len() > MAX_RESPONSE_BYTES;
         let slice = &bytes[..bytes.len().min(MAX_RESPONSE_BYTES)];
-        let body = String::from_utf8_lossy(slice).to_string();
-
-        let body = if content_type.contains("html") {
-            strip_html(&body)
+        let raw_body = String::from_utf8_lossy(slice).to_string();
+        let cleaned = if content_type.contains("html") {
+            strip_html(&raw_body)
         } else {
-            body
+            raw_body
         };
 
         let header = format!("HTTP {status} {url}\nContent-Type: {content_type}\n");
@@ -152,7 +178,30 @@ impl Tool for WebFetchTool {
             String::new()
         };
 
-        let content = format!("{header}\n{body}{footer}");
+        // TS-compat summarization path: when `prompt` is non-empty AND a
+        // Summarizer is wired in, delegate to the model for a focused
+        // answer instead of returning raw body bytes. Summarizer failures
+        // fall back to the raw body so a model outage doesn't break the
+        // whole tool call — the header still carries the status line for
+        // context.
+        let mut body = cleaned;
+        let mut summarize_error: Option<String> = None;
+        if let (Some(summarizer), Some(prompt)) = (&self.summarizer, summary_prompt.as_deref()) {
+            match summarizer.summarize(prompt, &body, cancel).await {
+                Ok(summary) => body = summary,
+                Err(e) => {
+                    tracing::warn!("WebFetch summarizer failed: {e}; returning raw body");
+                    summarize_error = Some(e.to_string());
+                }
+            }
+        }
+
+        let mut content = format!("{header}\n{body}{footer}");
+        if let Some(err) = summarize_error {
+            content.push_str(&format!(
+                "\n\n[summarizer unavailable: {err}; raw body above]"
+            ));
+        }
 
         if status.is_success() {
             Ok(ToolResult::ok(content))
@@ -227,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_file_url() {
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::new();
         let cancel = CancellationToken::new();
         let result = tool
             .execute(json!({"url": "file:///etc/passwd"}), &cancel)
@@ -239,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_missing_url_errors() {
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::new();
         let cancel = CancellationToken::new();
         let err = tool.execute(json!({}), &cancel).await.unwrap_err();
         assert!(err.to_string().contains("url"));
@@ -266,7 +315,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         });
 
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::new();
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
@@ -298,7 +347,7 @@ mod tests {
         // refusal message. Either way the content must contain "refused".
         let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::new();
         let cancel = CancellationToken::new();
         let result = tool
             .execute(
@@ -335,7 +384,7 @@ mod tests {
             }
         });
 
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::new();
         let cancel = CancellationToken::new();
         let url = format!("http://127.0.0.1:{port}/");
         let result = tool.execute(json!({"url": url}), &cancel).await.unwrap();
@@ -359,7 +408,7 @@ mod tests {
         // of flakiness from DNS or network.
         let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::new();
         let cancel = CancellationToken::new();
         let result = tool
             .execute(json!({"url": "http://10.0.0.1/admin"}), &cancel)
@@ -373,7 +422,7 @@ mod tests {
     async fn execute_refuses_ipv6_loopback() {
         let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
-        let tool = WebFetchTool;
+        let tool = WebFetchTool::new();
         let cancel = CancellationToken::new();
         let result = tool
             .execute(json!({"url": "http://[::1]:8080/"}), &cancel)
@@ -381,5 +430,222 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("refused"));
+    }
+
+    // ── Summarizer wiring ───────────────────────────────────────────────────
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Records the (prompt, content) it was handed and returns a canned
+    /// reply (or a canned error). No LLM, no network. Reply is stored as
+    /// `Result<String, String>` because `CcError` isn't `Clone`.
+    struct FakeSummarizer {
+        reply: Result<String, String>,
+        seen: Arc<StdMutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Summarizer for FakeSummarizer {
+        async fn summarize(
+            &self,
+            prompt: &str,
+            content: &str,
+            _cancel: &CancellationToken,
+        ) -> CcResult<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((prompt.to_string(), content.to_string()));
+            match &self.reply {
+                Ok(s) => Ok(s.clone()),
+                Err(msg) => Err(CcError::api(msg.clone())),
+            }
+        }
+    }
+
+    async fn serve_once(body: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain the request so the client's write completes.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn execute_routes_prompt_through_summarizer() {
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::set_var("CC_WEBFETCH_ALLOW_PRIVATE", "1");
+
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let summarizer = Arc::new(FakeSummarizer {
+            reply: Ok::<String, String>("SUMMARY: hello from model".into()),
+            seen: seen.clone(),
+        });
+        let tool = WebFetchTool::with_summarizer(summarizer);
+
+        let (port, handle) = serve_once("raw server body").await;
+        let url = format!("http://127.0.0.1:{port}/doc");
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(json!({"url": url, "prompt": "be brief"}), &cancel)
+            .await
+            .unwrap();
+        let _ = handle.await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+
+        assert!(!result.is_error, "200 OK must be Ok: {}", result.content);
+        assert!(
+            result.content.contains("SUMMARY: hello from model"),
+            "summarizer output must appear in result; got: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("raw server body"),
+            "raw body must be replaced by summary; got: {}",
+            result.content
+        );
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1, "summarizer should be called exactly once");
+        assert_eq!(calls[0].0, "be brief");
+        assert_eq!(calls[0].1, "raw server body");
+    }
+
+    #[tokio::test]
+    async fn execute_without_prompt_skips_summarizer() {
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::set_var("CC_WEBFETCH_ALLOW_PRIVATE", "1");
+
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let summarizer = Arc::new(FakeSummarizer {
+            reply: Ok::<String, String>("nope".into()),
+            seen: seen.clone(),
+        });
+        let tool = WebFetchTool::with_summarizer(summarizer);
+
+        let (port, handle) = serve_once("plain body").await;
+        let url = format!("http://127.0.0.1:{port}/doc");
+        let cancel = CancellationToken::new();
+        let result = tool.execute(json!({"url": url}), &cancel).await.unwrap();
+        let _ = handle.await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("plain body"),
+            "raw body must pass through when no prompt: {}",
+            result.content
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            0,
+            "summarizer must not be invoked without prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_empty_prompt_skips_summarizer() {
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::set_var("CC_WEBFETCH_ALLOW_PRIVATE", "1");
+
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let summarizer = Arc::new(FakeSummarizer {
+            reply: Ok::<String, String>("nope".into()),
+            seen: seen.clone(),
+        });
+        let tool = WebFetchTool::with_summarizer(summarizer);
+
+        let (port, handle) = serve_once("plain body").await;
+        let url = format!("http://127.0.0.1:{port}/doc");
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(json!({"url": url, "prompt": "   "}), &cancel)
+            .await
+            .unwrap();
+        let _ = handle.await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("plain body"));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            0,
+            "whitespace-only prompt must be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_summarizer_failure_falls_back_to_raw_body() {
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::set_var("CC_WEBFETCH_ALLOW_PRIVATE", "1");
+
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let summarizer = Arc::new(FakeSummarizer {
+            reply: Err::<String, String>("model exploded".into()),
+            seen: seen.clone(),
+        });
+        let tool = WebFetchTool::with_summarizer(summarizer);
+
+        let (port, handle) = serve_once("fallback body").await;
+        let url = format!("http://127.0.0.1:{port}/doc");
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(json!({"url": url, "prompt": "be brief"}), &cancel)
+            .await
+            .unwrap();
+        let _ = handle.await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+
+        // Request itself succeeded (200 OK) so it stays Ok despite the
+        // summarizer failure.
+        assert!(!result.is_error, "non-summarizer status wins");
+        assert!(
+            result.content.contains("fallback body"),
+            "raw body must be used on summarizer failure: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("summarizer unavailable")
+                && result.content.contains("model exploded"),
+            "fallback banner must mention the error: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn no_summarizer_still_accepts_prompt_field() {
+        // Schema compatibility: if the caller (or the model) sends a
+        // `prompt` field but the tool has no summarizer wired, the raw
+        // body path must still return successfully — no error, no panic.
+        let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
+        std::env::set_var("CC_WEBFETCH_ALLOW_PRIVATE", "1");
+
+        let tool = WebFetchTool::new();
+        let (port, handle) = serve_once("unchanged").await;
+        let url = format!("http://127.0.0.1:{port}/doc");
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(json!({"url": url, "prompt": "ignored"}), &cancel)
+            .await
+            .unwrap();
+        let _ = handle.await;
+        std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("unchanged"));
     }
 }
