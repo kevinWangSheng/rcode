@@ -8,6 +8,8 @@ use cc_core::PromptDecision;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::keybindings::Keybindings;
+
 /// Window (in milliseconds) during which a second Ctrl+C escalates from
 /// graceful `Abort` to `ForceQuit`.
 pub const FORCE_QUIT_WINDOW_MS: u64 = 2_000;
@@ -139,6 +141,11 @@ pub struct App {
     /// lands, mode already `Input`). Restoring from this snapshot on any
     /// decision keeps the TUI's input routing correct.
     pub pre_permission_mode: Option<AppMode>,
+    /// Active keybinding map. Loaded once at startup and swapped in-place by
+    /// `/reload-keybindings` (see `AppAction::ReloadKeybindings`). Held on the
+    /// App so `map_key_event` and the reload action share a single source of
+    /// truth without threading an `Arc<Mutex>` through the main loop.
+    pub keybindings: Keybindings,
 }
 
 impl App {
@@ -159,6 +166,38 @@ impl App {
             last_abort_at: None,
             status_hint: None,
             pre_permission_mode: None,
+            keybindings: Keybindings::default(),
+        }
+    }
+
+    /// Reload the keybinding map via the provided loader.
+    ///
+    /// Production callers pass `Keybindings::try_load` so we re-read
+    /// `~/.claude/keybindings.json`. Tests can pass a closure pointing at a
+    /// tempdir fixture to avoid touching the real HOME.
+    ///
+    /// Return value:
+    ///   - `Ok(count)` — new map applied (or file absent → defaults kept).
+    ///     `count` is the number of first-class bindings active.
+    ///   - `Err(msg)` — loader reported an error; `self.keybindings` is left
+    ///     untouched so the previous map remains live (matches the "malformed
+    ///     file during edit does not wipe cache" scenario).
+    pub fn reload_keybindings_with<F>(&mut self, loader: F) -> Result<usize, String>
+    where
+        F: FnOnce() -> Result<Option<Keybindings>, String>,
+    {
+        match loader() {
+            Ok(Some(kb)) => {
+                self.keybindings = kb;
+                // Three first-class actions today (Quit / Abort / Submit).
+                Ok(3)
+            }
+            Ok(None) => {
+                // File absent — treat as "no customisations". Keep whatever
+                // is currently live (typically the default map).
+                Ok(3)
+            }
+            Err(e) => Err(e),
         }
     }
 

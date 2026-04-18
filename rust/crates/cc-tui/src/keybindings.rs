@@ -89,6 +89,46 @@ impl Keybindings {
         kb
     }
 
+    /// Fallible variant used by `/reload-keybindings` so the TUI can show a
+    /// parse error on the status line *and* keep the previously-cached map
+    /// intact. Covers the "malformed file during edit does not wipe cache"
+    /// scenario from the `fix-tui-keybindings-reload-per-key` change.
+    ///
+    /// Returns:
+    ///   - `Ok(None)` — file does not exist; caller should keep the current
+    ///     (typically default) map.
+    ///   - `Ok(Some(kb))` — parsed successfully.
+    ///   - `Err(msg)` — file present but could not be read/parsed. The
+    ///     message embeds the file path so the user can locate the
+    ///     offending file from the status-line toast.
+    pub fn try_load() -> Result<Option<Self>, String> {
+        let Some(p) = path() else {
+            return Ok(None);
+        };
+        Self::try_load_from(&p)
+    }
+
+    pub fn try_load_from(path: &std::path::Path) -> Result<Option<Self>, String> {
+        let raw_text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let raw: Raw = serde_json::from_str(&raw_text)
+            .map_err(|e| format!("{}: parse error: {e}", path.display()))?;
+        let mut kb = Keybindings::default();
+        if let Some(s) = raw.quit.as_deref().and_then(parse_chord) {
+            kb.quit = s;
+        }
+        if let Some(s) = raw.abort.as_deref().and_then(parse_chord) {
+            kb.abort = s;
+        }
+        if let Some(s) = raw.submit.as_deref().and_then(parse_chord) {
+            kb.submit = s;
+        }
+        Ok(Some(kb))
+    }
+
     /// Match a key event against the bound actions.
     pub fn match_action(&self, key: &KeyEvent) -> Option<Action> {
         if self.quit.matches(key) {

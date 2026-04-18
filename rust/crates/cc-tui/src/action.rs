@@ -49,6 +49,9 @@ pub enum AppAction {
 
     // Slash commands
     SlashCommand(String),
+    /// Re-load `~/.claude/keybindings.json` and swap the active map on `App`.
+    /// Triggered by the `/reload-keybindings` slash command.
+    ReloadKeybindings,
 
     // Control
     Abort,
@@ -148,6 +151,9 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                         app.push_user(msg.clone());
                         app.start_stream();
                         return UpdateResult::SubmitToEngine(msg);
+                    }
+                    CommandOutcome::ReloadKeybindings => {
+                        reload_keybindings(app, crate::keybindings::Keybindings::try_load);
                     }
                     CommandOutcome::Unknown(msg) => {
                         app.push_system(msg);
@@ -306,9 +312,40 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
         AppAction::SlashCommand(_) => {
             // Handled via Submit path.
         }
+        AppAction::ReloadKeybindings => {
+            reload_keybindings(app, crate::keybindings::Keybindings::try_load);
+        }
     }
 
     UpdateResult::Continue
+}
+
+/// Re-read the keybinding map via `loader`, swap it on `App`, and push a
+/// short status-line toast + transcript notice reporting success (with
+/// binding count) or a parse error referencing the offending file.
+///
+/// Preserves the previously-cached map when the loader reports an error, so
+/// an editor that saved a malformed file mid-session never wipes the active
+/// bindings (see the "malformed file during edit" scenario in the spec).
+///
+/// Factored out so the `Submit` slash-command path and the direct
+/// `AppAction::ReloadKeybindings` arm stay in lock-step.
+pub(crate) fn reload_keybindings<F>(app: &mut App, loader: F)
+where
+    F: FnOnce() -> Result<Option<crate::keybindings::Keybindings>, String>,
+{
+    match app.reload_keybindings_with(loader) {
+        Ok(count) => {
+            let msg = format!("Reloaded {count} keybindings");
+            app.status_hint = Some(msg.clone());
+            app.push_system(msg);
+        }
+        Err(e) => {
+            let msg = format!("Reload failed: {e}");
+            app.status_hint = Some(msg.clone());
+            app.push_system(msg);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -663,6 +700,163 @@ mod tests {
         update(&mut app, show, &uctx);
         update(&mut app, AppAction::PermissionAllowAlways, &uctx);
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    // ── /reload-keybindings ─────────────────────────────────────────────
+
+    /// Task 4.2: dispatching the reload path with a modified fixture swaps
+    /// the active map on `App`, pushes a success toast to the status line,
+    /// and records a system notice in the transcript.
+    #[test]
+    fn reload_keybindings_swaps_active_map_and_shows_toast() {
+        use crate::keybindings::{Chord, Keybindings};
+        use std::fs;
+        use tempfile::tempdir;
+
+        let mut app = App::new("s".into(), "m".into());
+        // Pre-condition: default bindings active (ctrl+q quit).
+        assert_eq!(app.keybindings.quit, Chord::ctrl('q'));
+
+        // Simulate the initial startup-cache load from a tempdir fixture.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keybindings.json");
+        fs::write(&path, r#"{"quit":"ctrl+q"}"#).unwrap();
+        let path_for_initial = path.clone();
+        app.reload_keybindings_with(move || Keybindings::try_load_from(&path_for_initial))
+            .expect("initial load");
+
+        // User edits the file — rebind quit to ctrl+x.
+        fs::write(&path, r#"{"quit":"ctrl+x"}"#).unwrap();
+
+        // Dispatch the reload (simulates `/reload-keybindings`).
+        let path_for_reload = path.clone();
+        reload_keybindings(&mut app, move || {
+            Keybindings::try_load_from(&path_for_reload)
+        });
+
+        // New binding is live.
+        assert_eq!(
+            app.keybindings.quit,
+            Chord::ctrl('x'),
+            "reload must swap the active map"
+        );
+        // Toast on status line.
+        assert!(
+            app.status_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("Reloaded") && h.contains("keybindings")),
+            "status hint should confirm reload: {:?}",
+            app.status_hint
+        );
+        // Transcript notice.
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(crate::app::TranscriptItem::SystemNotice(m)) if m.contains("Reloaded")
+            ),
+            "transcript must show reload confirmation"
+        );
+    }
+
+    /// Task 2.2: a malformed file must NOT wipe the previously-cached map;
+    /// the toast must surface the parse error with the file path.
+    #[test]
+    fn reload_keybindings_with_malformed_file_preserves_cache_and_reports_error() {
+        use crate::keybindings::{Chord, Keybindings};
+        use std::fs;
+        use tempfile::tempdir;
+
+        let mut app = App::new("s".into(), "m".into());
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keybindings.json");
+
+        // Seed a good map first.
+        fs::write(&path, r#"{"quit":"ctrl+x"}"#).unwrap();
+        let p1 = path.clone();
+        app.reload_keybindings_with(move || Keybindings::try_load_from(&p1))
+            .expect("good initial load");
+        assert_eq!(app.keybindings.quit, Chord::ctrl('x'));
+
+        // Corrupt the file mid-session.
+        fs::write(&path, "{broken json").unwrap();
+
+        // Reload — must fail without wiping the cached ctrl+x map.
+        let p2 = path.clone();
+        reload_keybindings(&mut app, move || Keybindings::try_load_from(&p2));
+
+        assert_eq!(
+            app.keybindings.quit,
+            Chord::ctrl('x'),
+            "malformed file must NOT wipe the cached bindings"
+        );
+        let hint = app.status_hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("Reload failed"),
+            "status hint should report failure: {hint}"
+        );
+        assert!(
+            hint.contains(&*path.display().to_string()) || hint.contains("parse"),
+            "error should reference the file or parse context: {hint}"
+        );
+    }
+
+    /// Dispatching via the public `AppAction::ReloadKeybindings` variant also
+    /// invokes the real loader (reads from `~/.claude/keybindings.json`).
+    /// We only check that the action runs cleanly and pushes a transcript
+    /// notice — the precise content depends on the user's home directory,
+    /// which we do not mutate in this unit test.
+    #[test]
+    fn reload_keybindings_action_runs_and_records_notice() {
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+        let before = app.transcript.len();
+        update(&mut app, AppAction::ReloadKeybindings, &uctx);
+        assert_eq!(
+            app.transcript.len(),
+            before + 1,
+            "action must push one system notice"
+        );
+        match app.transcript.last() {
+            Some(crate::app::TranscriptItem::SystemNotice(msg)) => {
+                assert!(
+                    msg.contains("Reloaded") || msg.contains("Reload failed"),
+                    "notice must be a reload outcome: {msg}"
+                );
+            }
+            other => panic!("expected SystemNotice, got {other:?}"),
+        }
+    }
+
+    /// End-to-end via Submit: `/reload-keybindings` typed in the input box
+    /// must dispatch the reload path (not submit the raw string to the
+    /// model). We verify indirectly: `UpdateResult` is `Continue` (not
+    /// `SubmitToEngine`) and a system notice is recorded.
+    #[test]
+    fn slash_reload_keybindings_dispatches_reload_not_submit_to_engine() {
+        let mut app = App::new("s".into(), "m".into());
+        app.input = "/reload-keybindings".into();
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+        let result = update(&mut app, AppAction::Submit, &uctx);
+        assert!(
+            matches!(result, UpdateResult::Continue),
+            "reload must not submit the raw command to the model: {result:?}"
+        );
+        assert!(
+            matches!(
+                app.transcript.last(),
+                Some(crate::app::TranscriptItem::SystemNotice(m))
+                    if m.contains("Reloaded") || m.contains("Reload failed")
+            ),
+            "Submit path should produce a reload notice"
+        );
     }
 
     #[test]

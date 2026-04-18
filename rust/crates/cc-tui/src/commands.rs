@@ -85,6 +85,10 @@ pub enum CommandOutcome {
     Compact,
     /// Switch the active model.
     SwitchModel(String),
+    /// Re-read `~/.claude/keybindings.json` and swap the active map. The TUI
+    /// side reports success (with binding count) or a parse error on the
+    /// status line. Implemented by `AppAction::ReloadKeybindings`.
+    ReloadKeybindings,
     /// Unknown command — host shows an error.
     Unknown(String),
 }
@@ -114,6 +118,10 @@ pub enum Builtin {
     Diff,
     Commit,
     Context,
+    /// Re-read `~/.claude/keybindings.json` without restarting the TUI.
+    /// Added to close the "Reload via slash command" scenario from the
+    /// `fix-tui-keybindings-reload-per-key` OpenSpec change (H6 QA gap).
+    ReloadKeybindings,
 }
 
 impl Builtin {
@@ -139,6 +147,7 @@ impl Builtin {
         Builtin::Diff,
         Builtin::Commit,
         Builtin::Context,
+        Builtin::ReloadKeybindings,
     ];
 
     pub fn name(self) -> &'static str {
@@ -164,6 +173,7 @@ impl Builtin {
             Builtin::Diff => "diff",
             Builtin::Commit => "commit",
             Builtin::Context => "context",
+            Builtin::ReloadKeybindings => "reload-keybindings",
         }
     }
 
@@ -190,6 +200,9 @@ impl Builtin {
             Builtin::Diff => "show current git diff",
             Builtin::Commit => "stage and commit all changes with an AI-generated message",
             Builtin::Context => "show context window usage (tokens remaining)",
+            Builtin::ReloadKeybindings => {
+                "re-read ~/.claude/keybindings.json without restarting the TUI"
+            }
         }
     }
 
@@ -287,6 +300,7 @@ impl CommandRegistry {
                     .to_string(),
             ),
             Builtin::Context => CommandOutcome::Info(format_context(ctx)),
+            Builtin::ReloadKeybindings => CommandOutcome::ReloadKeybindings,
         }
     }
 
@@ -676,6 +690,35 @@ mod tests {
                 assert!(msg.contains("3 turn"), "expected turn count: {msg}");
                 assert!(msg.contains("1.5k"), "expected token format: {msg}");
                 assert!(msg.contains("$0.0095"), "expected cost: {msg}");
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    /// `/reload-keybindings` must resolve to the new `ReloadKeybindings`
+    /// outcome so the Submit path can dispatch a reload against `App` rather
+    /// than submitting the command string to the model. Covers task 2.1 of
+    /// the `fix-tui-keybindings-reload-per-key` change.
+    #[test]
+    fn reload_keybindings_command_returns_reload_outcome() {
+        let reg = CommandRegistry::empty();
+        let cmd = parse("/reload-keybindings").unwrap();
+        assert!(matches!(
+            reg.execute(&cmd, &ctx()),
+            CommandOutcome::ReloadKeybindings
+        ));
+    }
+
+    /// `/help` must advertise the reload command so users can discover it.
+    #[test]
+    fn help_advertises_reload_keybindings() {
+        let reg = CommandRegistry::empty();
+        match reg.execute(&parse("/help").unwrap(), &ctx()) {
+            CommandOutcome::Info(text) => {
+                assert!(
+                    text.contains("/reload-keybindings"),
+                    "help must list /reload-keybindings: {text}"
+                );
             }
             other => panic!("expected Info, got {other:?}"),
         }

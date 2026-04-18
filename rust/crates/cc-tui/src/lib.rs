@@ -76,17 +76,17 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
 
     // ── Build TUI state ───────────────────────────────────────────────────
     let mut app = App::new(config.session_id.clone(), config.model.clone());
+    // Load keybindings once at startup and stash them on the App so
+    // `/reload-keybindings` can swap the map without restarting the TUI.
+    // Edits to ~/.claude/keybindings.json are picked up on demand via the
+    // slash command (there is no file watcher — see the optional task 3.1).
+    app.keybindings = Keybindings::load();
     let commands = config.commands;
     let cmd_ctx = config.command_ctx;
     let update_ctx = UpdateContext {
         commands: &commands,
         command_ctx: &cmd_ctx,
     };
-
-    // Load keybindings once at startup. Edits to ~/.claude/keybindings.json
-    // won't be picked up mid-session — re-run the TUI to reload (or add a
-    // /reload-keybindings command in the future).
-    let keybindings = Keybindings::load();
 
     // ── Initialize terminal ───────────────────────────────────────────────
     let mut terminal = ratatui::init();
@@ -104,7 +104,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(crossterm::event::Event::Key(key))) => {
-                        map_key_event(&key, &keybindings, &app)
+                        map_key_event(&key, &app.keybindings, &app)
                     }
                     Some(Ok(crossterm::event::Event::Resize(_, _))) => None,
                     Some(Err(_)) | None => Some(AppAction::Quit),
