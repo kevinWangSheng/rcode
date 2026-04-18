@@ -6,10 +6,18 @@
       `Ipv4Addr::is_loopback` / `is_link_local` / `is_private` plus
       explicit bans on `169.254.169.254`, `100.64.0.0/10`,
       `fc00::/7`, `fe80::/10`.
-- [x] 1.3 Respect `CC_WEBFETCH_ALLOW_PRIVATE=1` to bypass for local dev.
-- [x] 1.4 Unit tests covering: public DNS name (pass), `localhost` (fail),
+- [ ] 1.3 Respect `CC_WEBFETCH_ALLOW_PRIVATE=1` to bypass for local dev
+      **and emit `tracing::warn!` naming the bypassed host** so the
+      transparency the spec requires is observable in logs.
+      (QA 2026-04-18: env-var handling landed in `ssrf.rs:68-77`, but no
+      `warn!` is emitted; spec Scenario "Developer opt-out" explicitly
+      requires the log. Reverting to [ ].)
+- [ ] 1.4 Unit tests covering: public DNS name (pass), `localhost` (fail),
       `127.0.0.1` (fail), `169.254.169.254` (fail), `10.0.0.1` (fail),
-      `[::1]` (fail), opt-out env var (pass with warning).
+      `[::1]` (fail), opt-out env var (pass **and assert the warn! was
+      logged**, e.g. via `tracing_test::traced_test`).
+      (QA 2026-04-18: IP/DNS tests pass; warn-log assertion depends on 1.3
+      and is not present. Reverting to [ ].)
 
 ## 2. Integrate Into web_fetch
 
@@ -25,6 +33,10 @@
 
 - [x] 3.1 When following an individual search result URL, same guard
       applies. Failing results are skipped (not fatal).
+      (QA 2026-04-18: `web_search.rs:97-108` guards the Brave API endpoint
+      itself — the only outbound URL. The tool does not currently follow
+      per-result URLs, so the spec scenario is vacuously satisfied. If
+      result-URL following is added later, the guard MUST be reapplied.)
 
 ## 4. Regression Tests
 

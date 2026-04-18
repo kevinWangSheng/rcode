@@ -10,12 +10,20 @@
 
 ## 2. Metadata Writes
 
-- [x] 2.1 For `metadata.json` (written with `fs::write`), switch to the
+- [ ] 2.1 For `metadata.json` (written with `fs::write`), switch to the
       atomic tmpfile + rename pattern so a crash mid-write does not leave
-      a truncated `metadata.json`. (N/A: no metadata.json path exists in
-      current `cc-session` — only the append-only transcript.)
-- [x] 2.2 Keep `fs::write` semantics for read-only tests where durability
-      doesn't matter.
+      a truncated `metadata.json`.
+      (QA 2026-04-18: the original "N/A" note was incorrect.
+      `Session::write_metadata` at `cc-session/src/lib.rs:183-192`
+      exists, is exercised by `metadata_roundtrip` at line 584, and is
+      called from list-sessions at line 377. It still uses non-atomic
+      `fs::write(&path, json)`. Spec Scenario "Metadata write is atomic"
+      is unmet. Reverting to [ ].)
+- [ ] 2.2 Implement the tmpfile pattern: same-dir `NamedTempFile::new_in(dir)`
+      + write + `sync_all` + `persist(&path)`. Add a regression test that
+      crashes between the tempfile write and the rename (or mocks it) and
+      asserts `metadata.json` is either the prior full version or absent,
+      never truncated.
 
 ## 3. Durability Test
 
@@ -27,6 +35,16 @@
       the fix (e.g., tokio's page cache hides it on the current FS), add
       a loom or `unsafe { libc::exit(9) }` variant to force it.
       Implemented the `libc::_exit(9)` variant.
+      (QA 2026-04-18: on macOS/Linux `libc::_exit(9)` does NOT bypass the
+      kernel page cache, so the test passes both with and without the
+      `sync_all` call. It is a regression guard for the presence of the
+      code, not proof that un-synced writes would be lost. See 3.3.)
+
+- [ ] 3.3 Replace the `libc::_exit(9)` pseudo-proof with either a
+      crash-invariant test using a `failingfs` / loom-style FS mock that
+      really drops un-fsynced writes, OR a feature-gated docker test
+      against a storage layer with `fsync=off` semantics. The goal is to
+      observe that removing `sync_all` breaks the test.
 
 ## 4. Docs
 
