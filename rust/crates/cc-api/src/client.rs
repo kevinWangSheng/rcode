@@ -2,11 +2,38 @@ use cc_core::{CcError, CcResult, Message, Usage};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::request::CreateMessageRequest;
-use crate::stream::{ContentBlockDelta, StreamAccumulator, StreamEvent};
+use crate::stream::{ContentBlockDelta, StreamAccumulator, StreamError, StreamEvent};
+
+/// Errors returned by [`ApiClient::complete_message`].
+///
+/// Split into `Core` (HTTP / IO / auth / parse-of-envelope) and `Stream`
+/// (semantic problems in the accumulated SSE payload, such as a `tool_use`
+/// block whose JSON buffer is not valid JSON at end-of-stream). Keeping
+/// `Stream` structured lets `cc-query` translate it into a synthetic
+/// `tool_result` with `is_error: true` instead of forwarding silent garbage
+/// to the model.
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error(transparent)]
+    Core(#[from] CcError),
+
+    #[error(transparent)]
+    Stream(#[from] StreamError),
+}
+
+impl From<ApiError> for CcError {
+    fn from(e: ApiError) -> Self {
+        match e {
+            ApiError::Core(c) => c,
+            ApiError::Stream(s) => s.into(),
+        }
+    }
+}
 
 /// Anthropic API base URL.
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com";
@@ -168,11 +195,16 @@ impl ApiClient {
 
     /// Stream and accumulate a complete message.
     /// Calls `on_text` for each text delta (for real-time display).
+    ///
+    /// Returns [`ApiError::Stream`] (e.g. `StreamError::ToolInputNotJson`)
+    /// if the accumulated payload is structurally invalid at end-of-stream;
+    /// callers typically translate this into a synthetic `tool_result` with
+    /// `is_error: true` so the model can retry with well-formed arguments.
     pub async fn complete_message<F>(
         &self,
         request: CreateMessageRequest,
         mut on_text: F,
-    ) -> CcResult<Message>
+    ) -> Result<Message, ApiError>
     where
         F: FnMut(&str),
     {
@@ -196,7 +228,7 @@ impl ApiClient {
         let stop_reason = acc.stop_reason.clone();
         let input_tokens = acc.input_tokens;
         let output_tokens = acc.output_tokens;
-        let content = acc.into_content();
+        let content = acc.into_content()?;
 
         Ok(Message {
             id,

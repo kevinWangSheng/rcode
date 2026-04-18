@@ -1,4 +1,4 @@
-use cc_api::{ApiClient, CreateMessageRequest};
+use cc_api::{ApiClient, ApiError, CreateMessageRequest, StreamError};
 use cc_core::{
     CcError, CcResult, ContentBlock, MessageContent, MessageParam, Role, StopReason,
     SystemBlock, ToolResultBlock, ToolUseBlock,
@@ -122,13 +122,34 @@ impl QueryEngine {
             let mut text_buf = String::new();
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
 
-            let message = self
+            let message = match self
                 .api
                 .complete_message(req, |delta| {
                     text_buf.push_str(delta);
                     on_text(delta);
                 })
-                .await?;
+                .await
+            {
+                Ok(m) => m,
+                Err(ApiError::Stream(StreamError::ToolInputNotJson { id, name, raw })) => {
+                    debug!(
+                        "tool_use input parse failed (id={id}, name={name}); emitting synthetic is_error tool_result"
+                    );
+                    let (assistant_msg, result_msg) =
+                        synthesize_malformed_tool_use_pair(&id, &name, &raw, &text_buf);
+                    self.session.append(&assistant_msg)?;
+                    messages.push(assistant_msg);
+                    self.session.append(&result_msg)?;
+                    messages.push(result_msg);
+
+                    // Loop so Claude gets another chance to call the tool.
+                    continue;
+                }
+                Err(ApiError::Stream(other)) => {
+                    return Err(CcError::Api(other.to_string()));
+                }
+                Err(ApiError::Core(e)) => return Err(e),
+            };
 
             let input_tokens = message.usage.input_tokens;
             let stop_reason = message.stop_reason.clone();
@@ -293,6 +314,56 @@ fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResul
     }
 }
 
+/// Translate a `StreamError::ToolInputNotJson` into the message pair the
+/// conversation loop needs so Claude can pair the failed `tool_use` id with
+/// an `is_error` tool_result and retry. We emit:
+///
+/// 1. A synthetic assistant message containing any streamed text plus a
+///    `tool_use` block carrying the original id/name and an empty-object
+///    input. The empty object is a placeholder — it only exists so the
+///    Anthropic API accepts the paired tool_result on the next turn.
+/// 2. A user message with a `tool_result` block whose `tool_use_id` matches
+///    the synthetic `tool_use`, `is_error: true`, and content that surfaces
+///    the raw (truncated) JSON buffer so the model can diagnose the parse
+///    failure and retry.
+fn synthesize_malformed_tool_use_pair(
+    id: &str,
+    name: &str,
+    raw: &str,
+    text_buf: &str,
+) -> (MessageParam, MessageParam) {
+    let synthetic_tool_use = ToolUseBlock {
+        id: id.to_string(),
+        name: name.to_string(),
+        input: Value::Object(Default::default()),
+    };
+    let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
+    if !text_buf.is_empty() {
+        assistant_blocks.push(ContentBlock::text(text_buf.to_string()));
+    }
+    assistant_blocks.push(ContentBlock::ToolUse(synthetic_tool_use));
+    let assistant_msg = MessageParam {
+        role: Role::Assistant,
+        content: MessageContent::Blocks(assistant_blocks),
+    };
+
+    let err_msg = format!(
+        "Tool input was not valid JSON. The accumulated buffer was: {raw}\n\
+         Please retry the tool call with a syntactically correct JSON object."
+    );
+    let tool_result = ToolResultBlock {
+        tool_use_id: id.to_string(),
+        content: Some(Value::String(err_msg)),
+        is_error: Some(true),
+    };
+    let result_msg = MessageParam {
+        role: Role::User,
+        content: MessageContent::Blocks(vec![ContentBlock::ToolResult(tool_result)]),
+    };
+
+    (assistant_msg, result_msg)
+}
+
 /// Simple auto-compact: keep only the first user message and the last N messages.
 /// This is a basic implementation that satisfies the exit criterion.
 fn compact_messages(messages: &mut Vec<MessageParam>) {
@@ -317,4 +388,86 @@ fn compact_messages(messages: &mut Vec<MessageParam>) {
     ));
 
     messages.extend(recent);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercises the translation path for task 3.2: a `StreamError::ToolInputNotJson`
+    /// must be turned into a paired assistant(tool_use) + user(tool_result
+    /// is_error: true) message pair, with the tool_use id matching the
+    /// tool_use_id so the Anthropic API accepts the conversation.
+    #[test]
+    fn malformed_tool_use_is_translated_to_is_error_tool_result() {
+        let (assistant, user) = synthesize_malformed_tool_use_pair(
+            "tool_abc",
+            "Write",
+            r#"{"file_path":"/tmp/x","content"#,
+            "", // no preceding streamed text
+        );
+
+        // Assistant side: exactly one tool_use block with id/name preserved,
+        // empty-object placeholder input.
+        let MessageContent::Blocks(ref blocks) = assistant.content else {
+            panic!("assistant content must be Blocks");
+        };
+        assert_eq!(blocks.len(), 1);
+        let ContentBlock::ToolUse(tu) = &blocks[0] else {
+            panic!("expected tool_use");
+        };
+        assert_eq!(tu.id, "tool_abc");
+        assert_eq!(tu.name, "Write");
+        assert_eq!(tu.input, Value::Object(Default::default()));
+        assert!(matches!(assistant.role, Role::Assistant));
+
+        // User side: tool_result with is_error=true, paired id, raw fragment
+        // surfaced in the content so Claude can self-correct.
+        let MessageContent::Blocks(ref blocks) = user.content else {
+            panic!("user content must be Blocks");
+        };
+        assert_eq!(blocks.len(), 1);
+        let ContentBlock::ToolResult(tr) = &blocks[0] else {
+            panic!("expected tool_result");
+        };
+        assert_eq!(tr.tool_use_id, "tool_abc");
+        assert_eq!(tr.is_error, Some(true));
+        let content_str = match tr.content.as_ref().expect("content present") {
+            Value::String(s) => s.clone(),
+            other => panic!("expected string content, got {other:?}"),
+        };
+        assert!(content_str.contains("not valid JSON"));
+        assert!(content_str.contains("/tmp/x"));
+        assert!(content_str.contains("retry"));
+        assert!(matches!(user.role, Role::User));
+    }
+
+    #[test]
+    fn malformed_tool_use_preserves_preceding_streamed_text() {
+        // If the model streamed some explanatory text before the malformed
+        // tool_use (e.g. "I'll write the file..."), that text should be
+        // preserved in the assistant message so the conversation still
+        // reflects what the user saw on their screen.
+        let (assistant, _user) = synthesize_malformed_tool_use_pair(
+            "tool_xyz",
+            "Edit",
+            r#"{"file_path":"a","old_stri"#,
+            "I will now edit the file.",
+        );
+        let MessageContent::Blocks(ref blocks) = assistant.content else {
+            panic!("assistant content must be Blocks");
+        };
+        assert_eq!(blocks.len(), 2, "expected text + tool_use blocks");
+        match &blocks[0] {
+            ContentBlock::Text(t) => assert!(t.text.contains("I will now edit")),
+            _ => panic!("first block must be Text"),
+        }
+        match &blocks[1] {
+            ContentBlock::ToolUse(tu) => {
+                assert_eq!(tu.id, "tool_xyz");
+                assert_eq!(tu.name, "Edit");
+            }
+            _ => panic!("second block must be ToolUse"),
+        }
+    }
 }
