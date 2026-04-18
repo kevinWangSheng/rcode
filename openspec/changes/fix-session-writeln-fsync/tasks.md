@@ -10,7 +10,7 @@
 
 ## 2. Metadata Writes
 
-- [ ] 2.1 For `metadata.json` (written with `fs::write`), switch to the
+- [x] 2.1 For `metadata.json` (written with `fs::write`), switch to the
       atomic tmpfile + rename pattern so a crash mid-write does not leave
       a truncated `metadata.json`.
       (QA 2026-04-18: the original "N/A" note was incorrect.
@@ -19,11 +19,13 @@
       called from list-sessions at line 377. It still uses non-atomic
       `fs::write(&path, json)`. Spec Scenario "Metadata write is atomic"
       is unmet. Reverting to [ ].)
-- [ ] 2.2 Implement the tmpfile pattern: same-dir `NamedTempFile::new_in(dir)`
+      Fixed 2026-04-18: implemented via NamedTempFile::persist + added test.
+- [x] 2.2 Implement the tmpfile pattern: same-dir `NamedTempFile::new_in(dir)`
       + write + `sync_all` + `persist(&path)`. Add a regression test that
       crashes between the tempfile write and the rename (or mocks it) and
       asserts `metadata.json` is either the prior full version or absent,
       never truncated.
+      Fixed 2026-04-18: implemented via NamedTempFile::persist + added test.
 
 ## 3. Durability Test
 

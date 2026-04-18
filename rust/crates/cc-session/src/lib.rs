@@ -180,14 +180,67 @@ impl Session {
     }
 
     /// Write session metadata alongside the transcript.
+    ///
+    /// Atomically persisted via a same-directory `NamedTempFile` +
+    /// `persist`. A crash (SIGKILL, power loss) between the tmpfile
+    /// write and the rename cannot leave `metadata.json` truncated:
+    /// readers either see the prior fully-written version or no file,
+    /// never a half-written JSON document. See spec
+    /// `session-persistence` Scenario "Metadata write is atomic".
     pub fn write_metadata(&self, metadata: &SessionMetadata) -> CcResult<()> {
         let Some(dir) = self.session_dir() else {
             return Err(CcError::io("no session directory"));
         };
+        // Ensure the session directory exists before placing a tmpfile
+        // inside it. `Session::new` creates it, but a `Session` constructed
+        // directly in tests (or via resume of a TS-only session where the
+        // Rust-layout dir has not been touched yet) may not have it.
+        fs::create_dir_all(dir).map_err(|e| {
+            CcError::io(format!(
+                "failed to create session dir {}: {e}",
+                dir.display()
+            ))
+        })?;
         let path = dir.join("metadata.json");
         let json = serde_json::to_string_pretty(metadata).map_err(CcError::Json)?;
-        fs::write(&path, json)
-            .map_err(|e| CcError::io(format!("failed to write metadata: {e}")))?;
+
+        // Same-dir tempfile so the final `persist` is an atomic rename
+        // on the same filesystem (cross-FS rename would fall back to
+        // copy + unlink and lose atomicity).
+        let tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
+            CcError::io(format!(
+                "failed to create metadata tempfile in {}: {e}",
+                dir.display()
+            ))
+        })?;
+        {
+            let mut file = tmp.as_file();
+            file.write_all(json.as_bytes()).map_err(|e| {
+                CcError::io(format!(
+                    "failed to write metadata tempfile {}: {e}",
+                    path.display()
+                ))
+            })?;
+            file.flush().map_err(|e| {
+                CcError::io(format!(
+                    "failed to flush metadata tempfile {}: {e}",
+                    path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|e| {
+                CcError::io(format!(
+                    "failed to fsync metadata tempfile {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+
+        tmp.persist(&path).map_err(|e| {
+            CcError::io(format!(
+                "failed to persist metadata to {}: {e}",
+                path.display()
+            ))
+        })?;
         Ok(())
     }
 
