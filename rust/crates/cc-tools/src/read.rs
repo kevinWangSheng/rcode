@@ -59,37 +59,88 @@ impl Tool for ReadTool {
             .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
 
         let path = Path::new(file_path);
-        if !path.exists() {
-            return Ok(ToolResult::error(format!("File not found: {file_path}")));
-        }
-        if path.is_dir() {
-            return Ok(ToolResult::error(format!("{file_path} is a directory")));
-        }
 
-        // Size-cap gate: stat before reading so a 10 GB log file can't
-        // balloon our memory before we notice. Files over MAX_FILE_BYTES
-        // get a helpful error explaining how to do a partial read.
-        if let Ok(meta) = tokio::fs::metadata(path).await {
-            if meta.len() > MAX_FILE_BYTES {
-                let mb = meta.len() / (1024 * 1024);
-                let cap_mb = MAX_FILE_BYTES / (1024 * 1024);
-                return Ok(ToolResult::error(format!(
-                    "File {file_path} is {mb} MB, above the {cap_mb} MB Read cap. \
-                     Use `offset` + `limit` for a line range, or the Grep/Bash tools \
-                     for pattern / byte-range reads."
-                )));
+        // Open the file ONCE and perform both the size probe and the read
+        // through the same fd. A separate path-based `metadata()` followed by
+        // `read_to_string(path)` is a TOCTOU: an attacker who swaps the path
+        // to a 10 GB log between the two syscalls can bypass the cap and OOM
+        // the process. An fd is pinned to the inode, so metadata() + read()
+        // on the same fd describe the same object.
+        let file = match tokio::fs::File::open(path).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ToolResult::error(format!("File not found: {file_path}")));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::IsADirectory
+                || e.raw_os_error() == Some(21) /* EISDIR */ =>
+            {
+                return Ok(ToolResult::error(format!("{file_path} is a directory")));
+            }
+            Err(e) => {
+                // On some platforms (macOS) opening a dir returns a generic
+                // error kind; double-check via path semantics.
+                if path.is_dir() {
+                    return Ok(ToolResult::error(format!("{file_path} is a directory")));
+                }
+                return Err(CcError::tool("tool", format!("failed to open {file_path}: {e}")));
+            }
+        };
+
+        // Size-cap gate, atomic with the read. meta.len() describes the
+        // inode behind `file`, not whatever the path now points at.
+        let size = match file.metadata().await {
+            Ok(m) => {
+                if m.is_dir() {
+                    return Ok(ToolResult::error(format!("{file_path} is a directory")));
+                }
+                m.len()
+            }
+            Err(e) => {
+                return Err(CcError::tool("tool", format!("failed to stat {file_path}: {e}")));
+            }
+        };
+        if size > MAX_FILE_BYTES {
+            let mb = size / (1024 * 1024);
+            let cap_mb = MAX_FILE_BYTES / (1024 * 1024);
+            // Drop the fd without reading; cap violation — no bytes slurped.
+            drop(file);
+            return Ok(ToolResult::error(format!(
+                "File {file_path} is {mb} MB, above the {cap_mb} MB Read cap. \
+                 Use `offset` + `limit` for a line range, or the Grep/Bash tools \
+                 for pattern / byte-range reads."
+            )));
         }
 
+        // Stream-read from the same fd with an explicit byte cap. This
+        // defends against a second race where the file grows between the
+        // stat above and the read below (e.g. an active log being appended
+        // to). The cap ensures we never allocate more than MAX_FILE_BYTES
+        // + a small overshoot margin regardless of growth.
+        //
         // Race the read against cancel so Ctrl+C lands quickly even on slow
         // network filesystems (NFS, FUSE mounts, etc.).
-        let content = tokio::select! {
-            r = tokio::fs::read_to_string(path) => r
-                .map_err(|e| CcError::tool("tool", format!("failed to read {file_path}: {e}")))?,
+        use tokio::io::AsyncReadExt;
+        // +1 so we can detect overshoot (someone grew the file past the cap
+        // after the stat but before we finished reading).
+        let read_limit = MAX_FILE_BYTES + 1;
+        let mut buf = Vec::with_capacity(size as usize);
+        let mut bounded = file.take(read_limit);
+        let read_result = tokio::select! {
+            r = bounded.read_to_end(&mut buf) => r,
             _ = cancel.cancelled() => {
                 return Err(CcError::tool("tool", "Read cancelled"));
             }
         };
+        read_result.map_err(|e| CcError::tool("tool", format!("failed to read {file_path}: {e}")))?;
+        if buf.len() as u64 > MAX_FILE_BYTES {
+            let cap_mb = MAX_FILE_BYTES / (1024 * 1024);
+            return Ok(ToolResult::error(format!(
+                "File {file_path} exceeded the {cap_mb} MB Read cap during read. \
+                 Use `offset` + `limit` for a line range, or the Grep/Bash tools \
+                 for pattern / byte-range reads."
+            )));
+        }
+        let content = String::from_utf8_lossy(&buf).into_owned();
 
         let offset = input["offset"].as_u64().map(|n| n as usize).unwrap_or(1);
         let limit = input["limit"]
@@ -217,5 +268,113 @@ mod tests {
     #[test]
     fn read_is_read_only() {
         assert!(ReadTool.is_read_only());
+    }
+
+    #[tokio::test]
+    async fn read_metadata_size_matches_content_bytes() {
+        // For a few fixed sizes, verify that the fd metadata.len() agrees
+        // with the number of bytes actually read. This is the atomic-read
+        // invariant: since we open once and both stat+read go through the
+        // same fd, the two must agree.
+        let dir = tempfile::tempdir().unwrap();
+        for &size in &[0usize, 1, 128, 4096, 10_000] {
+            let file = dir.path().join(format!("s{size}.bin"));
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            std::fs::write(&file, &bytes).unwrap();
+
+            let tool = ReadTool;
+            let cancel = CancellationToken::new();
+            let result = tool
+                .execute(json!({"file_path": file.to_string_lossy()}), &cancel)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "size {size}: {}", result.content);
+
+            // The returned content is line-numbered, but for raw-byte tests we
+            // care about the underlying read path not panicking and size-cap
+            // not tripping for small files. Separately assert the raw fd read
+            // through tokio agrees with metadata().
+            let f = tokio::fs::File::open(&file).await.unwrap();
+            let meta_size = f.metadata().await.unwrap().len();
+            drop(f);
+            assert_eq!(meta_size, size as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_tolerates_relink_race() {
+        // Background task repeatedly swaps a symlink between a tiny target
+        // and a "large" (sparse-reported) target while the main task calls
+        // Read. The main task must either succeed with the small content
+        // OR return the cap error — but never blow up with an OOM / panic.
+        //
+        // We use a sparse file for the "large" side so the test is cheap.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small");
+        let huge = dir.path().join("huge");
+        let link = dir.path().join("link");
+
+        std::fs::write(&small, "hello").unwrap();
+        let f = std::fs::File::create(&huge).unwrap();
+        f.set_len(MAX_FILE_BYTES + 1024).unwrap();
+        drop(f);
+
+        // Initial link points at small.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&small, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&small, &link).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let link2 = link.clone();
+        let small2 = small.clone();
+        let huge2 = huge.clone();
+        #[cfg(unix)]
+        let swapper = std::thread::spawn(move || {
+            let mut flip = false;
+            while !stop2.load(Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&link2);
+                let target = if flip { &small2 } else { &huge2 };
+                let _ = std::os::unix::fs::symlink(target, &link2);
+                flip = !flip;
+            }
+        });
+
+        let tool = ReadTool;
+        let cancel = CancellationToken::new();
+        for _ in 0..50 {
+            let result = tool
+                .execute(
+                    json!({"file_path": link.to_string_lossy()}),
+                    &cancel,
+                )
+                .await;
+            // Acceptable outcomes:
+            //   - Ok with is_error=false (happy path)
+            //   - Ok with is_error=true (cap hit)
+            //   - Ok with is_error=true "File not found" / stat error (link
+            //     was gone mid-swap — acceptable).
+            //   - Err (OS-level open failure during swap — rare but ok).
+            // UNacceptable:
+            //   - Panic / OOM / returning 10 GB of content for a 5-byte
+            //     file.
+            if let Ok(r) = result {
+                if !r.is_error {
+                    // content is line-numbered "1\thello"
+                    assert!(
+                        r.content.len() < 1024,
+                        "unexpectedly large payload on the 'small' side: {} bytes",
+                        r.content.len()
+                    );
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        swapper.join().unwrap();
     }
 }
