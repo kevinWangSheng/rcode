@@ -59,7 +59,7 @@ impl Tool for GrepTool {
         true
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
         let pattern_str = input["pattern"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;
@@ -95,6 +95,13 @@ impl Tool for GrepTool {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
+            // Bail out if the caller cancelled mid-walk. Grep is bounded by
+            // MAX_RESULTS, but "bounded to 250" is not the same as "bounded
+            // in time" — a huge repo with a narrow regex can still chew
+            // through tens of thousands of files before hitting the cap.
+            if cancel.is_cancelled() {
+                return Err(CcError::tool("tool", "Grep cancelled"));
+            }
             let path = entry.path();
 
             // Apply glob filter
@@ -176,5 +183,40 @@ impl Tool for GrepTool {
         }
 
         Ok(ToolResult::ok(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn grep_honors_cancel_token_mid_walk() {
+        // Pre-cancel the token and verify the walker bails immediately
+        // rather than enumerating the entire tree. No fixture tree needed —
+        // any non-empty directory works; the cancel check short-circuits
+        // before the first file is processed.
+        let tool = GrepTool;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = tool
+            .execute(
+                json!({"pattern": "zzz", "path": "."}),
+                &cancel,
+            )
+            .await;
+        assert!(result.is_err(), "expected cancel error, got {:?}", result);
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn grep_invalid_regex_errors() {
+        let tool = GrepTool;
+        let cancel = CancellationToken::new();
+        let err = tool
+            .execute(json!({"pattern": "["}), &cancel)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("regex"));
     }
 }

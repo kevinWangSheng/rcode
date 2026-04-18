@@ -60,7 +60,7 @@ impl Tool for WebSearchTool {
         true
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
         let query = input["query"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'query' field"))?
@@ -92,16 +92,22 @@ impl Tool for WebSearchTool {
             .build()
             .map_err(|e| CcError::tool("tool", format!("failed to build http client: {e}")))?;
 
-        let response = match client
+        // Race the request against the cancel token — Ctrl+C shouldn't wait
+        // out the full 30s timeout when Brave is slow.
+        let send_fut = client
             .get(BRAVE_SEARCH_URL)
             .header("X-Subscription-Token", api_key)
             .header("Accept", "application/json")
             .query(&[("q", query.as_str()), ("count", &count.to_string())])
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return Ok(ToolResult::error(format!("WebSearch request failed: {e}"))),
+            .send();
+        let response = tokio::select! {
+            r = send_fut => match r {
+                Ok(r) => r,
+                Err(e) => return Ok(ToolResult::error(format!("WebSearch request failed: {e}"))),
+            },
+            _ = cancel.cancelled() => {
+                return Err(CcError::tool("tool", "WebSearch cancelled"));
+            }
         };
 
         let status = response.status();
@@ -112,12 +118,17 @@ impl Tool for WebSearchTool {
             )));
         }
 
-        let body: Value = match response.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(ToolResult::error(format!(
-                    "WebSearch: failed to parse JSON response: {e}"
-                )));
+        let body: Value = tokio::select! {
+            v = response.json::<Value>() => match v {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(ToolResult::error(format!(
+                        "WebSearch: failed to parse JSON response: {e}"
+                    )));
+                }
+            },
+            _ = cancel.cancelled() => {
+                return Err(CcError::tool("tool", "WebSearch cancelled"));
             }
         };
 

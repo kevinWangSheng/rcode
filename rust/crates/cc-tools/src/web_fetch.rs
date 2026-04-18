@@ -57,7 +57,7 @@ impl Tool for WebFetchTool {
         true
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
         let url = input["url"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'url' field"))?
@@ -75,10 +75,15 @@ impl Tool for WebFetchTool {
             .build()
             .map_err(|e| CcError::tool("tool", format!("failed to build http client: {e}")))?;
 
-        let response = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolResult::error(format!("WebFetch request failed: {e}")));
+        // Race the fetch against the cancel token so Ctrl+C can abort a
+        // hung / slow server without waiting the full 30s reqwest timeout.
+        let response = tokio::select! {
+            r = client.get(&url).send() => match r {
+                Ok(r) => r,
+                Err(e) => return Ok(ToolResult::error(format!("WebFetch request failed: {e}"))),
+            },
+            _ = cancel.cancelled() => {
+                return Err(CcError::tool("tool", "WebFetch cancelled"));
             }
         };
 
@@ -91,9 +96,15 @@ impl Tool for WebFetchTool {
             .to_lowercase();
 
         // Use bytes() so we can enforce the size cap before allocating a String.
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => return Ok(ToolResult::error(format!("WebFetch read failed: {e}"))),
+        // Same cancel race — the body read can also hang on a slow server.
+        let bytes = tokio::select! {
+            b = response.bytes() => match b {
+                Ok(b) => b,
+                Err(e) => return Ok(ToolResult::error(format!("WebFetch read failed: {e}"))),
+            },
+            _ = cancel.cancelled() => {
+                return Err(CcError::tool("tool", "WebFetch cancelled"));
+            }
         };
 
         let truncated = bytes.len() > MAX_RESPONSE_BYTES;
@@ -204,5 +215,36 @@ mod tests {
         let cancel = CancellationToken::new();
         let err = tool.execute(json!({}), &cancel).await.unwrap_err();
         assert!(err.to_string().contains("url"));
+    }
+
+    #[tokio::test]
+    async fn execute_honors_cancel_token_on_slow_server() {
+        // Spin up a TCP listener that accepts the connection but never sends
+        // any response. WebFetch would normally wait the full 30s timeout
+        // before erroring; with cancel wiring, 100ms is enough.
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _hang = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            // Hold the socket open forever.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+
+        let tool = WebFetchTool;
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel2.cancel();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/hang");
+        let start = std::time::Instant::now();
+        let err = tool.execute(json!({"url": url}), &cancel).await.unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("cancelled"), "got: {err}");
+        // Must have bailed well before the 30s reqwest timeout.
+        assert!(elapsed < std::time::Duration::from_secs(5), "took {:?}", elapsed);
     }
 }
