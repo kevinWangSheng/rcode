@@ -171,7 +171,22 @@ impl ApiClient {
                 .unwrap_or_else(|_| "<unreadable body>".into());
 
             let err = if status_code == 429 {
-                CcError::RateLimited { retry_after }
+                // Parse out the server's human-readable reason
+                // (`{"error":{"message":"..."}}`) so the error surface
+                // tells the user WHICH quota tripped, not a context-free
+                // "Rate limited".
+                let message = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    });
+                CcError::RateLimited {
+                    retry_after,
+                    message,
+                }
             } else if status_code >= 500 {
                 CcError::api_retryable(format!("HTTP {status}: {text}"), status_code)
             } else {

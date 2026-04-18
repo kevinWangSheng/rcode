@@ -39,8 +39,17 @@ pub enum CcError {
     #[error("Cancelled")]
     Cancelled,
 
-    #[error("Rate limited (retry after {retry_after:?}s)")]
-    RateLimited { retry_after: Option<u64> },
+    #[error("Rate limited{}{}",
+        retry_after.map(|s| format!(" (retry after {s}s)")).unwrap_or_default(),
+        message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())]
+    RateLimited {
+        retry_after: Option<u64>,
+        /// Server-provided human-readable reason (parsed from the 429
+        /// response body's `error.message` field when present). Preserved
+        /// so logs surface "organization rate limit exceeded" etc. instead
+        /// of a context-free "Rate limited".
+        message: Option<String>,
+    },
 
     #[error("{0}")]
     Other(String),
@@ -118,9 +127,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rate_limited_display_without_retry_after() {
+        // Regression: formatting with `{:?}` used to produce "Nones".
+        let e = CcError::RateLimited {
+            retry_after: None,
+            message: None,
+        };
+        assert_eq!(e.to_string(), "Rate limited");
+    }
+
+    #[test]
+    fn rate_limited_display_with_retry_after_and_message() {
+        let e = CcError::RateLimited {
+            retry_after: Some(30),
+            message: Some("organization rate limit exceeded".into()),
+        };
+        assert_eq!(
+            e.to_string(),
+            "Rate limited (retry after 30s): organization rate limit exceeded"
+        );
+    }
+
+    #[test]
     fn error_retryable() {
         assert!(CcError::RateLimited {
-            retry_after: Some(5)
+            retry_after: Some(5),
+            message: None,
         }
         .is_retryable());
         assert!(CcError::api_retryable("server error", 500).is_retryable());

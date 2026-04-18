@@ -30,7 +30,7 @@ impl RetryPolicy {
             return None;
         }
         match error {
-            CcError::RateLimited { retry_after } => {
+            CcError::RateLimited { retry_after, .. } => {
                 Some(Duration::from_secs(retry_after.unwrap_or(5)))
             }
             CcError::Api {
@@ -55,6 +55,7 @@ mod tests {
         let policy = RetryPolicy::default();
         let err = CcError::RateLimited {
             retry_after: Some(10),
+            message: None,
         };
         assert_eq!(policy.should_retry(&err, 0), Some(Duration::from_secs(10)));
         assert_eq!(policy.should_retry(&err, 1), Some(Duration::from_secs(10)));
