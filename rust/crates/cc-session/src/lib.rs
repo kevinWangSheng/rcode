@@ -56,6 +56,12 @@ impl Session {
     }
 
     /// Append a message to the JSONL transcript file.
+    ///
+    /// Each append is fsynced before returning so that a crash / SIGKILL /
+    /// power loss after `append` returns is guaranteed to preserve the
+    /// turn on disk. `RUST_REWRITE_PLAN.md` §3 promises per-turn
+    /// durability; without `sync_all` the libc-level and OS page cache
+    /// can silently drop the last write.
     pub fn append(&self, message: &MessageParam) -> CcResult<()> {
         let entry = TranscriptEntry {
             message: message.clone(),
@@ -71,6 +77,16 @@ impl Session {
 
         writeln!(file, "{line}")
             .map_err(|e| CcError::Io(format!("failed to write transcript: {e}")))?;
+
+        // Durability: flush libc buffers, then fsync so the write survives
+        // a SIGKILL / power loss. If the FS cannot durably persist (disk
+        // full, read-only remount, network FS outage), surface the error
+        // so the caller can decide — silently continuing would mislead
+        // resume logic into a false sense of persistence.
+        file.flush()
+            .map_err(|e| CcError::Io(format!("failed to flush transcript: {e}")))?;
+        file.sync_all()
+            .map_err(|e| CcError::Io(format!("failed to fsync transcript: {e}")))?;
 
         Ok(())
     }
