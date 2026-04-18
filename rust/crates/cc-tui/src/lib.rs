@@ -83,6 +83,11 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
         command_ctx: &cmd_ctx,
     };
 
+    // Load keybindings once at startup. Edits to ~/.claude/keybindings.json
+    // won't be picked up mid-session — re-run the TUI to reload (or add a
+    // /reload-keybindings command in the future).
+    let keybindings = Keybindings::load();
+
     // ── Initialize terminal ───────────────────────────────────────────────
     let mut terminal = ratatui::init();
     let mut reader = EventStream::new();
@@ -99,8 +104,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(crossterm::event::Event::Key(key))) => {
-                        let kb = Keybindings::load();
-                        map_key_event(&key, &kb, &app)
+                        map_key_event(&key, &keybindings, &app)
                     }
                     Some(Ok(crossterm::event::Event::Resize(_, _))) => None,
                     Some(Err(_)) | None => Some(AppAction::Quit),

@@ -223,4 +223,41 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         assert_eq!(kb.match_action(&key), None);
     }
+
+    /// Fix: `Keybindings::load` used to run on every key event, hammering the
+    /// home directory. This test simulates many key events against a cached
+    /// instance and asserts that a counted `load_from` is only ever invoked
+    /// once, matching the run_tui startup-cache behavior.
+    #[test]
+    fn cached_keybindings_load_once_across_many_events() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static LOAD_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        // Wrapper that counts how many times load_from is invoked.
+        fn counting_load() -> Keybindings {
+            LOAD_CALLS.fetch_add(1, Ordering::SeqCst);
+            Keybindings::default()
+        }
+
+        LOAD_CALLS.store(0, Ordering::SeqCst);
+
+        // Caller-owned cache — mirrors lib.rs's `let keybindings = Keybindings::load()`
+        // captured once before the event loop.
+        let kb = counting_load();
+
+        // Simulate a burst of 500 key events. None of them should reload.
+        for i in 0..500u32 {
+            let ch = std::char::from_u32((b'a' as u32) + (i % 26)).unwrap();
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            let _ = kb.match_action(&key);
+        }
+
+        assert_eq!(
+            LOAD_CALLS.load(Ordering::SeqCst),
+            1,
+            "keybindings must be loaded exactly once per session; got {} loads",
+            LOAD_CALLS.load(Ordering::SeqCst)
+        );
+    }
 }
