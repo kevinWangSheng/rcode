@@ -81,6 +81,30 @@ async fn write_empty_202(sock: &mut TcpStream) {
     let _ = sock.shutdown().await;
 }
 
+/// Write an SSE response with an explicit `id:` line for the final event.
+async fn write_sse_with_event_id(
+    sock: &mut TcpStream,
+    event_id: &str,
+    body_json: &Value,
+) {
+    let payload = format!(
+        "event: message\nid: {event_id}\ndata: {}\n\n",
+        serde_json::to_string(body_json).unwrap()
+    );
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        payload.len(),
+        payload
+    );
+    let _ = sock.write_all(resp.as_bytes()).await;
+    let _ = sock.shutdown().await;
+}
+
 #[tokio::test]
 async fn session_id_from_initialize_is_replayed_on_next_request() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -207,6 +231,62 @@ async fn custom_headers_from_config_reach_server() {
     let _client = McpHttpClient::connect_with_headers("stub", &url, extra)
         .await
         .expect("connect");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn last_event_id_captured_from_sse_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+
+    let server = tokio::spawn(async move {
+        // 1. initialize — plain JSON response.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (_h, req) = read_request(&mut sock).await;
+        let id = req["id"].as_u64().unwrap_or(0);
+        write_response(
+            &mut sock,
+            200,
+            &[],
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "stub", "version": "0.0.1"}
+                }
+            }),
+        )
+        .await;
+
+        // 2. notifications/initialized 202.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut sock).await;
+        write_empty_202(&mut sock).await;
+
+        // 3. tools/list — SSE with an explicit event id.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (_h, req) = read_request(&mut sock).await;
+        let id = req["id"].as_u64().unwrap_or(0);
+        write_sse_with_event_id(
+            &mut sock,
+            "evt-42",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"tools": []}
+            }),
+        )
+        .await;
+    });
+
+    let mut client = McpHttpClient::connect("stub", &url).await.expect("connect");
+    // No SSE response seen yet.
+    assert_eq!(client.last_event_id().await, None);
+    let _ = client.list_tools().await.expect("list_tools");
+    // After the SSE response, the event id is captured.
+    assert_eq!(client.last_event_id().await.as_deref(), Some("evt-42"));
     server.await.unwrap();
 }
 

@@ -63,6 +63,12 @@ pub struct McpHttpClient {
     /// subsequent request. Cleared when the server returns 404 (session
     /// expired) so the next call re-initializes.
     session_id: tokio::sync::Mutex<Option<String>>,
+    /// Most recent SSE `id:` seen on any response. Exposed for future
+    /// resumable-stream work — not currently sent as a `Last-Event-Id`
+    /// request header because we don't reconnect mid-request. Having it
+    /// captured means the building block is ready when a long-lived
+    /// server→client SSE listener lands.
+    last_event_id: tokio::sync::Mutex<Option<String>>,
 }
 
 impl McpHttpClient {
@@ -104,6 +110,7 @@ impl McpHttpClient {
             http,
             extra_headers,
             session_id: tokio::sync::Mutex::new(None),
+            last_event_id: tokio::sync::Mutex::new(None),
         };
 
         // Redact sensitive values before logging. Matches the TS client
@@ -214,6 +221,13 @@ impl McpHttpClient {
         self.session_id.lock().await.clone()
     }
 
+    /// Most recent SSE `id:` value observed across all responses. `None`
+    /// until an SSE response carries an id. Exposed for tests + future
+    /// resumable-stream work.
+    pub async fn last_event_id(&self) -> Option<String> {
+        self.last_event_id.lock().await.clone()
+    }
+
     /// Send `DELETE <url>` with the current session ID header to tell the
     /// server we're terminating the session cleanly (MCP 2025-03-26
     /// §Session Management). Best-effort: servers MAY return 405 if they
@@ -322,6 +336,13 @@ impl McpHttpClient {
 
         if content_type.starts_with("text/event-stream") {
             let body = resp.text().await.map_err(|e| format!("read sse: {e}"))?;
+            // Capture Last-Event-Id before parsing the JSON-RPC response so
+            // the caller's error path (no matching id) still records what
+            // we saw. Any non-empty `id:` line updates our stored value.
+            if let Some(eid) = parse_sse_last_event_id(&body) {
+                let mut guard = self.last_event_id.lock().await;
+                *guard = Some(eid);
+            }
             return parse_sse_for_id(&body, req_id);
         }
 
@@ -446,6 +467,24 @@ pub fn redact_headers(headers: &HashMap<String, String>) -> HashMap<String, Stri
         .collect()
 }
 
+/// Return the last non-empty SSE `id:` value observed in `body`, or `None`
+/// if the stream carried no ids. Per the SSE spec, any `id:` line (including
+/// `id:` alone) updates the reader's "last event ID" — we mirror that but
+/// only remember non-empty values, since the only use for this is a future
+/// `Last-Event-Id` reconnect header.
+pub fn parse_sse_last_event_id(body: &str) -> Option<String> {
+    let mut last = None;
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("id:") {
+            let val = rest.trim();
+            if !val.is_empty() {
+                last = Some(val.to_string());
+            }
+        }
+    }
+    last
+}
+
 /// Parse a Server-Sent Events body and return the first JSON-RPC response
 /// whose `id` matches `target_id`. Tolerates multi-line `data:` payloads and
 /// ignores `event:` / comment lines.
@@ -498,6 +537,27 @@ mod tests {
     fn returns_error_when_id_not_present() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
         assert!(parse_sse_for_id(body, 99).is_err());
+    }
+
+    #[test]
+    fn parse_sse_last_event_id_returns_latest() {
+        let body = "id: 1\ndata: {}\n\nid: 2\ndata: {}\n\nid: 3\ndata: {}\n\n";
+        assert_eq!(parse_sse_last_event_id(body).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn parse_sse_last_event_id_ignores_empty_and_returns_none() {
+        let body = "data: {}\n\nevent: message\ndata: {}\n\n";
+        assert_eq!(parse_sse_last_event_id(body), None);
+    }
+
+    #[test]
+    fn parse_sse_last_event_id_empty_line_does_not_clear() {
+        // Per the SSE spec an `id:` with an empty value should reset the
+        // stored ID. For the Last-Event-Id reconnect use case we only care
+        // about the last non-empty value — the reset semantics don't apply.
+        let body = "id: 42\ndata: {}\n\nid:\ndata: {}\n\n";
+        assert_eq!(parse_sse_last_event_id(body).as_deref(), Some("42"));
     }
 
     #[test]
