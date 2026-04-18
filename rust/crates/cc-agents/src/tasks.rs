@@ -96,8 +96,22 @@ pub async fn run_local_bash(
         .spawn()
         .map_err(|e| CcError::tool("local_bash", format!("failed to spawn: {e}")))?;
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    // Command was built with `Stdio::piped()` for both streams, so `.take()`
+    // returns `Some` in practice — but surface an explicit tool error
+    // rather than `.expect()`-panicking on the executor thread if that ever
+    // changes (e.g., a refactor to `Stdio::null()` for a silent variant).
+    let stdout = child.stdout.take().ok_or_else(|| {
+        CcError::tool(
+            "local_bash",
+            "child stdout was not piped; cannot capture output",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        CcError::tool(
+            "local_bash",
+            "child stderr was not piped; cannot capture output",
+        )
+    })?;
 
     let buf = Arc::new(StdMutex::new(Vec::<u8>::new()));
     let last_activity = Arc::new(StdMutex::new(Instant::now()));

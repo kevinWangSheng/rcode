@@ -119,8 +119,33 @@ real defect, promote to a `fix-*` change at that point.
 | cc-config | ✅ | Six-layer merge, NFC, sanitize, project context |
 | cc-auth | ✅ | env/file/Keychain chain, OAuth, refresh |
 | cc-git | ✅ | GitContext, is_git_ignored, filter_git_ignored |
-| cc-agents | — | Audit not yet run; added 2026-04-16, 15 tests. Queue for next pass. |
+| cc-agents | ✅ | Audited 2026-04-18 (commit pending); 18 tests, 3 new regression tests. Findings below. |
 | cc-bridge | — | 106 LOC, `--print` path. Low priority. |
 
-The "cc-agents" audit is a known follow-up. Everything else was in
-scope for this pass.
+---
+
+## cc-agents audit (2026-04-18)
+
+Static review against §3 / §4 contracts on 891 LOC across 5 files.
+Findings addressed in the same commit:
+
+| # | Severity | Location | Defect | Fix |
+|---|----------|----------|--------|-----|
+| A1 | HIGH | `cc-agents/src/registry.rs` | `TaskRegistry` had no `Drop` impl. A registry going out of scope (panic, session teardown, test exit) would leak `JoinHandle`s — the spawned futures kept running and any subprocesses survived the TUI. | Added `impl Drop for TaskRegistry` that calls `cancel.cancel()` + `handle.abort()` for every entry. Regression: `drop_aborts_running_task_handles`. |
+| A2 | HIGH | `cc-agents/src/registry.rs::poll_completed` | Filter `status == Running` meant a cancelled task's handle was never reaped even after it exited. The HashMap grew unbounded under cancel-heavy workloads. | Widened filter to any `handle.is_finished()`; cancelled reaps are silent (no `pending_outputs` push), non-cancelled transitions stamp `completed_at`. Regression: `poll_completed_reaps_cancelled_handles`. |
+| A3 | MEDIUM | `cc-agents/src/tasks.rs:99-100` | `child.stdout.take().expect("stdout piped")` would panic on the executor thread if a refactor ever flipped the `Stdio::piped()` construction. | Replaced with `ok_or_else` returning `CcError::tool("local_bash", …)`. |
+| A4 | MEDIUM | `cc-agents/src/registry.rs::evict_old` | The `_max_age: Duration` arg was unused — the impl evicted every non-running task. Callers that expected a TTL got aggressive eviction. | Now honours `max_age` via `completed_at`: Pending/Running are kept; terminal states are kept while `completed_at > (now - max_age)`. Regression: `evict_old_honours_max_age_against_completed_at`. |
+
+False positives considered and dismissed:
+- `std::sync::Mutex` in async context (tasks.rs read/write buf, watchdog).
+  All critical sections are synchronous (no `.await` held across the
+  lock) so `std::sync::Mutex` is the correct choice; `tokio::sync::Mutex`
+  would add overhead without benefit and clippy's `await_holding_lock`
+  already verifies the invariant.
+- Flaky `try_recv().expect("watchdog should have fired")` at
+  `tasks.rs:387`. The 150 ms / 50 ms / 1 s choreography has ample margin;
+  zero flakes in repeated runs. Not load-bearing.
+
+Mailbox (106 LOC) + teammate_dir (85 LOC) — clean channel-based IPC,
+no filesystem path traversal surface (names are HashMap keys, not path
+components).
