@@ -12,7 +12,7 @@ use cc_core::{MessageParam, SystemBlock};
 use cc_hooks::{HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
-    engine::{QueryEngine, QueryOptions},
+    engine::{QueryEngine, QueryEngineConfig, QueryOptions},
     ApiSummarizer, StdinPrompter, SubAgentRunnerImpl, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
@@ -397,16 +397,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(cc_tui::ChannelPrompter::new(events_tx.clone()));
 
         let tui_tool_registry: ToolRegistry = tools.into();
-        let tui_engine = QueryEngine::new(
+        let tui_engine = QueryEngine::new(QueryEngineConfig {
             api,
-            Arc::new(tui_tool_registry),
-            permission_engine,
-            hook_runner.clone(),
+            tools: Arc::new(tui_tool_registry),
+            permissions: permission_engine,
+            hooks: hook_runner.clone(),
             session,
             system_blocks,
             options,
-            tui_prompter,
-        );
+            prompter: tui_prompter,
+        });
 
         // Discover skills and build the command registry.
         let config_dir = dirs::home_dir().unwrap_or_default().join(".claude");
@@ -444,16 +444,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let non_interactive = options.non_interactive;
     let prompter: Arc<dyn cc_core::PermissionPrompter> =
         Arc::new(StdinPrompter::new(non_interactive));
-    let mut engine = QueryEngine::new(
+    let mut engine = QueryEngine::new(QueryEngineConfig {
         api,
-        Arc::new(tool_registry),
-        permission_engine,
-        hook_runner.clone(),
+        tools: Arc::new(tool_registry),
+        permissions: permission_engine,
+        hooks: hook_runner.clone(),
         session,
         system_blocks,
         options,
         prompter,
-    );
+    });
 
     let cancel = tokio_util::sync::CancellationToken::new();
 

@@ -14,7 +14,7 @@ use cc_session::Session;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::engine::{QueryEngine, QueryOptions};
+use crate::engine::{QueryEngine, QueryEngineConfig, QueryOptions};
 use crate::tool_registry::ToolRegistry;
 
 /// Factory that builds a fresh QueryEngine for each sub-agent invocation.
@@ -73,16 +73,16 @@ impl SubAgentRunner for SubAgentRunnerImpl {
             sys_blocks.push(cc_core::SystemBlock::text(extra));
         }
 
-        let mut engine = QueryEngine::new(
-            self.api.clone(),
-            self.tools.clone(),
-            self.permissions.clone(),
-            self.hooks.clone(),
+        let mut engine = QueryEngine::new(QueryEngineConfig {
+            api: self.api.clone(),
+            tools: self.tools.clone(),
+            permissions: self.permissions.clone(),
+            hooks: self.hooks.clone(),
             session,
-            sys_blocks,
-            self.options.clone(),
-            self.prompter.clone(),
-        );
+            system_blocks: sys_blocks,
+            options: self.options.clone(),
+            prompter: self.prompter.clone(),
+        });
 
         let result = engine
             .run_turn(prompt, |_| {}, &mut messages, &cancel)

@@ -14,7 +14,7 @@ use cc_api::ApiClient;
 use cc_core::{MessageParam, PermissionPrompter, SystemBlock};
 use cc_hooks::HookRunner;
 use cc_permissions::PermissionEngine;
-use cc_query::{QueryEngine, QueryOptions, StdinPrompter, ToolRegistry};
+use cc_query::{QueryEngine, QueryEngineConfig, QueryOptions, StdinPrompter, ToolRegistry};
 use cc_session::Session;
 use cc_tools::Tool;
 use tokio_util::sync::CancellationToken;
@@ -86,16 +86,16 @@ where
     let registry: ToolRegistry = tools.into();
 
     let prompter: Arc<dyn PermissionPrompter> = Arc::new(StdinPrompter::new(non_interactive));
-    let mut engine = QueryEngine::new(
+    let mut engine = QueryEngine::new(QueryEngineConfig {
         api,
-        Arc::new(registry),
+        tools: Arc::new(registry),
         permissions,
         hooks,
         session,
         system_blocks,
         options,
         prompter,
-    );
+    });
 
     let session_id = engine.session().id.clone();
     let cancel = CancellationToken::new();

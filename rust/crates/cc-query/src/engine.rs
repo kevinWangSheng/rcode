@@ -73,18 +73,34 @@ pub struct QueryEngine {
     compacted_last_turn: bool,
 }
 
+/// Construction bundle for `QueryEngine::new`.
+///
+/// Collected into a struct so callers pass named fields instead of
+/// matching an 8-arg positional signature (easy to swap two Arc<_>
+/// parameters undetected). Use struct-init syntax at the call site.
+pub struct QueryEngineConfig {
+    pub api: ApiClient,
+    pub tools: Arc<ToolRegistry>,
+    pub permissions: PermissionEngine,
+    pub hooks: Arc<HookRunner>,
+    pub session: Session,
+    pub system_blocks: Vec<SystemBlock>,
+    pub options: QueryOptions,
+    pub prompter: Arc<dyn PermissionPrompter>,
+}
+
 impl QueryEngine {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        api: ApiClient,
-        tools: Arc<ToolRegistry>,
-        permissions: PermissionEngine,
-        hooks: Arc<HookRunner>,
-        session: Session,
-        system_blocks: Vec<SystemBlock>,
-        options: QueryOptions,
-        prompter: Arc<dyn PermissionPrompter>,
-    ) -> Self {
+    pub fn new(cfg: QueryEngineConfig) -> Self {
+        let QueryEngineConfig {
+            api,
+            tools,
+            permissions,
+            hooks,
+            session,
+            system_blocks,
+            options,
+            prompter,
+        } = cfg;
         QueryEngine {
             api,
             tools,
