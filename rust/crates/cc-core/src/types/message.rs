@@ -18,6 +18,36 @@ pub struct CacheControl {
     pub scope: Option<String>, // "global" | "org"
 }
 
+impl CacheControl {
+    /// Ephemeral cache entry with `scope = "global"` — use for the static
+    /// instruction prompt (tier 2 of the three-tier cache scheme).
+    pub fn ephemeral_global() -> Self {
+        CacheControl {
+            kind: "ephemeral".into(),
+            scope: Some("global".into()),
+        }
+    }
+
+    /// Ephemeral cache entry with `scope = "org"` — use for dynamic / per-org
+    /// system blocks such as git context and memory (tier 3).
+    pub fn ephemeral_org() -> Self {
+        CacheControl {
+            kind: "ephemeral".into(),
+            scope: Some("org".into()),
+        }
+    }
+
+    /// Ephemeral cache entry with no scope. The server treats it as an
+    /// unscoped ephemeral cache request; prefer `ephemeral_global` /
+    /// `ephemeral_org` when the three-tier contract applies.
+    pub fn ephemeral_unscoped() -> Self {
+        CacheControl {
+            kind: "ephemeral".into(),
+            scope: None,
+        }
+    }
+}
+
 /// A text content block.
 /// Note: no `kind`/`type` field — the `ContentBlock` enum tag handles "type" for serde.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,5 +201,58 @@ impl Message {
             .filter_map(|b| b.as_text())
             .collect::<Vec<_>>()
             .join("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_global_has_expected_kind_and_scope() {
+        let cc = CacheControl::ephemeral_global();
+        assert_eq!(cc.kind, "ephemeral");
+        assert_eq!(cc.scope.as_deref(), Some("global"));
+    }
+
+    #[test]
+    fn ephemeral_org_has_expected_kind_and_scope() {
+        let cc = CacheControl::ephemeral_org();
+        assert_eq!(cc.kind, "ephemeral");
+        assert_eq!(cc.scope.as_deref(), Some("org"));
+    }
+
+    #[test]
+    fn ephemeral_unscoped_has_expected_kind_and_no_scope() {
+        let cc = CacheControl::ephemeral_unscoped();
+        assert_eq!(cc.kind, "ephemeral");
+        assert!(cc.scope.is_none());
+    }
+
+    #[test]
+    fn cache_control_wire_shape_global() {
+        let cc = CacheControl::ephemeral_global();
+        let json = serde_json::to_value(&cc).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "ephemeral", "scope": "global"})
+        );
+    }
+
+    #[test]
+    fn cache_control_wire_shape_org() {
+        let cc = CacheControl::ephemeral_org();
+        let json = serde_json::to_value(&cc).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "ephemeral", "scope": "org"})
+        );
+    }
+
+    #[test]
+    fn cache_control_wire_shape_unscoped_omits_scope() {
+        let cc = CacheControl::ephemeral_unscoped();
+        let json = serde_json::to_value(&cc).expect("serialize");
+        assert_eq!(json, serde_json::json!({"type": "ephemeral"}));
     }
 }
