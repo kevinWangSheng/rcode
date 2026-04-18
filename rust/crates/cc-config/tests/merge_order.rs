@@ -53,7 +53,10 @@ fn local_overrides_project_overrides_global() {
     let project = load_one(&project_path);
     let local = load_one(&local_path);
 
-    let merged = global.merge(project).merge(local);
+    let merged = global
+        .merge(project)
+        .and_then(|m| m.merge(local))
+        .expect("merge ok in test");
 
     // Local model wins.
     assert_eq!(merged.model.as_deref(), Some("local-model"));
@@ -84,6 +87,7 @@ fn missing_layers_fall_through_to_lower_layer() {
     let merged = global
         .clone()
         .merge(Settings::default())
-        .merge(Settings::default());
+        .and_then(|m| m.merge(Settings::default()))
+        .expect("merge ok in test");
     assert_eq!(merged.model.as_deref(), Some("only-global"));
 }

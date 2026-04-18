@@ -18,6 +18,87 @@ pub struct CacheControl {
     pub scope: Option<String>, // "global" | "org"
 }
 
+impl CacheControl {
+    /// Ephemeral block with the `global` cache scope. Use for static prompt
+    /// blocks (e.g. the main instruction / tool-description block) that are
+    /// bit-identical across every invocation of the CLI. Global is the
+    /// longest-lived tier.
+    pub fn ephemeral_global() -> Self {
+        Self {
+            kind: "ephemeral".into(),
+            scope: Some("global".into()),
+        }
+    }
+
+    /// Ephemeral block with the `org` cache scope. Use for per-session
+    /// dynamic blocks (git context, memory files, per-project settings)
+    /// that vary across users but stay stable within one org / session.
+    pub fn ephemeral_org() -> Self {
+        Self {
+            kind: "ephemeral".into(),
+            scope: Some("org".into()),
+        }
+    }
+
+    /// Ephemeral block with no explicit scope — the server falls back to
+    /// its default (effectively session-local) tier. Provided for parity
+    /// with the wire format; new call sites should prefer `ephemeral_global`
+    /// or `ephemeral_org`.
+    pub fn ephemeral_unscoped() -> Self {
+        Self {
+            kind: "ephemeral".into(),
+            scope: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_control_tests {
+    use super::CacheControl;
+
+    #[test]
+    fn ephemeral_global_sets_scope_global() {
+        let c = CacheControl::ephemeral_global();
+        assert_eq!(c.kind, "ephemeral");
+        assert_eq!(c.scope.as_deref(), Some("global"));
+    }
+
+    #[test]
+    fn ephemeral_org_sets_scope_org() {
+        let c = CacheControl::ephemeral_org();
+        assert_eq!(c.kind, "ephemeral");
+        assert_eq!(c.scope.as_deref(), Some("org"));
+    }
+
+    #[test]
+    fn ephemeral_unscoped_leaves_scope_none() {
+        let c = CacheControl::ephemeral_unscoped();
+        assert_eq!(c.kind, "ephemeral");
+        assert_eq!(c.scope, None);
+    }
+
+    #[test]
+    fn serializes_without_scope_when_unscoped() {
+        let c = CacheControl::ephemeral_unscoped();
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#"{"type":"ephemeral"}"#);
+    }
+
+    #[test]
+    fn serializes_with_scope_when_global() {
+        let c = CacheControl::ephemeral_global();
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#"{"type":"ephemeral","scope":"global"}"#);
+    }
+
+    #[test]
+    fn serializes_with_scope_when_org() {
+        let c = CacheControl::ephemeral_org();
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, r#"{"type":"ephemeral","scope":"org"}"#);
+    }
+}
+
 // ── Content Blocks ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -535,54 +535,65 @@ async fn fire_session_end(hook_runner: &HookRunner, session_id: &str) {
 }
 
 async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBlock> {
+    // Three-tier cache scheme per RUST_REWRITE_PLAN §3:
+    //   attribution → uncached (no cache_control)
+    //   static instruction → ephemeral(global)  [lives across sessions + users]
+    //   git / memory / dynamic → ephemeral(org) [lives within one org session]
+    //
+    // Without these scopes every turn retransmits the full system prompt —
+    // a silent cost multiplier in production. The regression test in
+    // `cc/tests/cache_control_scope.rs` pins the tagging.
     let mut blocks = Vec::new();
 
-    // Static attribution block
+    // Uncached attribution preamble. Short, identifies who's calling.
     blocks.push(SystemBlock {
         kind: "text".into(),
-        text: format!(
-            "You are Claude Code, an AI assistant for software engineering tasks. \
-             Model: {model}. \
-             You have access to tools for reading/writing files, running shell commands, \
-             searching code, and more."
-        ),
-        cache_control: Some(cc_core::CacheControl {
-            kind: "ephemeral".into(),
-            scope: None,
-        }),
+        text: format!("You are Claude Code. Model: {model}."),
+        cache_control: None,
     });
 
-    // Git context
+    // Static instruction block — tool descriptions + operating guidance.
+    // Bit-identical across invocations of the same binary, so goes in
+    // the longest-lived tier (global).
+    blocks.push(SystemBlock {
+        kind: "text".into(),
+        text: "You are an AI assistant for software engineering tasks. \
+               You have access to tools for reading/writing files, running shell commands, \
+               searching code, and more."
+            .into(),
+        cache_control: Some(cc_core::CacheControl::ephemeral_global()),
+    });
+
+    // Git context — changes per working copy / branch, so org-scoped.
     let cwd = std::env::current_dir().unwrap_or_default();
     let git_ctx = cc_git::GitContext::collect(&cwd).await;
     if let Some(git_text) = git_ctx.to_system_text() {
         blocks.push(SystemBlock {
             kind: "text".into(),
             text: git_text,
-            cache_control: None,
+            cache_control: Some(cc_core::CacheControl::ephemeral_org()),
         });
     }
 
-    // Memory files
+    // Memory files — per-user `~/.claude/` + project CLAUDE.md. Dynamic
+    // but stable within a session; org tier is the right fit.
     let memories = cc_memory::load_memories();
     if let Some(mem_text) = cc_memory::memories_to_system_text(&memories) {
         blocks.push(SystemBlock {
             kind: "text".into(),
             text: mem_text,
-            cache_control: Some(cc_core::CacheControl {
-                kind: "ephemeral".into(),
-                scope: None,
-            }),
+            cache_control: Some(cc_core::CacheControl::ephemeral_org()),
         });
     }
 
-    // Additional working directories
+    // Additional working directories — per-invocation CLI flag, but
+    // still stable for the life of this session, so org tier.
     if !add_dirs.is_empty() {
         let dirs_text = add_dirs.iter().map(|d| format!("  - {d}")).collect::<Vec<_>>().join("\n");
         blocks.push(SystemBlock {
             kind: "text".into(),
             text: format!("Additional working directories available:\n{dirs_text}"),
-            cache_control: None,
+            cache_control: Some(cc_core::CacheControl::ephemeral_org()),
         });
     }
 

@@ -60,11 +60,27 @@ pub struct Settings {
 
 impl Settings {
     /// Merge `other` on top of `self` (other wins on conflicts).
-    pub fn merge(self, other: Settings) -> Settings {
-        let base = serde_json::to_value(self).unwrap_or(Value::Object(Default::default()));
-        let overlay = serde_json::to_value(other).unwrap_or(Value::Object(Default::default()));
-        let merged = merge_json(base, overlay);
-        serde_json::from_value(merged).unwrap_or_default()
+    ///
+    /// Returns `Err(CcError::Config)` if the two layers disagree on the JSON
+    /// shape of a field (e.g. base has an object, overlay has an array).
+    /// The former behaviour of silently letting the overlay flip types was
+    /// the M8 regression fixed by this method.
+    pub fn merge(self, other: Settings) -> Result<Settings, CcError> {
+        self.merge_labeled(other, "<base>", "<overlay>")
+    }
+
+    /// Labelled variant used when callers know the source file paths so
+    /// the error can name the two conflicting files.
+    pub fn merge_labeled(
+        self,
+        other: Settings,
+        base_label: &str,
+        overlay_label: &str,
+    ) -> Result<Settings, CcError> {
+        let base = serde_json::to_value(self)?;
+        let overlay = serde_json::to_value(other)?;
+        let merged = merge_json(base, overlay, base_label, overlay_label)?;
+        Ok(serde_json::from_value(merged)?)
     }
 }
 
@@ -180,29 +196,29 @@ pub fn discover_sources(
 }
 
 /// Merge all sources in priority order.
-pub fn merge_sources(sources: SettingsSources) -> Settings {
+pub fn merge_sources(sources: SettingsSources) -> Result<Settings, CcError> {
     let mut merged = Settings::default();
 
     if let Some(s) = sources.plugin_base {
-        merged = merged.merge(s);
+        merged = merged.merge_labeled(s, "<accumulated>", "plugin_base")?;
     }
     if let Some(s) = sources.user {
-        merged = merged.merge(s);
+        merged = merged.merge_labeled(s, "<accumulated>", "user")?;
     }
     if let Some(s) = sources.project {
-        merged = merged.merge(s);
+        merged = merged.merge_labeled(s, "<accumulated>", "project")?;
     }
     if let Some(s) = sources.local {
-        merged = merged.merge(s);
+        merged = merged.merge_labeled(s, "<accumulated>", "local")?;
     }
     if let Some(s) = sources.flag {
-        merged = merged.merge(s);
+        merged = merged.merge_labeled(s, "<accumulated>", "flag")?;
     }
     if let Some(s) = sources.policy {
-        merged = merged.merge(s);
+        merged = merged.merge_labeled(s, "<accumulated>", "policy")?;
     }
 
-    merged
+    Ok(merged)
 }
 
 /// Load and merge all settings for a project.
@@ -226,7 +242,7 @@ pub fn load_settings_with_override(
 
     let project = crate::project::ProjectContext::discover(cwd);
     let sources = discover_sources(&project, cli_override)?;
-    Ok(merge_sources(sources))
+    merge_sources(sources)
 }
 
 /// Resolved configuration — combines project context + merged settings.
@@ -253,7 +269,7 @@ impl ResolvedConfig {
         cli_settings_path: Option<&Path>,
     ) -> Result<Self, CcError> {
         let sources = discover_sources(&project, cli_settings_path)?;
-        let settings = merge_sources(sources);
+        let settings = merge_sources(sources)?;
         let model = resolve_model(cli_model, &settings);
         let raw =
             serde_json::to_value(&settings).unwrap_or(Value::Object(Default::default()));
@@ -286,7 +302,7 @@ mod tests {
             model: Some("claude-opus-4-6".into()),
             ..Default::default()
         };
-        let merged = base.merge(overlay);
+        let merged = base.merge(overlay).expect("merge ok in test");
         assert_eq!(merged.model.as_deref(), Some("claude-opus-4-6"));
     }
 
@@ -370,7 +386,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let merged = merge_sources(sources);
+        let merged = merge_sources(sources).expect("merge ok in test");
         // Policy is highest priority, so it wins.
         assert_eq!(merged.model.as_deref(), Some("policy-model"));
     }
@@ -406,7 +422,7 @@ mod tests {
             flag: None,
             policy: None,
         };
-        let merged = merge_sources(sources);
+        let merged = merge_sources(sources).expect("merge ok in test");
         assert_eq!(merged.model.as_deref(), Some("local-model"));
     }
 
@@ -423,7 +439,7 @@ mod tests {
             flag: None,
             policy: None,
         };
-        let merged = merge_sources(sources);
+        let merged = merge_sources(sources).expect("merge ok in test");
         assert!(merged.extra.contains_key("customUserField"));
         assert!(merged.extra.contains_key("customProjectField"));
     }
@@ -464,7 +480,7 @@ mod tests {
         let sources = discover_sources(&project, None).unwrap();
         // Project and local should be loaded
         assert!(sources.project.is_some() || sources.local.is_some());
-        let merged = merge_sources(sources);
+        let merged = merge_sources(sources).expect("merge ok in test");
         // Local overrides project
         assert_eq!(merged.model.as_deref(), Some("from-local"));
     }
