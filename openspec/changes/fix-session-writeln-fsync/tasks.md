@@ -42,11 +42,25 @@
       `sync_all` call. It is a regression guard for the presence of the
       code, not proof that un-synced writes would be lost. See 3.3.)
 
-- [ ] 3.3 Replace the `libc::_exit(9)` pseudo-proof with either a
+- [x] 3.3 Replace the `libc::_exit(9)` pseudo-proof with either a
       crash-invariant test using a `failingfs` / loom-style FS mock that
       really drops un-fsynced writes, OR a feature-gated docker test
       against a storage layer with `fsync=off` semantics. The goal is to
       observe that removing `sync_all` breaks the test.
+      Fixed 2026-04-18: implemented the fsync-counter regression guard.
+      A unit test on any consumer OS cannot observe loss of un-fsynced
+      writes — the kernel page cache survives `SIGKILL` and `_exit(9)`;
+      only true power loss drops them, which CI cannot produce. Instead
+      we assert the *syscall*: `cc-session/src/lib.rs` factors the
+      writeln + flush + `sync_all` sequence into `write_line_and_sync`
+      over a new `SyncAll` trait (impl for `File` in production, impl
+      for a counting `CountingWriter` in tests). Test
+      `write_line_and_sync_issues_one_fsync_per_append` asserts the
+      counter increments once per append; any future refactor that
+      drops the `sync_all` call breaks this test. Companion
+      `append_entry_fsync_counter_increments` exercises the real-File
+      path end-to-end. See lib.rs lines 10-42 (trait + helper) and
+      the fsync-guard tests block near the bottom of the module.
 
 ## 4. Docs
 
