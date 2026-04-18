@@ -1,21 +1,47 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// How a hook's `command` is expressed in settings.json.
+///
+/// - `Argv([...])` is the preferred form and is spawned via
+///   `Command::new(argv[0]).args(&argv[1..])` with no intervening shell, so
+///   settings-sourced strings can never be reinterpreted as shell syntax.
+///   This eliminates an entire class of cmd-injection risk (H5) if a less
+///   trusted writer ever lands bytes in settings.json.
+/// - `Shell(String)` preserves the legacy single-string form for backwards
+///   compatibility. It runs through `bash -c`, but only when the hook entry
+///   also sets `unsafe_shell: true`. Without that opt-in, the runner rejects
+///   the hook at init time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HookCommand {
+    Argv(Vec<String>),
+    Shell(String),
+}
 
 /// A configured hook command.
-/// Uses `command: Option<String>` + `#[serde(flatten)]` to tolerate hooks with different
-/// schemas in the global settings file (e.g. TS-format plugin hooks that have no `command` field).
+/// Uses `command: Option<HookCommand>` + `#[serde(flatten)]` to tolerate hooks
+/// with different schemas in the global settings file (e.g. TS-format plugin
+/// hooks that have no `command` field).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookConfig {
-    /// Shell command to execute. None = entry is ignored (different hook format).
+    /// Command to execute. `None` = entry is ignored (different hook format).
+    /// Accepts either a string (shell form, requires `unsafe_shell: true`) or
+    /// an array of strings (argv form, preferred).
     #[serde(default)]
-    pub command: Option<String>,
+    pub command: Option<HookCommand>,
     /// Timeout in seconds (default: 600).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// Explicit opt-in to execute a string-form `command` through `bash -c`.
+    /// Defaults to false. Required whenever `command` is a plain string.
+    #[serde(default, rename = "unsafe_shell", alias = "unsafeShell")]
+    pub unsafe_shell: bool,
     /// Absorb unknown fields (e.g. TS plugin hooks with `hooks`, `matcher`, etc.).
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, Value>,
@@ -24,13 +50,31 @@ pub struct HookConfig {
 impl HookConfig {
     /// Return true only if this entry has an executable command.
     pub fn has_command(&self) -> bool {
-        self.command.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        match &self.command {
+            Some(HookCommand::Argv(argv)) => !argv.is_empty() && !argv[0].is_empty(),
+            Some(HookCommand::Shell(s)) => !s.is_empty(),
+            None => false,
+        }
     }
 }
 
 /// Settings hooks section — keyed by event name.
 /// e.g. `{ "PreToolUse": [{ "command": "my-hook.sh" }] }`
 pub type HooksConfig = std::collections::HashMap<String, Vec<HookConfig>>;
+
+/// Error returned by `HookRunner::new` when the loaded config fails validation.
+#[derive(Debug, Error)]
+pub enum HookInitError {
+    /// A hook entry uses the legacy string-form `command` without opting in via
+    /// `unsafe_shell: true`. The fields carry the event name and the offending
+    /// command string so the error points at the field path.
+    #[error(
+        "hook under event `{event}` uses string-form `command` (\"{command}\") \
+         without `unsafe_shell: true`; convert to argv array form \
+         (e.g. [\"bin\", \"arg\"]) or set `unsafe_shell: true` to opt in"
+    )]
+    ShellFormRequiresOptIn { event: String, command: String },
+}
 
 /// Outcome of running a hook.
 #[derive(Debug)]
@@ -78,8 +122,34 @@ pub struct HookRunner {
 }
 
 impl HookRunner {
-    pub fn new(config: HooksConfig) -> Self {
-        HookRunner { config }
+    /// Construct a runner from a parsed hooks config.
+    ///
+    /// Fails if any hook uses the legacy string-form `command` without
+    /// `unsafe_shell: true`. For each string-form entry that *did* opt in,
+    /// emits a `tracing::warn!` so users see the migration path.
+    pub fn new(config: HooksConfig) -> Result<Self, HookInitError> {
+        for (event, entries) in &config {
+            for hook in entries {
+                if let Some(HookCommand::Shell(s)) = &hook.command {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if !hook.unsafe_shell {
+                        return Err(HookInitError::ShellFormRequiresOptIn {
+                            event: event.clone(),
+                            command: s.clone(),
+                        });
+                    }
+                    warn!(
+                        event = %event,
+                        command = %s,
+                        "hook uses legacy shell form (`unsafe_shell: true`); \
+                         migrate to argv array form, e.g. [\"bin\", \"arg\"]"
+                    );
+                }
+            }
+        }
+        Ok(HookRunner { config })
     }
 
     pub fn empty() -> Self {
@@ -107,14 +177,21 @@ impl HookRunner {
         };
 
         for hook in hooks {
-            // Skip hooks without a command (e.g. TS plugin-format hooks in global settings)
-            let command = match hook.command.as_deref() {
-                Some(c) if !c.is_empty() => c.to_string(),
+            // Skip hooks without a runnable command. String-form without opt-in
+            // is already rejected at runner init, so by the time we get here
+            // any shell-form entry has `unsafe_shell == true`.
+            let command = match hook.command.as_ref() {
+                Some(HookCommand::Argv(argv)) if !argv.is_empty() && !argv[0].is_empty() => {
+                    HookCommand::Argv(argv.clone())
+                }
+                Some(HookCommand::Shell(s)) if !s.is_empty() && hook.unsafe_shell => {
+                    HookCommand::Shell(s.clone())
+                }
                 _ => continue,
             };
 
             let timeout_secs = hook.timeout.unwrap_or(600);
-            debug!("running hook command: {command} (event={event})");
+            debug!("running hook command: {command:?} (event={event})");
 
             let result = tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
@@ -126,7 +203,7 @@ impl HookRunner {
                 Err(_) => {
                     return HookOutcome::failed(
                         "timeout",
-                        format!("hook timed out after {timeout_secs}s: {command}"),
+                        format!("hook timed out after {timeout_secs}s: {command:?}"),
                     );
                 }
                 Ok(Err(outcome)) => {
@@ -139,7 +216,7 @@ impl HookRunner {
                     }
                     // Any other non-zero is non-blocking (logged, not blocking)
                     if exit_code != 0 {
-                        debug!("hook exited {exit_code}: {command}");
+                        debug!("hook exited {exit_code}: {command:?}");
                     }
                 }
             }
@@ -150,12 +227,25 @@ impl HookRunner {
 }
 
 async fn run_hook_command(
-    command: &str,
+    command: &HookCommand,
     stdin_data: &str,
 ) -> Result<(i32, String, String), HookOutcome> {
-    let mut child = Command::new("bash")
-        .arg("-c")
-        .arg(command)
+    let mut cmd = match command {
+        HookCommand::Argv(argv) => {
+            // argv form: spawn directly — no shell interprets settings bytes.
+            let mut c = Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        }
+        HookCommand::Shell(s) => {
+            // Legacy shell form, only reachable when `unsafe_shell: true`.
+            let mut c = Command::new("bash");
+            c.arg("-c").arg(s);
+            c
+        }
+    };
+
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -211,12 +301,25 @@ mod tests {
     }
 
     #[test]
-    fn direct_command_hook_is_detected() {
+    fn direct_string_command_hook_is_detected() {
         let json = r#"{"command":"my-hook.sh","timeout":30}"#;
         let cfg: HookConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.has_command());
-        assert_eq!(cfg.command.as_deref(), Some("my-hook.sh"));
+        assert!(matches!(cfg.command, Some(HookCommand::Shell(ref s)) if s == "my-hook.sh"));
         assert_eq!(cfg.timeout, Some(30));
+    }
+
+    #[test]
+    fn argv_command_hook_is_detected() {
+        let json = r#"{"command":["/bin/echo","hi"]}"#;
+        let cfg: HookConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.has_command());
+        match cfg.command {
+            Some(HookCommand::Argv(ref argv)) => {
+                assert_eq!(argv, &["/bin/echo", "hi"]);
+            }
+            _ => panic!("expected argv form"),
+        }
     }
 
     #[test]
@@ -225,7 +328,7 @@ mod tests {
         let json = r#"{
             "PreToolUse": [
                 {"hooks":[{"async":true,"command":"node notify.js","type":"command"}]},
-                {"command":"my-pre-hook.sh"}
+                {"command":"my-pre-hook.sh","unsafe_shell":true}
             ]
         }"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
@@ -234,6 +337,71 @@ mod tests {
         assert!(!pre[0].has_command(), "TS-format entry should be skipped");
         assert!(pre[1].has_command(), "direct command entry should be kept");
     }
+
+    // --- Proposal: fix-hook-command-injection ---
+
+    #[tokio::test]
+    async fn argv_hook_runs_without_shell() {
+        // 4.1: array-form unit test — `/bin/echo hello` runs and returns cleanly.
+        let json = r#"{"PreToolUse":[{"command":["/bin/echo","hello"]}]}"#;
+        let cfg: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(cfg).expect("argv form must not require opt-in");
+
+        let input = HookInput {
+            event: "PreToolUse",
+            tool_name: "Bash",
+            tool_input: &json!({}),
+            session_id: None,
+        };
+        let outcome = runner.run("PreToolUse", &input).await;
+        match outcome {
+            HookOutcome::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_form_without_opt_in_is_rejected_at_init() {
+        // 4.2: string-without-flag unit test — HookRunner::new rejects it with
+        // a clear error pointing at the field path.
+        let json = r#"{"PreToolUse":[{"command":"echo shouldfail"}]}"#;
+        let cfg: HooksConfig = serde_json::from_str(json).unwrap();
+        let err = HookRunner::new(cfg).expect_err("string form without flag must be rejected");
+        let msg = err.to_string();
+        match err {
+            HookInitError::ShellFormRequiresOptIn { event, command } => {
+                assert_eq!(event, "PreToolUse");
+                assert_eq!(command, "echo shouldfail");
+            }
+        }
+        assert!(
+            msg.contains("unsafe_shell"),
+            "error must mention the opt-in field: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn string_form_with_opt_in_still_runs() {
+        // 4.3: string-with-flag unit test — legacy `bash -c` path still works
+        // when `unsafe_shell: true` is set.
+        let json = r#"{"PreToolUse":[{"command":"exit 0","unsafe_shell":true}]}"#;
+        let cfg: HooksConfig = serde_json::from_str(json).unwrap();
+        let runner = HookRunner::new(cfg).expect("opt-in string form must load");
+
+        let input = HookInput {
+            event: "PreToolUse",
+            tool_name: "Bash",
+            tool_input: &json!({}),
+            session_id: None,
+        };
+        let outcome = runner.run("PreToolUse", &input).await;
+        match outcome {
+            HookOutcome::Ok => {}
+            other => panic!("expected Ok from opt-in shell hook, got {other:?}"),
+        }
+    }
+
+    // --- Proposal: fix-hook-stdin-error-propagation (kept post command-injection refactor) ---
 
     #[tokio::test]
     async fn stdin_write_failure_surfaces_as_structured_failed() {
@@ -244,9 +412,9 @@ mod tests {
         //
         // 256 KiB is well over the typical 64 KiB PIPE_BUF on macOS/Linux.
         let big_tool_input = json!({ "pad": "x".repeat(256 * 1024) });
-        let json = r#"{"PreToolUse":[{"command":"exec </dev/null; sleep 0"}]}"#;
+        let json = r#"{"PreToolUse":[{"command":"exec </dev/null; sleep 0","unsafe_shell":true}]}"#;
         let cfg: HooksConfig = serde_json::from_str(json).unwrap();
-        let runner = HookRunner::new(cfg);
+        let runner = HookRunner::new(cfg).expect("opt-in shell hook must load");
 
         let input = HookInput {
             event: "PreToolUse",

@@ -155,7 +155,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         serde_json::from_value(hooks_raw).unwrap_or_default()
     };
-    let hook_runner = HookRunner::new(hooks_config);
+    let hook_runner = match HookRunner::new(hooks_config) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(format!("invalid hook configuration: {e}").into());
+        }
+    };
 
     // Build tools
     let tools = default_tools();
