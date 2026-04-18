@@ -402,9 +402,7 @@ mod tests {
                 )
                 .await;
             if let Ok(tr) = r {
-                if tr.is_error
-                    && tr.content.contains("file changed on disk since last read")
-                {
+                if tr.is_error && tr.content.contains("file changed on disk since last read") {
                     saw_lost_update = true;
                     break;
                 }
@@ -503,7 +501,11 @@ mod tests {
             .env(CRASH_CHILD_ENV, &target)
             // Run ONLY the child entry-point test, single-threaded, to
             // avoid test harness interference.
-            .args(["--test-threads=1", "--exact", "edit::tests::crash_child_entry_point"])
+            .args([
+                "--test-threads=1",
+                "--exact",
+                "edit::tests::crash_child_entry_point",
+            ])
             .output()
             .expect("spawn child");
 
