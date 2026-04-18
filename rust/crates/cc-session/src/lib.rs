@@ -206,14 +206,26 @@ fn load_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
 
+    // Transcripts are append-only and crash-fragile: a process killed mid-
+    // write can leave a half-flushed final line. Matching `load_ts_transcript`,
+    // we skip unparseable lines with a warning rather than abort the resume —
+    // a partial history is strictly better than no history.
     for (line_num, line) in reader.lines().enumerate() {
         let line = line
             .map_err(|e| CcError::io(format!("failed to read transcript line {line_num}: {e}")))?;
         if line.trim().is_empty() {
             continue;
         }
-        let entry: TranscriptEntry = serde_json::from_str(&line).map_err(CcError::Json)?;
-        messages.push(entry.message);
+        match serde_json::from_str::<TranscriptEntry>(&line) {
+            Ok(entry) => messages.push(entry.message),
+            Err(e) => {
+                tracing::warn!(
+                    "skipping malformed transcript line {} in {}: {e}",
+                    line_num + 1,
+                    path.display()
+                );
+            }
+        }
     }
 
     Ok(messages)
@@ -461,5 +473,44 @@ mod tests {
         session.append(&MessageParam::user("two")).unwrap();
         let loaded = session.load_messages().unwrap();
         assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn native_transcript_tolerates_malformed_tail() {
+        // Simulates a process that crashed mid-write: two clean entries
+        // followed by a partial/invalid tail line. The old behavior failed
+        // the whole load; the robust loader skips the bad line and keeps
+        // the rest so the user's session can still resume.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"message":{{"role":"user","content":"first"}},"timestamp":"2026-04-17T00:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"message":{{"role":"assistant","content":"second"}},"timestamp":"2026-04-17T00:00:01Z"}}"#
+        )
+        .unwrap();
+        // Partial / invalid JSON — crashed mid-flush.
+        writeln!(f, "{{\"message\":{{\"role\":\"user\",\"content\":\"# broken trailing line").unwrap();
+        // Another bit of noise for good measure.
+        writeln!(f, "not json").unwrap();
+
+        let messages = load_transcript(&path).unwrap();
+        assert_eq!(messages.len(), 2, "valid prefix must survive a bad tail");
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn native_transcript_empty_file_returns_no_messages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        File::create(&path).unwrap();
+        let messages = load_transcript(&path).unwrap();
+        assert!(messages.is_empty());
     }
 }
