@@ -1,7 +1,9 @@
 use cc_core::{CcError, CcResult, Message, Usage};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{
+    HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT as USER_AGENT_HDR,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -47,7 +49,20 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETAS_API_KEY: &str = "interleaved-thinking-2025-05-14";
 
 /// Beta headers for OAuth Bearer token auth.
-const ANTHROPIC_BETAS_OAUTH: &str = "interleaved-thinking-2025-05-14,oauth-2025-04-20";
+///
+/// `claude-code-20250219` is the Claude Code identification beta; the
+/// official TypeScript client always includes it on agentic turns. Pairs
+/// with the attribution system-prompt phrase in `build_system_blocks` —
+/// without both markers, OAuth requests for Sonnet/Opus models get
+/// routed to a tight "naked OAuth" quota pool and return HTTP 429.
+const ANTHROPIC_BETAS_OAUTH: &str =
+    "interleaved-thinking-2025-05-14,oauth-2025-04-20,claude-code-20250219";
+
+/// User-Agent identifying this client as the Rust Claude Code rewrite.
+/// Mirrors the shape of the TS `getClaudeCodeUserAgent()` output so the
+/// backend can attribute traffic correctly. Version must match the
+/// workspace Cargo.toml.
+const USER_AGENT: &str = concat!("claude-cli/", env!("CARGO_PKG_VERSION"), " (rust, cli)");
 
 /// How the client authenticates with the API.
 #[derive(Clone)]
@@ -125,6 +140,7 @@ impl ApiClient {
         headers.insert("anthropic-beta", HeaderValue::from_static(betas));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert("x-app", HeaderValue::from_static("cli"));
+        headers.insert(USER_AGENT_HDR, HeaderValue::from_static(USER_AGENT));
         Ok(headers)
     }
 

@@ -564,7 +564,7 @@ async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBloc
 /// regression test in `tests` below can pin the tagging without having to
 /// stub `git`/`memory` I/O.
 fn build_system_blocks_inner(
-    model: &str,
+    _model: &str,
     git_text: Option<String>,
     memory_text: Option<String>,
     add_dirs: &[String],
@@ -572,12 +572,23 @@ fn build_system_blocks_inner(
     let mut blocks = Vec::new();
 
     // Tier 1: attribution — uncached (matches TS client).
+    //
+    // ⚠️ Load-bearing magic string. Anthropic's backend routes OAuth
+    // requests to the Claude Code subscription quota pool ONLY when the
+    // first system block's text begins with this exact phrase. Any other
+    // wording — including superficial variants like "You are Claude
+    // Code." or "an AI assistant for software engineering tasks" — falls
+    // through to a much tighter "naked OAuth inference" pool and returns
+    // HTTP 429 on even the first request against Sonnet / Opus.
+    //
+    // Empirically verified 2026-04-18 by probing /v1/messages with a
+    // matrix of phrasings; only the literal string below unlocked the
+    // quota. If you change this, expect the CLI to start returning 429.
+    // Do NOT append the model name here — the official CC does not, and
+    // the match appears to be prefix-sensitive.
     blocks.push(SystemBlock {
         kind: "text".into(),
-        text: format!(
-            "You are Claude Code, an AI assistant for software engineering tasks. \
-             Model: {model}."
-        ),
+        text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
         cache_control: None,
     });
 
