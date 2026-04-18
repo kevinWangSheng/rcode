@@ -535,39 +535,51 @@ async fn fire_session_end(hook_runner: &HookRunner, session_id: &str) {
 }
 
 async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBlock> {
-    // Three-tier cache scheme per RUST_REWRITE_PLAN §3:
-    //   attribution → uncached (no cache_control)
-    //   static instruction → ephemeral(global)  [lives across sessions + users]
-    //   git / memory / dynamic → ephemeral(org) [lives within one org session]
-    //
-    // Without these scopes every turn retransmits the full system prompt —
-    // a silent cost multiplier in production. The regression test in
-    // `cc/tests/cache_control_scope.rs` pins the tagging.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let git_text = cc_git::GitContext::collect(&cwd).await.to_system_text();
+    let memory_text = cc_memory::memories_to_system_text(&cc_memory::load_memories());
+    build_system_blocks_inner(model, git_text, memory_text, add_dirs)
+}
+
+/// Three-tier system-prompt tagging per `RUST_REWRITE_PLAN.md` §3:
+///
+/// - attribution (tier 1 / uncached): no `cache_control`
+/// - static instruction (tier 2 / global cache): `ephemeral_global`
+/// - git / memory / dynamic (tier 3 / org cache): `ephemeral_org`
+///
+/// Block ordering is attribution → static → dynamic so the server caches
+/// them in the right tier. Factored out from the `async` wrapper so the
+/// regression test in `tests` below can pin the tagging without having to
+/// stub `git`/`memory` I/O.
+fn build_system_blocks_inner(
+    model: &str,
+    git_text: Option<String>,
+    memory_text: Option<String>,
+    add_dirs: &[String],
+) -> Vec<SystemBlock> {
     let mut blocks = Vec::new();
 
-    // Uncached attribution preamble. Short, identifies who's calling.
+    // Tier 1: attribution — uncached (matches TS client).
     blocks.push(SystemBlock {
         kind: "text".into(),
-        text: format!("You are Claude Code. Model: {model}."),
+        text: format!(
+            "You are Claude Code, an AI assistant for software engineering tasks. \
+             Model: {model}."
+        ),
         cache_control: None,
     });
 
-    // Static instruction block — tool descriptions + operating guidance.
-    // Bit-identical across invocations of the same binary, so goes in
-    // the longest-lived tier (global).
+    // Tier 2: static instruction — global cache.
     blocks.push(SystemBlock {
         kind: "text".into(),
-        text: "You are an AI assistant for software engineering tasks. \
-               You have access to tools for reading/writing files, running shell commands, \
+        text: "You have access to tools for reading/writing files, running shell commands, \
                searching code, and more."
-            .into(),
+            .to_string(),
         cache_control: Some(cc_core::CacheControl::ephemeral_global()),
     });
 
-    // Git context — changes per working copy / branch, so org-scoped.
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let git_ctx = cc_git::GitContext::collect(&cwd).await;
-    if let Some(git_text) = git_ctx.to_system_text() {
+    // Tier 3: dynamic blocks — org cache.
+    if let Some(git_text) = git_text {
         blocks.push(SystemBlock {
             kind: "text".into(),
             text: git_text,
@@ -575,10 +587,7 @@ async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBloc
         });
     }
 
-    // Memory files — per-user `~/.claude/` + project CLAUDE.md. Dynamic
-    // but stable within a session; org tier is the right fit.
-    let memories = cc_memory::load_memories();
-    if let Some(mem_text) = cc_memory::memories_to_system_text(&memories) {
+    if let Some(mem_text) = memory_text {
         blocks.push(SystemBlock {
             kind: "text".into(),
             text: mem_text,
@@ -586,10 +595,14 @@ async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBloc
         });
     }
 
-    // Additional working directories — per-invocation CLI flag, but
-    // still stable for the life of this session, so org tier.
+    // Additional working directories — per-invocation CLI flag, but still
+    // stable for the life of this session so also org-tier.
     if !add_dirs.is_empty() {
-        let dirs_text = add_dirs.iter().map(|d| format!("  - {d}")).collect::<Vec<_>>().join("\n");
+        let dirs_text = add_dirs
+            .iter()
+            .map(|d| format!("  - {d}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         blocks.push(SystemBlock {
             kind: "text".into(),
             text: format!("Additional working directories available:\n{dirs_text}"),
@@ -620,4 +633,87 @@ fn libc_isatty(fd: i32) -> bool {
     }
     // SAFETY: isatty(3) is a POSIX function taking a valid fd, returning 0 or 1.
     unsafe { isatty(fd) != 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cc_scope(block: &SystemBlock) -> Option<&str> {
+        block.cache_control.as_ref().and_then(|c| c.scope.as_deref())
+    }
+
+    fn cc_kind(block: &SystemBlock) -> Option<&str> {
+        block.cache_control.as_ref().map(|c| c.kind.as_str())
+    }
+
+    #[test]
+    fn three_tier_tagging_attribution_static_dynamic() {
+        let blocks = build_system_blocks_inner(
+            "claude-sonnet-4-6",
+            Some("## Git context\nbranch=main".into()),
+            Some("## Memory\n- remember foo".into()),
+            &[],
+        );
+
+        assert_eq!(blocks.len(), 4, "expected 4 blocks (attr + static + git + memory)");
+
+        // Block 0: attribution, no cache_control.
+        assert!(
+            blocks[0].cache_control.is_none(),
+            "attribution block must be uncached"
+        );
+        assert!(blocks[0].text.contains("Claude Code"));
+
+        // Block 1: static instruction → global cache.
+        assert_eq!(cc_kind(&blocks[1]), Some("ephemeral"));
+        assert_eq!(cc_scope(&blocks[1]), Some("global"));
+
+        // Block 2: git (dynamic) → org cache.
+        assert_eq!(cc_kind(&blocks[2]), Some("ephemeral"));
+        assert_eq!(cc_scope(&blocks[2]), Some("org"));
+
+        // Block 3: memory (dynamic) → org cache.
+        assert_eq!(cc_kind(&blocks[3]), Some("ephemeral"));
+        assert_eq!(cc_scope(&blocks[3]), Some("org"));
+    }
+
+    #[test]
+    fn three_tier_tagging_serialized_wire_shape() {
+        let blocks = build_system_blocks_inner(
+            "claude-sonnet-4-6",
+            None,
+            Some("mem".into()),
+            &[],
+        );
+        let wire = serde_json::to_value(&blocks).expect("serialize");
+
+        // Attribution block: no cache_control key at all (skip_serializing_if).
+        let attr = &wire[0];
+        assert_eq!(attr["type"], "text");
+        assert!(attr.get("cache_control").is_none());
+
+        // Static instruction block: global cache.
+        let static_blk = &wire[1];
+        assert_eq!(
+            static_blk["cache_control"],
+            json!({"type": "ephemeral", "scope": "global"})
+        );
+
+        // Memory block: org cache.
+        let mem_blk = &wire[2];
+        assert_eq!(
+            mem_blk["cache_control"],
+            json!({"type": "ephemeral", "scope": "org"})
+        );
+    }
+
+    #[test]
+    fn three_tier_tagging_handles_absent_dynamic_blocks() {
+        let blocks = build_system_blocks_inner("claude-sonnet-4-6", None, None, &[]);
+        assert_eq!(blocks.len(), 2, "attribution + static only");
+        assert!(blocks[0].cache_control.is_none());
+        assert_eq!(cc_scope(&blocks[1]), Some("global"));
+    }
 }

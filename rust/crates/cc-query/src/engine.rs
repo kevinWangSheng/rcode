@@ -42,6 +42,19 @@ impl Default for QueryOptions {
 }
 
 /// The main agentic query engine.
+///
+/// ## System-prompt cache-tier contract
+///
+/// Callers passing `system_blocks` to `QueryEngine::new` MUST already
+/// three-tier tag them per `RUST_REWRITE_PLAN.md` §3:
+///
+/// - attribution → `cache_control = None`
+/// - static instruction → `CacheControl::ephemeral_global()`
+/// - git / memory / dynamic → `CacheControl::ephemeral_org()`
+///
+/// The engine itself does not construct `SystemBlock`s; it forwards them as
+/// received. If the agent-runner memory path ever grows a block-emission
+/// site here, use `CacheControl::ephemeral_org()` for memory content.
 pub struct QueryEngine {
     api: ApiClient,
     tools: Arc<ToolRegistry>,

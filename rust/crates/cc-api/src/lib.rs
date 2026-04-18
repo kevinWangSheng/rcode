@@ -7,5 +7,8 @@ pub mod usage;
 pub use client::{ApiClient, AuthCredential, StreamDelta};
 pub use request::CreateMessageRequest;
 pub use retry::RetryPolicy;
-pub use stream::StreamEvent;
+pub use stream::{
+    ContentBlockDelta, ContentBlockStartData, MessageDeltaData, MessageDeltaUsage,
+    MessageStartData, StreamAccumulator, StreamEvent,
+};
 pub use usage::UsageTracker;
