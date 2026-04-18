@@ -18,15 +18,19 @@
 
 ## 3. Tests
 
-- [ ] 3.1 Deferred: a deterministic end-to-end test requires either
-      a synchronisation primitive between the parent and child (the
-      child must close stdin *before* the parent attempts the write)
-      or a megabyte-scale JSON to overflow the pipe buffer past the
-      child's reap. Both are awkward in a unit-test harness; the
-      `bash -c 'exec 0<&-; sleep 0.05'` one-liner suggested in the
-      proposal races against the parent's 1-shot write and was flaky
-      on fast hardware during prototyping. Leaving a real-world
-      stdin failure to be a manual-validated change.
+- [x] 3.1 Deterministic E2E test landed.
+      Fixed 2026-04-18: `tests::stdin_write_failure_surfaces_as_structured_failure`
+      in `cc-hooks/src/lib.rs`. The recipe uses the **pipe-buffer overflow**
+      approach rather than the synchronisation-primitive one — the child
+      runs `exec 0<&-; exit 0` (close stdin immediately) and the parent
+      tries to `write_all` a 2 MiB payload via `HookInput.message`. Because
+      2 MiB is well beyond any realistic kernel pipe buffer (macOS 16–64
+      KiB, Linux 64 KiB), the writer ends up blocked on `write_all`, at
+      which point the closed reader end forces `BrokenPipe`. No `sleep`s,
+      no races, no files — purely driven by the kernel pipe size.
+      The test asserts the failure is tagged with the `stdin_write:`
+      prefix and not interpreted as a block. Ran locally 5× back-to-back
+      with zero flakes.
 
 ## 4. Sign-off
 

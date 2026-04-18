@@ -1048,6 +1048,57 @@ mod tests {
         );
     }
 
+    // §3.1 fix-hook-stdin-error-propagation: deterministic E2E test that the
+    // parent's stdin `write_all` error surfaces as `HookOutcome::Failed` with a
+    // `stdin_write:` prefix. Earlier flaky attempts raced a small write against
+    // a hook that closed stdin, but on fast hardware the write often slipped
+    // into the kernel pipe buffer before the child exited, so no EPIPE ever
+    // fired. The deterministic fix: pick a hook command that `exec 0<&-`
+    // closes its own stdin *before* doing anything else, and ship a payload
+    // far larger than any plausible pipe buffer (macOS default ≈16–64 KiB,
+    // Linux ≈64 KiB). ~2 MiB guarantees the write saturates and blocks, at
+    // which point the closed reader forces a `BrokenPipe`.
+    #[tokio::test]
+    async fn stdin_write_failure_surfaces_as_structured_failure() {
+        // Hook closes stdin immediately, then exits 0. Because the reader end
+        // of the pipe is gone before the parent's multi-MiB write can drain,
+        // `write_all` MUST fail with BrokenPipe.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "exec 0<&-; exit 0", "unsafe_shell": true, "timeout": 10}]}]
+        }"#,
+        )
+        .unwrap();
+        let runner = HookRunner::new(&settings, reqwest::Client::new());
+        let mut input = test_input("PreToolUse");
+        // Stuff the serialized HookInput with a payload large enough to
+        // overflow any realistic pipe buffer (typically 16–64 KiB). 2 MiB
+        // removes all timing ambiguity on both macOS and Linux.
+        input.message = Some("x".repeat(2 * 1024 * 1024));
+        let cancel = CancellationToken::new();
+        let result = runner.run("PreToolUse", &input, &cancel).await;
+
+        // Not blocked — the child never got to make a semantic decision.
+        assert!(
+            !result.blocked,
+            "stdin_write failure must not be interpreted as block: {:?}",
+            result.block_message
+        );
+        // Exactly one failure, tagged with the structured `stdin_write:` prefix.
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "expected one failure, got {:?}",
+            result.failures
+        );
+        assert!(
+            result.failures[0].starts_with("stdin_write:"),
+            "failure must carry the `stdin_write:` prefix so callers can \
+             distinguish this from a generic hook error; got {:?}",
+            result.failures[0]
+        );
+    }
+
     #[tokio::test]
     async fn session_end_respects_tight_timeout() {
         // Hook sleeps 10s — session_end enforces 1.5s (or env override).
