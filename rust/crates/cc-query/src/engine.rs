@@ -225,8 +225,8 @@ impl QueryEngine {
             HookOutcome::Block(msg) => {
                 return tool_result_error(&tu.id, format!("Blocked by hook: {msg}"));
             }
-            HookOutcome::Failed(e) => {
-                debug!("PreToolUse hook failed (non-blocking): {e}");
+            HookOutcome::Failed { kind, detail } => {
+                debug!("PreToolUse hook failed (non-blocking) [{kind}]: {detail}");
             }
             HookOutcome::Ok => {}
         }
