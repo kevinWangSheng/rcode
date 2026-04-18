@@ -102,9 +102,139 @@ fn ac2_streaming_text_cleared_after_abort() {
     );
 }
 
-/// AC-2c: Abort-path state transitions are fast — 100 abort cycles in <<100ms.
-/// (Headless proxy for the ≤100ms latency requirement; the real latency is
-/// measured at the crossterm level in integration tests.)
+/// AC-2b: StreamDelta actions arriving after Abort are dropped. The engine
+/// may still emit in-flight deltas after the cancel token trips (network
+/// read loop is async), so the App must guard at the action boundary.
+#[test]
+fn ac2_tokens_dropped_after_abort() {
+    let mut app = App::new("s".into(), "m".into());
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+
+    app.start_stream();
+    update(&mut app, AppAction::StreamDelta("hello ".into()), &uctx);
+    update(&mut app, AppAction::StreamDelta("world".into()), &uctx);
+    assert_eq!(app.streaming_text, "hello world");
+
+    // Abort mid-stream.
+    update(&mut app, AppAction::Abort, &uctx);
+    assert_eq!(app.mode, AppMode::Input);
+
+    // These late deltas must be silently dropped.
+    update(&mut app, AppAction::StreamDelta("late1 ".into()), &uctx);
+    update(&mut app, AppAction::StreamDelta("late2".into()), &uctx);
+    assert!(
+        app.streaming_text.is_empty(),
+        "streaming_text must stay empty after abort; got '{}'",
+        app.streaming_text
+    );
+
+    // Transcript's last assistant entry still holds the pre-abort partial.
+    match app.transcript.last() {
+        Some(TranscriptItem::AssistantText(t)) => {
+            assert!(t.contains("hello world"), "pre-abort partial kept: {t}");
+            assert!(
+                !t.contains("late1"),
+                "post-abort tokens must not leak in: {t}"
+            );
+            assert!(
+                !t.contains("late2"),
+                "post-abort tokens must not leak in: {t}"
+            );
+        }
+        other => panic!("expected AssistantText with aborted marker, got {other:?}"),
+    }
+}
+
+/// AC-2c: End-to-end abort latency <100ms. Drives the full async event path
+/// (engine task sends deltas over an mpsc channel; event loop processes
+/// them + an Abort action). Measures wall-clock elapsed from the Abort
+/// action until the App returns to Input mode. The headless event loop is
+/// the production one minus crossterm I/O, so this is a real end-to-end
+/// latency number, not a state-transition microbenchmark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ac2_abort_latency_under_100ms_end_to_end() {
+    let (tx, mut rx) = mpsc::channel::<AppEvent>(128);
+    let mut app = App::new("s".into(), "m".into());
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+
+    // Engine: emit 400 tokens at 1ms — plenty of buffer so we can catch a
+    // slow-abort regression. Ends with TurnComplete so the channel closes
+    // cleanly if abort somehow fails to take effect.
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        for i in 0..400u64 {
+            if tx2
+                .send(AppEvent::StreamDelta(format!("tok{i} ")))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let _ = tx2
+            .send(AppEvent::TurnComplete {
+                usage: Usage::default(),
+            })
+            .await;
+    });
+
+    app.start_stream();
+
+    // Consume 5 tokens so we're mid-stream when abort fires.
+    for _ in 0..5 {
+        let ev = rx.recv().await.expect("channel alive");
+        if let AppEvent::StreamDelta(d) = ev {
+            update(&mut app, AppAction::StreamDelta(d), &uctx);
+        }
+    }
+
+    let abort_start = Instant::now();
+    update(&mut app, AppAction::Abort, &uctx);
+    let abort_elapsed = abort_start.elapsed();
+
+    assert_eq!(app.mode, AppMode::Input, "Abort must return to Input mode");
+    assert!(
+        abort_elapsed.as_millis() < 100,
+        "end-to-end Abort handling must take <100ms, got {abort_elapsed:?}"
+    );
+
+    // Drain any in-flight events until the engine task ends. All remaining
+    // StreamDeltas must be dropped by the AC-2b guard.
+    let drain_start = Instant::now();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            Ok(Some(AppEvent::StreamDelta(d))) => {
+                update(&mut app, AppAction::StreamDelta(d), &uctx);
+            }
+            Ok(Some(AppEvent::TurnComplete { usage })) => {
+                update(&mut app, AppAction::TurnComplete { usage }, &uctx);
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+        if drain_start.elapsed() > Duration::from_secs(2) {
+            panic!("drain stuck for >2s");
+        }
+    }
+
+    assert!(
+        app.streaming_text.is_empty(),
+        "post-abort streaming_text must be empty; late deltas must be dropped"
+    );
+}
+
+/// State-transition microbenchmark: 100 abort cycles in <100ms. Kept as a
+/// cheap regression guard distinct from the end-to-end latency test above.
 #[test]
 fn ac2_abort_state_transition_is_fast() {
     let start = Instant::now();

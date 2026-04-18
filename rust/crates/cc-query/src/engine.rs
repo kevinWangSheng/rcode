@@ -1,8 +1,11 @@
-use cc_api::{ApiClient, CreateMessageRequest, StreamDelta, UsageTracker};
+use cc_api::{
+    ApiClient, ContentBlockDelta, ContentBlockStartData, CreateMessageRequest, StreamAccumulator,
+    StreamEvent, UsageTracker,
+};
 use cc_core::{
-    AppEvent, CcError, CcResult, ContentBlock, MessageContent, MessageParam, PermissionBehavior,
-    PermissionPrompter, PromptDecision, Role, StopReason, SystemBlock, ToolResultBlock,
-    ToolUseBlock,
+    AppEvent, CcError, CcResult, ContentBlock, Message, MessageContent, MessageParam,
+    PermissionBehavior, PermissionPrompter, PromptDecision, Role, StopReason, SystemBlock,
+    ToolResultBlock, ToolUseBlock, Usage,
 };
 use cc_hooks::{HookInput, HookRunner};
 use cc_permissions::PermissionEngine;
@@ -177,42 +180,98 @@ impl QueryEngine {
                 req = req.with_tools(tool_defs.clone());
             }
 
-            // 4. Stream response
+            // 4. Stream response.
+            //
+            // We consume the raw `StreamEvent` receiver directly (not
+            // `ApiClient::complete_message`) so we can forward user-visible
+            // deltas to `events_tx` with `.send().await`. Using async send
+            // propagates TUI backpressure upstream instead of silently
+            // dropping events under load (C3 regression guard in
+            // `openspec/AUDIT-phase3.md`; see also
+            // `cc_query::events::forward_stream_events`).
             let mut text_buf = String::new();
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
 
-            let events_tx = self.events_tx.clone();
-            let (message, usage) = self
-                .api
-                .complete_message(
-                    req,
-                    |delta| match &delta {
-                        StreamDelta::Text(ref text) => {
+            let (message, usage) = {
+                let mut rx = self.api.stream_message(req, cancel).await?;
+                let mut acc = StreamAccumulator::default();
+
+                while let Some(item) = rx.recv().await {
+                    let event = item?;
+                    // Forward user-visible events to the TUI with backpressure.
+                    match &event {
+                        StreamEvent::ContentBlockDelta {
+                            delta: ContentBlockDelta::TextDelta { text },
+                            ..
+                        } => {
                             text_buf.push_str(text);
                             on_text(text);
-                            if let Some(tx) = &events_tx {
-                                let _ = tx.try_send(AppEvent::StreamDelta(text.clone()));
+                            if let Some(tx) = &self.events_tx {
+                                if tx.send(AppEvent::StreamDelta(text.clone())).await.is_err() {
+                                    // Consumer dropped — stop streaming and
+                                    // treat as a cancellation.
+                                    cancel.cancel();
+                                }
                             }
                         }
-                        StreamDelta::Thinking(ref thinking) => {
-                            if let Some(tx) = &events_tx {
-                                let _ = tx.try_send(AppEvent::StreamThinking(thinking.clone()));
+                        StreamEvent::ContentBlockDelta {
+                            delta: ContentBlockDelta::ThinkingDelta { thinking },
+                            ..
+                        } => {
+                            if let Some(tx) = &self.events_tx {
+                                if tx
+                                    .send(AppEvent::StreamThinking(thinking.clone()))
+                                    .await
+                                    .is_err()
+                                {
+                                    cancel.cancel();
+                                }
                             }
                         }
-                        StreamDelta::ToolUseStart { id, name } => {
-                            if let Some(tx) = &events_tx {
-                                let _ = tx.try_send(AppEvent::StreamToolUse(ToolUseBlock {
+                        StreamEvent::ContentBlockStart {
+                            content_block: ContentBlockStartData::ToolUse { id, name, input },
+                            ..
+                        } => {
+                            if let Some(tx) = &self.events_tx {
+                                let tu = ToolUseBlock {
                                     id: id.clone(),
                                     name: name.clone(),
-                                    input: Value::Null,
-                                }));
+                                    input: input.clone(),
+                                };
+                                if tx.send(AppEvent::StreamToolUse(tu)).await.is_err() {
+                                    cancel.cancel();
+                                }
                             }
                         }
-                        StreamDelta::InputJsonDelta(_) => {}
-                    },
-                    cancel,
-                )
-                .await?;
+                        _ => {}
+                    }
+                    acc.apply(&event);
+                }
+
+                let id = acc.message_id.clone();
+                let model = acc.model.clone();
+                let stop_reason = acc.stop_reason;
+                let usage = Usage {
+                    input_tokens: acc.input_tokens,
+                    output_tokens: acc.output_tokens,
+                    cache_creation_input_tokens: acc.cache_creation_input_tokens,
+                    cache_read_input_tokens: acc.cache_read_input_tokens,
+                };
+                let content = acc
+                    .into_content()
+                    .map_err(|e| CcError::api(format!("stream accumulator: {e}")))?;
+                let message = Message {
+                    id,
+                    kind: "message".into(),
+                    role: Role::Assistant,
+                    content,
+                    model,
+                    stop_reason,
+                    stop_sequence: None,
+                    usage: usage.clone(),
+                };
+                (message, usage)
+            };
 
             // §4 contract: if streaming was interrupted (cancel fired), save partial
             // text with interrupt marker before propagating cancellation.

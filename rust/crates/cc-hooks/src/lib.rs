@@ -454,10 +454,7 @@ async fn run_prepared_hook(
     // its input was truncated. Surface the structured cause regardless of
     // what exit code the child chose.
     if let Some(err) = stdin_err {
-        return (
-            HookOutcome::Failed(format!("stdin_write: {err}")),
-            None,
-        );
+        return (HookOutcome::Failed(format!("stdin_write: {err}")), None);
     }
 
     let exit_code = output.status.code().unwrap_or(-1);
@@ -733,10 +730,7 @@ mod tests {
         // Must record as failure so the caller can surface the gate.
         assert!(!result.blocked);
         assert!(
-            result
-                .failures
-                .iter()
-                .any(|f| f.contains("unsafe_shell")),
+            result.failures.iter().any(|f| f.contains("unsafe_shell")),
             "expected an unsafe_shell failure, got {:?}",
             result.failures
         );

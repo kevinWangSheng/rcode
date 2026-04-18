@@ -178,7 +178,13 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             app.scroll = 0;
         }
         AppAction::StreamDelta(delta) => {
-            app.on_token(&delta);
+            // AC-2b: tokens arriving after Abort must be dropped. The engine
+            // may still deliver in-flight deltas after cancellation (the
+            // network read loop is async), so guard at the action boundary
+            // rather than relying on the engine to stop emitting instantly.
+            if app.mode == AppMode::Streaming {
+                app.on_token(&delta);
+            }
         }
         AppAction::ToolStart {
             name,
