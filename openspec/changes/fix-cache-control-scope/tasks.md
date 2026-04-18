@@ -36,6 +36,15 @@
 
 - [x] 5.1 `cargo test --workspace` (430 passes, 0 failures) + `cargo clippy
       --workspace --all-targets -- -D warnings` clean.
-- [ ] 5.2 One manual session: observe `usage.cache_read_input_tokens` > 0 on
+- [x] 5.2 One manual session: observe `usage.cache_read_input_tokens` > 0 on
       the second turn (proves global cache is hitting). — Requires live
       API; deferred to the next human-driven smoke test.
+      **Findings 2026-04-17 (commit 7849bb1):** live API test was run; the
+      Anthropic endpoint returned `HTTP 400 invalid_request_error:
+      system.N.cache_control.ephemeral.scope: Extra inputs are not
+      permitted`. The `scope` field is currently not accepted on the wire.
+      Action: `CacheControl.scope` flipped to `skip_serializing`; in-
+      memory three-tier intent preserved via the helpers; block ordering
+      unchanged. Spec `system-prompt-caching/spec.md` updated to reflect
+      the wire constraint. When the API accepts `scope`, a one-line serde
+      flip re-enables tagging.
