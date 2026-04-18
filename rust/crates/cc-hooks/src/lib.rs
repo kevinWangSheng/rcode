@@ -67,6 +67,11 @@ pub struct HookRunner {
 impl HookRunner {
     /// Snapshot the config at session start (prevents race with settings changes).
     pub fn new(settings: &HooksSettings, http: reqwest::Client) -> Self {
+        // §3.1 fix-hook-command-injection: emit a single startup summary of
+        // every `unsafe_shell: true` hook currently loaded. Per-hook failures
+        // already fire at invocation time; this summary gives an operator one
+        // consolidated place to audit the opt-in shell surface at session start.
+        log_unsafe_shell_summary(settings);
         Self {
             config_snapshot: settings.clone(),
             session_hooks: RwLock::new(HooksSettings::new()),
@@ -542,6 +547,60 @@ async fn run_http_hook(
     HookOutcome::Ok
 }
 
+/// Emit one consolidated WARN at session start summarising every hook
+/// configured with a string-form `command` + `unsafe_shell: true`. This is a
+/// follow-up to fix-hook-command-injection §3.1: per-invocation failures are
+/// loud but per-startup visibility makes the shell-injection surface easy to
+/// audit without digging through invocation logs. Fires exactly once per
+/// `HookRunner::new` call; truncates to the first 10 entries to keep logs
+/// readable if someone has dozens of legacy hooks.
+fn log_unsafe_shell_summary(settings: &HooksSettings) {
+    const MAX_ENTRIES: usize = 10;
+    let mut entries: Vec<String> = Vec::new();
+    let mut total: usize = 0;
+    for (event, groups) in settings.iter() {
+        for group in groups {
+            for hook in &group.hooks {
+                let is_shell_unsafe = matches!(
+                    hook.command.as_ref(),
+                    Some(cc_core::hook::HookCommand::Shell(_))
+                ) && hook.unsafe_shell;
+                if !is_shell_unsafe {
+                    continue;
+                }
+                total += 1;
+                if entries.len() < MAX_ENTRIES {
+                    let preview = hook
+                        .command
+                        .as_ref()
+                        .map(|c| c.preview())
+                        .unwrap_or_default();
+                    // Trim overly long commands so a single huge one-liner
+                    // doesn't blow up the log line.
+                    let preview = if preview.len() > 120 {
+                        format!("{}…", &preview[..120])
+                    } else {
+                        preview
+                    };
+                    entries.push(format!("{event}:{preview}"));
+                }
+            }
+        }
+    }
+    if total == 0 {
+        return;
+    }
+    let listed = entries.join(", ");
+    let overflow = total.saturating_sub(entries.len());
+    if overflow > 0 {
+        warn!(
+            "[hooks] {total} string-form command(s) using unsafe_shell=true: [{listed}, and {overflow} more]"
+        );
+    } else {
+        warn!("[hooks] {total} string-form command(s) using unsafe_shell=true: [{listed}]");
+    }
+}
+
 /// Build a deduplication key for a hook config.
 fn hook_key(h: &HookConfig) -> HookKey {
     // For dedup purposes collapse both HookCommand variants into a stable
@@ -918,6 +977,74 @@ mod tests {
         assert_eq!(
             result.additional_contexts,
             vec!["context from hook".to_string()]
+        );
+    }
+
+    // §3.1 fix-hook-command-injection: the startup summary fires exactly
+    // when at least one unsafe_shell hook is present, and stays silent
+    // otherwise. Uses `tracing_test` so the log assertion runs in-process.
+    #[test]
+    #[tracing_test::traced_test]
+    fn startup_warn_fires_for_unsafe_shell_hook() {
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "echo hi", "unsafe_shell": true}]}]
+        }"#,
+        )
+        .unwrap();
+        let _runner = HookRunner::new(&settings, reqwest::Client::new());
+        assert!(
+            logs_contain("string-form command(s) using unsafe_shell=true"),
+            "expected consolidated WARN summary when an unsafe_shell hook is loaded"
+        );
+        assert!(
+            logs_contain("PreToolUse:echo hi"),
+            "summary must list event:command preview for each unsafe_shell entry"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn startup_warn_silent_when_no_unsafe_shell_hooks() {
+        // Argv form never needs unsafe_shell, so the summary must not fire.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": ["/bin/echo", "hi"]}]}]
+        }"#,
+        )
+        .unwrap();
+        let _runner = HookRunner::new(&settings, reqwest::Client::new());
+        assert!(
+            !logs_contain("string-form command(s) using unsafe_shell"),
+            "summary must not fire when no unsafe_shell hooks exist"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn startup_warn_truncates_after_ten_entries() {
+        // Build 12 unsafe_shell hooks — summary should list 10 and note 2 more.
+        let mut settings = HooksSettings::new();
+        let hooks: Vec<HookConfig> = (0..12)
+            .map(|i| HookConfig {
+                kind: HookKind::Command,
+                command: Some(cc_core::hook::HookCommand::Shell(format!("echo {i}"))),
+                unsafe_shell: true,
+                ..Default::default()
+            })
+            .collect();
+        settings.insert(
+            "PreToolUse".to_string(),
+            vec![HookMatcherGroup {
+                matcher: None,
+                hooks,
+            }],
+        );
+        let _runner = HookRunner::new(&settings, reqwest::Client::new());
+        assert!(logs_contain("12 string-form command(s)"));
+        assert!(
+            logs_contain("and 2 more"),
+            "overflow tail must be logged when >10 entries"
         );
     }
 

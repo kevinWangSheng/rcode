@@ -21,9 +21,13 @@
 
 ## 3. Warning Path
 
-- [ ] 3.1 Deferred: a consolidated startup WARN summarising all string-form
-      entries is worth a follow-up, but the per-invocation `HookOutcome::Failed`
-      already surfaces the problem loudly at runtime. Not load-bearing.
+- [x] 3.1 `cc-hooks::log_unsafe_shell_summary` fires one consolidated
+      `tracing::warn!` at `HookRunner::new` time, listing each
+      `event:command` pair for every hook loaded with string-form
+      `command` + `unsafe_shell: true`. Truncates after 10 entries with
+      an "and N more" suffix. Silent when no such hooks exist.
+      Fixed 2026-04-18: cc-hooks: startup WARN summary for unsafe_shell
+      hooks (close fix-hook-command-injection §3.1).
 
 ## 4. Tests
 
