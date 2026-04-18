@@ -192,86 +192,15 @@ impl QueryEngine {
             let mut text_buf = String::new();
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
 
-            let (message, usage) = {
-                let mut rx = self.api.stream_message(req, cancel).await?;
-                let mut acc = StreamAccumulator::default();
-
-                while let Some(item) = rx.recv().await {
-                    let event = item?;
-                    // Forward user-visible events to the TUI with backpressure.
-                    match &event {
-                        StreamEvent::ContentBlockDelta {
-                            delta: ContentBlockDelta::TextDelta { text },
-                            ..
-                        } => {
-                            text_buf.push_str(text);
-                            on_text(text);
-                            if let Some(tx) = &self.events_tx {
-                                if tx.send(AppEvent::StreamDelta(text.clone())).await.is_err() {
-                                    // Consumer dropped — stop streaming and
-                                    // treat as a cancellation.
-                                    cancel.cancel();
-                                }
-                            }
-                        }
-                        StreamEvent::ContentBlockDelta {
-                            delta: ContentBlockDelta::ThinkingDelta { thinking },
-                            ..
-                        } => {
-                            if let Some(tx) = &self.events_tx {
-                                if tx
-                                    .send(AppEvent::StreamThinking(thinking.clone()))
-                                    .await
-                                    .is_err()
-                                {
-                                    cancel.cancel();
-                                }
-                            }
-                        }
-                        StreamEvent::ContentBlockStart {
-                            content_block: ContentBlockStartData::ToolUse { id, name, input },
-                            ..
-                        } => {
-                            if let Some(tx) = &self.events_tx {
-                                let tu = ToolUseBlock {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    input: input.clone(),
-                                };
-                                if tx.send(AppEvent::StreamToolUse(tu)).await.is_err() {
-                                    cancel.cancel();
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    acc.apply(&event);
-                }
-
-                let id = acc.message_id.clone();
-                let model = acc.model.clone();
-                let stop_reason = acc.stop_reason;
-                let usage = Usage {
-                    input_tokens: acc.input_tokens,
-                    output_tokens: acc.output_tokens,
-                    cache_creation_input_tokens: acc.cache_creation_input_tokens,
-                    cache_read_input_tokens: acc.cache_read_input_tokens,
-                };
-                let content = acc
-                    .into_content()
-                    .map_err(|e| CcError::api(format!("stream accumulator: {e}")))?;
-                let message = Message {
-                    id,
-                    kind: "message".into(),
-                    role: Role::Assistant,
-                    content,
-                    model,
-                    stop_reason,
-                    stop_sequence: None,
-                    usage: usage.clone(),
-                };
-                (message, usage)
-            };
+            let rx = self.api.stream_message(req, cancel).await?;
+            let (message, usage) = drain_stream(
+                rx,
+                &mut on_text,
+                &mut text_buf,
+                self.events_tx.as_ref(),
+                cancel,
+            )
+            .await?;
 
             // §4 contract: if streaming was interrupted (cancel fired), save partial
             // text with interrupt marker before propagating cancellation.
@@ -779,6 +708,105 @@ fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResul
     }
 }
 
+/// Drive a streaming response to completion, forwarding user-visible events
+/// to the TUI with async backpressure (`send().await`) rather than the
+/// previous lossy `try_send` path.
+///
+/// See `openspec/changes/fix-tui-event-dropping/` (C3): under TUI load the
+/// old `try_send` silently dropped `StreamDelta`/`StreamThinking`/
+/// `StreamToolUse` events, breaking the M3 "token-by-token" AC. Using
+/// `send().await` here makes the engine block until the TUI drains, which
+/// is the correct behaviour for a streaming UI.
+///
+/// If the TUI receiver is dropped mid-turn we call `cancel.cancel()` so the
+/// upstream HTTP stream is torn down quickly and the caller observes
+/// `CcError::Cancelled` at the §4 partial-save site.
+pub(crate) async fn drain_stream<F>(
+    mut rx: mpsc::Receiver<CcResult<StreamEvent>>,
+    on_text: &mut F,
+    text_buf: &mut String,
+    events_tx: Option<&mpsc::Sender<AppEvent>>,
+    cancel: &CancellationToken,
+) -> CcResult<(Message, Usage)>
+where
+    F: FnMut(&str),
+{
+    let mut acc = StreamAccumulator::default();
+
+    while let Some(item) = rx.recv().await {
+        let event = item?;
+        match &event {
+            StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::TextDelta { text },
+                ..
+            } => {
+                text_buf.push_str(text);
+                on_text(text);
+                if let Some(tx) = events_tx {
+                    if tx.send(AppEvent::StreamDelta(text.clone())).await.is_err() {
+                        cancel.cancel();
+                    }
+                }
+            }
+            StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::ThinkingDelta { thinking },
+                ..
+            } => {
+                if let Some(tx) = events_tx {
+                    if tx
+                        .send(AppEvent::StreamThinking(thinking.clone()))
+                        .await
+                        .is_err()
+                    {
+                        cancel.cancel();
+                    }
+                }
+            }
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlockStartData::ToolUse { id, name, input },
+                ..
+            } => {
+                if let Some(tx) = events_tx {
+                    let tu = ToolUseBlock {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    };
+                    if tx.send(AppEvent::StreamToolUse(tu)).await.is_err() {
+                        cancel.cancel();
+                    }
+                }
+            }
+            _ => {}
+        }
+        acc.apply(&event);
+    }
+
+    let id = acc.message_id.clone();
+    let model = acc.model.clone();
+    let stop_reason = acc.stop_reason;
+    let usage = Usage {
+        input_tokens: acc.input_tokens,
+        output_tokens: acc.output_tokens,
+        cache_creation_input_tokens: acc.cache_creation_input_tokens,
+        cache_read_input_tokens: acc.cache_read_input_tokens,
+    };
+    let content = acc
+        .into_content()
+        .map_err(|e| CcError::api(format!("stream accumulator: {e}")))?;
+    let message = Message {
+        id,
+        kind: "message".into(),
+        role: Role::Assistant,
+        content,
+        model,
+        stop_reason,
+        stop_sequence: None,
+        usage: usage.clone(),
+    };
+    Ok((message, usage))
+}
+
 /// Auto-compact threshold (§4.5).
 /// = effective_context_window - 13,000
 /// Default effective_context_window = 200,000 (claude-sonnet-4-6).
@@ -1126,5 +1154,151 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- drain_stream regression tests (C3 guard) ----
+    //
+    // These exercise the engine's per-turn stream consumer directly so we
+    // don't need a mock HTTP server. The invariant under test is: when a
+    // slow TUI receiver backpressures the forwarder, the engine must block
+    // on `send().await` rather than silently drop events. Dropping was the
+    // Phase-3 C3 regression (`openspec/changes/fix-tui-event-dropping/`).
+
+    use cc_api::{ContentBlockStartData, MessageStartData, StreamEvent};
+
+    fn text_delta_event(s: &str) -> StreamEvent {
+        StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: cc_api::ContentBlockDelta::TextDelta { text: s.into() },
+        }
+    }
+
+    fn message_start_event(id: &str) -> StreamEvent {
+        StreamEvent::MessageStart {
+            message: MessageStartData {
+                id: id.into(),
+                kind: "message".into(),
+                role: "assistant".into(),
+                content: vec![],
+                model: "claude-test".into(),
+                stop_reason: None,
+                stop_sequence: None,
+                usage: cc_core::Usage {
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+            },
+        }
+    }
+
+    fn content_block_start_text(index: u32) -> StreamEvent {
+        StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockStartData::Text {
+                text: String::new(),
+            },
+        }
+    }
+
+    /// Slow consumer + fast producer: every inbound delta must land in the
+    /// TUI channel, in order, with no drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_stream_no_drops_under_backpressure_1000_deltas() {
+        let (in_tx, in_rx) = mpsc::channel::<CcResult<StreamEvent>>(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<AppEvent>(4);
+        let cancel = CancellationToken::new();
+
+        // Producer: push 1000 text deltas + the framing events an
+        // accumulator expects. We send them as fast as possible; the
+        // channel is tiny (4) so the forwarder must backpressure.
+        let producer = tokio::spawn(async move {
+            in_tx.send(Ok(message_start_event("msg_1"))).await.unwrap();
+            in_tx.send(Ok(content_block_start_text(0))).await.unwrap();
+            for i in 0..1000 {
+                in_tx
+                    .send(Ok(text_delta_event(&format!("{i}"))))
+                    .await
+                    .unwrap();
+            }
+            drop(in_tx);
+        });
+
+        // Drain: run the real engine helper. Slow the consumer so the
+        // forwarder is definitely blocked on send().await at times.
+        let drain = tokio::spawn(async move {
+            let mut on_text = |_: &str| {};
+            let mut text_buf = String::new();
+            drain_stream(in_rx, &mut on_text, &mut text_buf, Some(&out_tx), &cancel).await
+        });
+
+        let mut received: Vec<String> = Vec::with_capacity(1000);
+        while let Some(ev) = out_rx.recv().await {
+            match ev {
+                AppEvent::StreamDelta(s) => {
+                    received.push(s);
+                    tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        producer.await.unwrap();
+        let (message, _usage) = drain.await.unwrap().expect("drain ok");
+        assert_eq!(received.len(), 1000, "no drops under backpressure");
+        for (i, s) in received.iter().enumerate() {
+            assert_eq!(s, &format!("{i}"), "out-of-order at index {i}");
+        }
+        // Accumulator should have assembled the full text block.
+        let total: String = (0..1000).map(|i| i.to_string()).collect();
+        assert!(
+            message
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(t) if t.text == total)),
+            "accumulator text block should match producer"
+        );
+    }
+
+    /// If the TUI receiver is dropped mid-turn, drain_stream cancels the
+    /// CancellationToken and returns Ok with whatever accumulated so far.
+    #[tokio::test]
+    async fn drain_stream_cancels_when_tui_receiver_drops() {
+        let (in_tx, in_rx) = mpsc::channel::<CcResult<StreamEvent>>(8);
+        let (out_tx, out_rx) = mpsc::channel::<AppEvent>(1);
+        let cancel = CancellationToken::new();
+
+        drop(out_rx);
+
+        let producer = tokio::spawn(async move {
+            in_tx.send(Ok(message_start_event("msg_2"))).await.unwrap();
+            in_tx.send(Ok(content_block_start_text(0))).await.unwrap();
+            for i in 0..50 {
+                if in_tx
+                    .send(Ok(text_delta_event(&format!("{i}"))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            drop(in_tx);
+        });
+
+        let mut on_text = |_: &str| {};
+        let mut text_buf = String::new();
+        let result = drain_stream(in_rx, &mut on_text, &mut text_buf, Some(&out_tx), &cancel).await;
+
+        producer.await.unwrap();
+        // drain_stream itself does not error on receiver drop — it cancels
+        // the upstream token and keeps accumulating the remaining frames
+        // that were already in the mpsc buffer. Callers observe
+        // cancellation via `cancel.is_cancelled()`.
+        assert!(result.is_ok(), "drain_stream should not error");
+        assert!(
+            cancel.is_cancelled(),
+            "cancel token must fire when TUI drops"
+        );
     }
 }
