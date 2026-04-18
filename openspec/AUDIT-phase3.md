@@ -6,9 +6,11 @@ contracts (§4). Produced with static code review of the crates under
 `rust/crates/` at commit `9dc8411`.
 
 This file is **reference only** — it is not an OpenSpec change. Each
-CRITICAL defect has its own actionable proposal under
-`openspec/changes/fix-*`. HIGH and MEDIUM items below are candidates for
-future proposals; they are kept in this audit until promoted.
+CRITICAL, HIGH, and MEDIUM defect has its own actionable proposal under
+`openspec/changes/fix-*` (20 total, all validated with `openspec
+validate --all --strict`). LOW items below stay in this audit as
+ergonomic polish — they are not tracked as individual proposals until
+user impact is demonstrated.
 
 ---
 
@@ -23,29 +25,29 @@ future proposals; they are kept in this audit until promoted.
 
 ## HIGH (fix within one iteration)
 
-| # | Location | Defect | Notes |
+| # | Location | Defect | Proposal |
 |---|---|---|---|
-| H1 | `cc-api/src/stream.rs:174` | Tool-use JSON fails to parse at end of stream → silently becomes `{}`; Claude then calls Bash / Edit / Write with **empty args**. | Promote: return `Err`, or tag `tool_result` as `is_error`. |
-| H2 | `cc-tools/src/read.rs:72 → 87` | `metadata()` then `read_to_string()` on the same path — TOCTOU. A symlink swap between the two reads a file much larger than the 50 MB cap → OOM. | Fix via `File::open` then `metadata()` on the same FD. |
-| H3 | `cc-tools/src/edit.rs` | Edit is `read → replace → write` with no tmpfile + rename. Two concurrent Edits both succeed, one silently wins. | Use `tempfile::NamedTempFile::persist`. |
-| H4 | `cc-mcp/src/http_client.rs:290-303` | 404 clears `session_id` under the lock, but another in-flight request already captured the old ID. No auto-reconnect; caller bubbles the error. | Wrap requests in a "retry once on 404 after reinit" guard. |
-| H5 | `cc-hooks` command-hook path | `bash -c $command` with no shell-escape on the settings.json-sourced `command` field. If settings.json is ever writable by a less-trusted path (sync, team template, import), command injection. | Support `argv[]` array form; or mandatory shell-escape with allowlist. |
-| H6 | `cc-tui/src/lib.rs:102` | `Keybindings::load()` called **per key event** — disk I/O on every keystroke. On slow filesystems it's visible lag; amplifies fs races. | Load once, hold in app state, reload on SIGHUP / `/reload`. |
+| H1 | `cc-api/src/stream.rs:174` | Tool-use JSON fails to parse at end of stream → silently becomes `{}`; Claude then calls Bash / Edit / Write with **empty args**. | `openspec/changes/fix-api-stream-toolinput-fallback/` |
+| H2 | `cc-tools/src/read.rs:72 → 87` | `metadata()` then `read_to_string()` on the same path — TOCTOU. A symlink swap between the two reads a file much larger than the 50 MB cap → OOM. | `openspec/changes/fix-read-size-cap-toctou/` |
+| H3 | `cc-tools/src/edit.rs` | Edit is `read → replace → write` with no tmpfile + rename. Two concurrent Edits both succeed, one silently wins. | `openspec/changes/fix-edit-atomic-write/` |
+| H4 | `cc-mcp/src/http_client.rs:290-303` | 404 clears `session_id` under the lock, but another in-flight request already captured the old ID. No auto-reconnect; caller bubbles the error. | `openspec/changes/fix-mcp-404-session-race/` |
+| H5 | `cc-hooks` command-hook path | `bash -c $command` with no shell-escape on the settings.json-sourced `command` field. If settings.json is ever writable by a less-trusted path, command injection. | `openspec/changes/fix-hook-command-injection/` |
+| H6 | `cc-tui/src/lib.rs:102` | `Keybindings::load()` called **per key event** — disk I/O on every keystroke. On slow filesystems it's visible lag; amplifies fs races. | `openspec/changes/fix-tui-keybindings-reload-per-key/` |
 
 ## MEDIUM (next quarter)
 
-| # | Location | Defect |
-|---|---|---|
-| M1 | `cc-session/src/lib.rs:55, 189` | `path.parent().unwrap()` + `Default::default().expect()` are startup-path panics. Rare but CLI-fatal. |
-| M2 | `cc-tools/src/grep.rs:~105` | Cancel token is checked **before** the per-file line loop but not **inside**. Ctrl+C on a 10 GB log goes unnoticed until the file finishes. |
-| M3 | `cc-tools/src/bash.rs:78` | Cancel branch returns without explicit `.kill().await`; relies on tokio `Child::Drop` → kill. Usually fine, but a short race window exists. |
-| M4 | `cc-tui/src/action.rs` Ctrl+C handling | No "second press = force quit" escalation. If abort stalls, user has no recovery. |
-| M5 | `cc-tui` permission dialog | Deny path hard-resets `AppMode::Streaming`; wrong if the stream already finished. |
-| M6 | `cc-memory` `@`-includes | Only recognises `@~/` prefix; doesn't handle `@/abs/path`; cycle detection relies on `canonicalize()` which fails silently on permission-denied symlinks. |
-| M7 | `cc-git::filter_git_ignored` | `git check-ignore --stdin` launched without a timeout. Large repos can hang for minutes. |
-| M8 | `cc-config::merge` | Round-trip through `serde_json::Value`. If base has `{"a":{"x":1}}` and overlay has `{"a":[1,2]}` the type flips silently — contradicts the "unknown fields preserved" promise. |
-| M9 | `cc-tools/src/write.rs` | Doesn't preserve file mode. A `chmod +x` script written via `Write` loses the executable bit. |
-| M10 | `cc-hooks` stdin feed | `let _ = stdin.write_all(...)` swallows `EPIPE`; hook sees half a JSON object and fails parse. |
+| # | Location | Defect | Proposal |
+|---|---|---|---|
+| M1 | `cc-session/src/lib.rs:55, 189` | `path.parent().unwrap()` + `Default::default().expect()` are startup-path panics. Rare but CLI-fatal. | `openspec/changes/fix-session-startup-panic/` |
+| M2 | `cc-tools/src/grep.rs:~105` | Cancel token is checked **before** the per-file line loop but not **inside**. Ctrl+C on a 10 GB log goes unnoticed until the file finishes. | `openspec/changes/fix-grep-cancel-in-file-loop/` |
+| M3 | `cc-tools/src/bash.rs:78` | Cancel branch returns without explicit `.kill().await`; relies on tokio `Child::Drop` → kill. Usually fine, but a short race window exists. | `openspec/changes/fix-bash-cancel-explicit-kill/` |
+| M4 | `cc-tui/src/action.rs` Ctrl+C handling | No "second press = force quit" escalation. If abort stalls, user has no recovery. | `openspec/changes/fix-tui-ctrl-c-force-quit/` |
+| M5 | `cc-tui` permission dialog | Deny path hard-resets `AppMode::Streaming`; wrong if the stream already finished. | `openspec/changes/fix-tui-permission-dialog-mode/` |
+| M6 | `cc-memory` `@`-includes | Only recognises `@~/` prefix; doesn't handle `@/abs/path`; cycle detection relies on `canonicalize()` which fails silently on permission-denied symlinks. | `openspec/changes/fix-memory-include-path-expansion/` |
+| M7 | `cc-git::filter_git_ignored` | `git check-ignore --stdin` launched without a timeout. Large repos can hang for minutes. | `openspec/changes/fix-git-filter-timeout/` |
+| M8 | `cc-config::merge` | Round-trip through `serde_json::Value`. If base has `{"a":{"x":1}}` and overlay has `{"a":[1,2]}` the type flips silently — contradicts the "unknown fields preserved" promise. | `openspec/changes/fix-config-merge-type-flip/` |
+| M9 | `cc-tools/src/write.rs` | Doesn't preserve file mode. A `chmod +x` script written via `Write` loses the executable bit. | `openspec/changes/fix-write-preserve-mode/` |
+| M10 | `cc-hooks` stdin feed | `let _ = stdin.write_all(...)` swallows `EPIPE`; hook sees half a JSON object and fails parse. | `openspec/changes/fix-hook-stdin-error-propagation/` |
 
 ## LOW
 
