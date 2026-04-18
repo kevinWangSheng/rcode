@@ -60,6 +60,22 @@ impl Default for ToolRegistry {
     }
 }
 
+impl FromIterator<BoxTool> for ToolRegistry {
+    fn from_iter<I: IntoIterator<Item = BoxTool>>(iter: I) -> Self {
+        let mut reg = Self::new();
+        for tool in iter {
+            reg.register(tool);
+        }
+        reg
+    }
+}
+
+impl From<Vec<BoxTool>> for ToolRegistry {
+    fn from(tools: Vec<BoxTool>) -> Self {
+        tools.into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +151,43 @@ mod tests {
         let defs = reg.definitions();
         assert_eq!(defs[0].name, "B");
         assert_eq!(defs[1].name, "A");
+    }
+
+    #[test]
+    fn from_vec_matches_manual_registration() {
+        let tools: Vec<BoxTool> = vec![
+            Arc::new(DummyTool {
+                tool_name: "Read".into(),
+                read_only: true,
+            }),
+            Arc::new(DummyTool {
+                tool_name: "Write".into(),
+                read_only: false,
+            }),
+        ];
+        let reg: ToolRegistry = tools.into();
+        assert_eq!(reg.len(), 2);
+        let defs = reg.definitions();
+        // Preserves insertion order (same guarantee as manual register).
+        assert_eq!(defs[0].name, "Read");
+        assert_eq!(defs[1].name, "Write");
+    }
+
+    #[test]
+    fn from_iter_matches_manual_registration() {
+        let reg: ToolRegistry = [
+            Arc::new(DummyTool {
+                tool_name: "A".into(),
+                read_only: true,
+            }) as BoxTool,
+            Arc::new(DummyTool {
+                tool_name: "B".into(),
+                read_only: false,
+            }),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.definitions()[0].name, "A");
     }
 }

@@ -316,11 +316,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // SubAgentRunner, then add AgentTool to the full tool list.
     // This two-pass approach breaks the cc-tools → cc-query → cc-tools cycle.
     {
-        let mut base_registry = ToolRegistry::new();
-        for tool in &tools {
-            base_registry.register(tool.clone());
-        }
-        let sub_agent_registry = Arc::new(base_registry);
+        let sub_agent_registry = Arc::new(ToolRegistry::from(tools.clone()));
         let sub_agent_prompter: Arc<dyn cc_core::PermissionPrompter> =
             Arc::new(StdinPrompter::new(true));
         let sub_agent_runner = Arc::new(SubAgentRunnerImpl {
@@ -400,10 +396,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let tui_prompter: Arc<dyn cc_core::PermissionPrompter> =
             Arc::new(cc_tui::ChannelPrompter::new(events_tx.clone()));
 
-        let mut tui_tool_registry = ToolRegistry::new();
-        for tool in tools {
-            tui_tool_registry.register(tool);
-        }
+        let tui_tool_registry: ToolRegistry = tools.into();
         let tui_engine = QueryEngine::new(
             api,
             Arc::new(tui_tool_registry),
@@ -446,10 +439,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Headless one-shot path — same as M2 behavior.
     let user_text = headless_user_text.expect("headless mode without user text — checked above");
 
-    let mut tool_registry = ToolRegistry::new();
-    for tool in tools {
-        tool_registry.register(tool);
-    }
+    let tool_registry: ToolRegistry = tools.into();
 
     let non_interactive = options.non_interactive;
     let prompter: Arc<dyn cc_core::PermissionPrompter> =

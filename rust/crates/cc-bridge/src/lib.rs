@@ -83,11 +83,7 @@ where
         bypass_permissions,
     };
 
-    // Build ToolRegistry from the tools vector
-    let mut registry = ToolRegistry::new();
-    for tool in tools {
-        registry.register(tool);
-    }
+    let registry: ToolRegistry = tools.into();
 
     let prompter: Arc<dyn PermissionPrompter> = Arc::new(StdinPrompter::new(non_interactive));
     let mut engine = QueryEngine::new(
