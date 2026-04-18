@@ -387,6 +387,7 @@ dependencies = [
  "cc-agents",
  "cc-core",
  "glob",
+ "libc",
  "regex",
  "reqwest",
  "serde",
@@ -396,6 +397,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "walkdir",
 ]
 

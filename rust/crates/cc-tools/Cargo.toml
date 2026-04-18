@@ -18,6 +18,8 @@ walkdir.workspace = true
 regex.workspace = true
 anyhow.workspace = true
 reqwest.workspace = true
+tempfile = "3"
+url = "2"
 
 [dev-dependencies]
-tempfile = "3"
+libc = "0.2"

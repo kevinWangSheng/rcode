@@ -56,7 +56,7 @@ impl Tool for BashTool {
 
         // Spawn the child so we can kill it on cancel. `Command::output()`
         // doesn't give us a handle to do that — it buffers the entire run.
-        let child = Command::new("bash")
+        let mut child = Command::new("bash")
             .arg("-c")
             .arg(&command)
             .stdout(std::process::Stdio::piped())
@@ -64,19 +64,60 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| cc_core::CcError::tool("tool", format!("failed to spawn bash: {e}")))?;
 
-        let output = tokio::select! {
-            // Command finishes naturally (success, failure, or ENOENT).
-            result = tokio::time::timeout(timeout, child.wait_with_output()) => {
-                result.map_err(|_| cc_core::CcError::tool(
-                    "tool",
-                    format!("command timed out after {timeout_ms}ms"),
-                ))?.map_err(|e| cc_core::CcError::tool("tool", format!("bash i/o failed: {e}")))?
-            }
-            // Cancel token fires (Ctrl+C, permission denied mid-flight, etc.)
-            // — we don't have the child handle after the branch completes,
-            // but tokio's Child kills on Drop so returning early is enough.
-            _ = cancel.cancelled() => {
-                return Err(cc_core::CcError::tool("tool", "bash execution cancelled"));
+        let output = {
+            // Drive wait + cancel in a separate scope so the borrow of `child`
+            // by wait() ends before we reach the post-select cleanup arms.
+            let run = async {
+                let status = child.wait().await?;
+                // Drain stdout/stderr after the child exits. Tokio pipes are
+                // buffered so this won't deadlock — they're fully written by
+                // the time wait() returns.
+                use tokio::io::AsyncReadExt;
+                let mut stdout_bytes = Vec::new();
+                if let Some(mut o) = child.stdout.take() {
+                    let _ = o.read_to_end(&mut stdout_bytes).await;
+                }
+                let mut stderr_bytes = Vec::new();
+                if let Some(mut e) = child.stderr.take() {
+                    let _ = e.read_to_end(&mut stderr_bytes).await;
+                }
+                Ok::<_, std::io::Error>(std::process::Output {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                })
+            };
+
+            tokio::select! {
+                result = tokio::time::timeout(timeout, run) => {
+                    match result {
+                        Err(_) => {
+                            // Timeout: explicit kill + reap. Don't rely on Drop —
+                            // the zombie window on Linux under load leaves the
+                            // PID alive from the caller's POV.
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            return Err(cc_core::CcError::tool(
+                                "tool",
+                                format!("command timed out after {timeout_ms}ms"),
+                            ));
+                        }
+                        Ok(Err(e)) => {
+                            return Err(cc_core::CcError::tool("tool", format!("bash i/o failed: {e}")));
+                        }
+                        Ok(Ok(out)) => out,
+                    }
+                }
+                // Cancel token fires (Ctrl+C, permission denied mid-flight,
+                // etc.). Explicitly kill + reap the child before returning —
+                // Drop is asynchronous and can leave the PID alive from the
+                // caller's POV, which breaks "the next bash sees a clean
+                // slate" invariants.
+                _ = cancel.cancelled() => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(cc_core::CcError::tool("tool", "bash execution cancelled"));
+                }
             }
         };
 
@@ -179,6 +220,55 @@ mod tests {
         assert!(result.content.contains("out"), "stdout missing: {:?}", result.content);
         assert!(result.content.contains("STDERR:"), "stderr marker missing: {:?}", result.content);
         assert!(result.content.contains("err"), "stderr body missing: {:?}", result.content);
+    }
+
+    #[tokio::test]
+    async fn bash_cancel_explicitly_kills_and_reaps() {
+        // Launch a long-running bash that writes its own pid to a sentinel
+        // file, then sleeps. Cancel the tool. Once the tool returns, the
+        // pid MUST no longer be alive from the OS's POV.
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let pidfile_str = pidfile.to_string_lossy().to_string();
+
+        let tool = BashTool;
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            // Give bash time to write the pid.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel2.cancel();
+        });
+
+        let command = format!("echo $$ > {pidfile_str} && sleep 30");
+        let result = tool.execute(json!({"command": command}), &cancel).await;
+        assert!(result.is_err(), "expected cancel error, got {:?}", result);
+
+        // Read the pid that bash wrote before sleeping.
+        let pid_str = std::fs::read_to_string(&pidfile).unwrap_or_default();
+        let pid: i32 = match pid_str.trim().parse() {
+            Ok(p) => p,
+            Err(_) => return, // If bash didn't even write the pid, nothing to verify.
+        };
+
+        // Poll briefly for reaping; on cancel we issue kill+wait so the child
+        // should be gone by the time the tool returns, but the immediate
+        // parent-child relationship only guarantees the tokio Child was
+        // reaped — the bash pid may linger as a zombie on very slow systems.
+        // `kill(pid, 0)` returns Err(ESRCH) when the process is gone.
+        let mut alive = true;
+        for _ in 0..20 {
+            // SAFETY: kill(pid, 0) is a no-op signal used to probe liveness.
+            let res = unsafe { libc::kill(pid, 0) };
+            if res != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "pid {pid} still alive after cancel — kill+reap failed");
     }
 
     #[tokio::test]
