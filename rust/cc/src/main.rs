@@ -292,14 +292,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     {
         let summarizer: Arc<dyn cc_core::Summarizer> =
             Arc::new(ApiSummarizer::new(api.clone(), model.clone()));
-        for tool in tools.iter_mut() {
-            if tool.name() == "WebFetch" {
-                *tool = Arc::new(cc_tools::web_fetch::WebFetchTool::with_summarizer(
-                    summarizer.clone(),
-                ));
-                break;
-            }
-        }
+        cc_tools::attach_webfetch_summarizer(&mut tools, summarizer);
     }
 
     // Add AskUserQuestionTool — wired with a StdinPrompter for headless and

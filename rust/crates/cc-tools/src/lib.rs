@@ -93,6 +93,29 @@ pub fn swarm_tools(directory: Arc<Mutex<TeammateDirectory>>) -> Vec<Arc<dyn Tool
     ]
 }
 
+/// Replace the stock `WebFetchTool` (no summarizer) in `tools` with one
+/// that has a `Summarizer` wired up. Used by `main.rs` right after the
+/// `ApiClient` is built so WebFetch can honour the TS-compat `prompt`
+/// field (see `cc-query::ApiSummarizer`).
+///
+/// Returns `true` if a WebFetch slot was found and swapped, `false` if
+/// the tool list didn't contain one (e.g. caller filtered it out).
+/// Keeping this here — rather than inlining the `tool.name() == "WebFetch"`
+/// match at the call site — means the hard-coded name + construction
+/// shape both live alongside the tool itself.
+pub fn attach_webfetch_summarizer(
+    tools: &mut [Arc<dyn Tool>],
+    summarizer: Arc<dyn cc_core::Summarizer>,
+) -> bool {
+    for tool in tools.iter_mut() {
+        if tool.name() == "WebFetch" {
+            *tool = Arc::new(web_fetch::WebFetchTool::with_summarizer(summarizer));
+            return true;
+        }
+    }
+    false
+}
+
 /// Build all built-in tools: 13 core tools + TodoWrite + 4 task tools + 2 background
 /// task tools + 2 swarm tools.
 ///
