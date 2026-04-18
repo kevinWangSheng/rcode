@@ -14,7 +14,17 @@ pub enum Role {
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub kind: String, // "ephemeral"
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Three-tier cache scope per `RUST_REWRITE_PLAN.md` §3. The Anthropic
+    /// API currently rejects this field with HTTP 400
+    /// (`cache_control.ephemeral.scope: Extra inputs are not permitted`),
+    /// so we **do not** serialize it on outbound requests. The field is kept
+    /// in-memory so the internal block-ordering logic (attribution → static
+    /// → dynamic) still has its intent recorded, and so we can flip
+    /// serialization back on (`skip_serializing_if = "Option::is_none"`)
+    /// when the server starts accepting it. `default` + `skip_serializing`
+    /// means the field is never emitted outbound but tolerates inbound
+    /// payloads that happen to carry it.
+    #[serde(default, skip_serializing)]
     pub scope: Option<String>, // "global" | "org"
 }
 
@@ -77,25 +87,41 @@ mod cache_control_tests {
         assert_eq!(c.scope, None);
     }
 
+    // The Anthropic API currently 400s on cache_control.scope. We therefore
+    // DO NOT emit `scope` on the wire even though we keep it in-memory. The
+    // three tests below pin this behavior — if the API starts accepting
+    // `scope`, flip `skip_serializing` back to `skip_serializing_if` and
+    // these tests will fail and demand an update.
+
     #[test]
-    fn serializes_without_scope_when_unscoped() {
+    fn wire_shape_never_emits_scope_unscoped() {
         let c = CacheControl::ephemeral_unscoped();
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(json, r#"{"type":"ephemeral"}"#);
     }
 
     #[test]
-    fn serializes_with_scope_when_global() {
+    fn wire_shape_never_emits_scope_global() {
         let c = CacheControl::ephemeral_global();
         let json = serde_json::to_string(&c).unwrap();
-        assert_eq!(json, r#"{"type":"ephemeral","scope":"global"}"#);
+        assert_eq!(json, r#"{"type":"ephemeral"}"#);
     }
 
     #[test]
-    fn serializes_with_scope_when_org() {
+    fn wire_shape_never_emits_scope_org() {
         let c = CacheControl::ephemeral_org();
         let json = serde_json::to_string(&c).unwrap();
-        assert_eq!(json, r#"{"type":"ephemeral","scope":"org"}"#);
+        assert_eq!(json, r#"{"type":"ephemeral"}"#);
+    }
+
+    #[test]
+    fn deserializes_cache_control_from_server_with_extra_scope() {
+        // Defensive: if the server ever starts echoing `scope`, we must
+        // still deserialize without error (skip_serializing, not skip).
+        let s = r#"{"type":"ephemeral","scope":"global"}"#;
+        let c: CacheControl = serde_json::from_str(s).unwrap();
+        assert_eq!(c.kind, "ephemeral");
+        assert_eq!(c.scope.as_deref(), Some("global"));
     }
 }
 

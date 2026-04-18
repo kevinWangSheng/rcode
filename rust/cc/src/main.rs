@@ -700,6 +700,14 @@ mod tests {
 
     #[test]
     fn three_tier_tagging_serialized_wire_shape() {
+        // The Anthropic API currently rejects a populated
+        // `cache_control.scope` field (HTTP 400: "Extra inputs are not
+        // permitted"). We therefore emit ONLY `{"type":"ephemeral"}` on
+        // the wire even when the in-memory tagging says global / org —
+        // the three-tier intent is preserved in the block ordering and
+        // the Rust-side `CacheControl::scope` field, so we can flip the
+        // scope back on at the serializer the moment the API accepts it
+        // without having to re-do the tagging sites.
         let blocks = build_system_blocks_inner("claude-sonnet-4-6", None, Some("mem".into()), &[]);
         let wire = serde_json::to_value(&blocks).expect("serialize");
 
@@ -708,18 +716,19 @@ mod tests {
         assert_eq!(attr["type"], "text");
         assert!(attr.get("cache_control").is_none());
 
-        // Static instruction block: global cache.
+        // Static + dynamic blocks: cache_control present but scope omitted.
         let static_blk = &wire[1];
         assert_eq!(
             static_blk["cache_control"],
-            json!({"type": "ephemeral", "scope": "global"})
+            json!({"type": "ephemeral"}),
+            "wire shape must not include scope (API rejects it)"
         );
 
-        // Memory block: org cache.
         let mem_blk = &wire[2];
         assert_eq!(
             mem_blk["cache_control"],
-            json!({"type": "ephemeral", "scope": "org"})
+            json!({"type": "ephemeral"}),
+            "wire shape must not include scope (API rejects it)"
         );
     }
 
