@@ -552,36 +552,23 @@ fn build_system_blocks_inner(
     // quota. If you change this, expect the CLI to start returning 429.
     // Do NOT append the model name here — the official CC does not, and
     // the match appears to be prefix-sensitive.
-    blocks.push(SystemBlock {
-        kind: "text".into(),
-        text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-        cache_control: None,
-    });
+    blocks.push(SystemBlock::text(
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    ));
 
     // Tier 2: static instruction — global cache.
-    blocks.push(SystemBlock {
-        kind: "text".into(),
-        text: "You have access to tools for reading/writing files, running shell commands, \
-               searching code, and more."
-            .to_string(),
-        cache_control: Some(cc_core::CacheControl::ephemeral_global()),
-    });
+    blocks.push(SystemBlock::text_global_cached(
+        "You have access to tools for reading/writing files, running shell commands, \
+         searching code, and more.",
+    ));
 
     // Tier 3: dynamic blocks — org cache.
     if let Some(git_text) = git_text {
-        blocks.push(SystemBlock {
-            kind: "text".into(),
-            text: git_text,
-            cache_control: Some(cc_core::CacheControl::ephemeral_org()),
-        });
+        blocks.push(SystemBlock::text_org_cached(git_text));
     }
 
     if let Some(mem_text) = memory_text {
-        blocks.push(SystemBlock {
-            kind: "text".into(),
-            text: mem_text,
-            cache_control: Some(cc_core::CacheControl::ephemeral_org()),
-        });
+        blocks.push(SystemBlock::text_org_cached(mem_text));
     }
 
     // Additional working directories — per-invocation CLI flag, but still
@@ -592,11 +579,9 @@ fn build_system_blocks_inner(
             .map(|d| format!("  - {d}"))
             .collect::<Vec<_>>()
             .join("\n");
-        blocks.push(SystemBlock {
-            kind: "text".into(),
-            text: format!("Additional working directories available:\n{dirs_text}"),
-            cache_control: Some(cc_core::CacheControl::ephemeral_org()),
-        });
+        blocks.push(SystemBlock::text_org_cached(format!(
+            "Additional working directories available:\n{dirs_text}"
+        )));
     }
 
     blocks

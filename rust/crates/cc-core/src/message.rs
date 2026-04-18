@@ -217,6 +217,39 @@ pub struct SystemBlock {
     pub cache_control: Option<CacheControl>,
 }
 
+impl SystemBlock {
+    /// Uncached text block. Use for the attribution/magic-string tier that
+    /// must never be cached (see `RUST_REWRITE_PLAN.md` §3 three-tier
+    /// tagging).
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".into(),
+            text: text.into(),
+            cache_control: None,
+        }
+    }
+
+    /// Global-cache-tier text block (static instructions that are the same
+    /// across the org's workflows — cached globally on Anthropic's side).
+    pub fn text_global_cached(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".into(),
+            text: text.into(),
+            cache_control: Some(CacheControl::ephemeral_global()),
+        }
+    }
+
+    /// Org-cache-tier text block (content that varies per session/project
+    /// but is stable within it — git context, memory, working dirs).
+    pub fn text_org_cached(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".into(),
+            text: text.into(),
+            cache_control: Some(CacheControl::ephemeral_org()),
+        }
+    }
+}
+
 // ── Conversation Messages ──────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

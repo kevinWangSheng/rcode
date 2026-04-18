@@ -70,11 +70,7 @@ impl SubAgentRunner for SubAgentRunnerImpl {
         // Build the sub-agent's system blocks: parent blocks + optional override.
         let mut sys_blocks = self.system_blocks.clone();
         if let Some(extra) = system {
-            sys_blocks.push(cc_core::SystemBlock {
-                kind: "text".into(),
-                text: extra,
-                cache_control: None,
-            });
+            sys_blocks.push(cc_core::SystemBlock::text(extra));
         }
 
         let mut engine = QueryEngine::new(
