@@ -4,7 +4,7 @@
 //! can be interrupted via the CancellationToken.
 
 use async_trait::async_trait;
-use cc_core::{CcResult, CcError};
+use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 

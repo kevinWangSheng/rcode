@@ -146,7 +146,8 @@ impl TaskRegistry {
     /// Evict completed/failed tasks older than `max_age`.
     pub fn evict_old(&mut self, _max_age: Duration) {
         // For now, evict all non-running tasks
-        self.tasks.retain(|_, e| e.state.status == TaskStatus::Running);
+        self.tasks
+            .retain(|_, e| e.state.status == TaskStatus::Running);
     }
 }
 
@@ -181,12 +182,12 @@ mod tests {
         let mut registry = TaskRegistry::new(10);
         let cancel = CancellationToken::new();
         let id = registry
-            .spawn(
-                TaskKind::LocalBash,
-                "test task".into(),
-                cancel,
-                async { Ok(TaskOutput { summary: "done".into(), content: "output".into() }) },
-            )
+            .spawn(TaskKind::LocalBash, "test task".into(), cancel, async {
+                Ok(TaskOutput {
+                    summary: "done".into(),
+                    content: "output".into(),
+                })
+            })
             .unwrap();
 
         // Give the task time to complete
@@ -206,23 +207,21 @@ mod tests {
         let cancel2 = CancellationToken::new();
 
         registry
-            .spawn(
-                TaskKind::LocalBash,
-                "task1".into(),
-                cancel1,
-                async {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    Ok(TaskOutput { summary: "".into(), content: "".into() })
-                },
-            )
+            .spawn(TaskKind::LocalBash, "task1".into(), cancel1, async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(TaskOutput {
+                    summary: "".into(),
+                    content: "".into(),
+                })
+            })
             .unwrap();
 
-        let result = registry.spawn(
-            TaskKind::LocalBash,
-            "task2".into(),
-            cancel2,
-            async { Ok(TaskOutput { summary: "".into(), content: "".into() }) },
-        );
+        let result = registry.spawn(TaskKind::LocalBash, "task2".into(), cancel2, async {
+            Ok(TaskOutput {
+                summary: "".into(),
+                content: "".into(),
+            })
+        });
         assert!(result.is_err());
     }
 
@@ -231,15 +230,13 @@ mod tests {
         let mut registry = TaskRegistry::new(10);
         let cancel = CancellationToken::new();
         let id = registry
-            .spawn(
-                TaskKind::LocalBash,
-                "test".into(),
-                cancel,
-                async {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    Ok(TaskOutput { summary: "".into(), content: "".into() })
-                },
-            )
+            .spawn(TaskKind::LocalBash, "test".into(), cancel, async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(TaskOutput {
+                    summary: "".into(),
+                    content: "".into(),
+                })
+            })
             .unwrap();
 
         registry.cancel(&id);

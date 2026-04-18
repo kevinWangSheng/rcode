@@ -46,9 +46,8 @@ pub fn read_credentials_from_path(path: &std::path::Path) -> CcResult<Option<Cre
             path.display()
         ))
     })?;
-    let data: SecureStorageData = serde_json::from_str(&content).map_err(|e| {
-        CcError::Auth(format!("credentials file parse error: {e}"))
-    })?;
+    let data: SecureStorageData = serde_json::from_str(&content)
+        .map_err(|e| CcError::Auth(format!("credentials file parse error: {e}")))?;
     Ok(data
         .claude_ai_oauth
         .map(|t| Credentials::OAuthToken(t.access_token)))
@@ -67,9 +66,7 @@ pub fn read_credentials_from_file() -> CcResult<Option<Credentials>> {
 /// specific path. Callers that only need the access token should use
 /// `read_credentials_from_path`; this variant exists for the refresh flow,
 /// which needs the refresh_token and expires_at.
-pub fn read_oauth_tokens_from_path(
-    path: &std::path::Path,
-) -> CcResult<Option<OAuthTokens>> {
+pub fn read_oauth_tokens_from_path(path: &std::path::Path) -> CcResult<Option<OAuthTokens>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -79,9 +76,8 @@ pub fn read_oauth_tokens_from_path(
             path.display()
         ))
     })?;
-    let data: SecureStorageData = serde_json::from_str(&content).map_err(|e| {
-        CcError::Auth(format!("credentials file parse error: {e}"))
-    })?;
+    let data: SecureStorageData = serde_json::from_str(&content)
+        .map_err(|e| CcError::Auth(format!("credentials file parse error: {e}")))?;
     Ok(data.claude_ai_oauth)
 }
 
@@ -226,8 +222,13 @@ mod tests {
     fn read_oauth_tokens_returns_full_bundle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("creds.json");
-        write_oauth_token_to_path(&path, "access-123", Some("refresh-456".into()), Some(9_000_000))
-            .unwrap();
+        write_oauth_token_to_path(
+            &path,
+            "access-123",
+            Some("refresh-456".into()),
+            Some(9_000_000),
+        )
+        .unwrap();
         let tokens = read_oauth_tokens_from_path(&path).unwrap().unwrap();
         assert_eq!(tokens.access_token, "access-123");
         assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-456"));

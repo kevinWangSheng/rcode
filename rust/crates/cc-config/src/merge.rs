@@ -184,10 +184,7 @@ mod tests {
         let base = json!({"hooks": [{"id": "h1"}]});
         let overlay = json!({"hooks": [{"id": "h2"}]});
         let result = merge(base, overlay).unwrap();
-        assert_eq!(
-            result,
-            json!({"hooks": [{"id": "h1"}, {"id": "h2"}]})
-        );
+        assert_eq!(result, json!({"hooks": [{"id": "h1"}, {"id": "h2"}]}));
     }
 
     #[test]

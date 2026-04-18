@@ -106,7 +106,9 @@ impl SubAgentRunner for SubAgentRunnerImpl {
             self.prompter.clone(),
         );
 
-        let result = engine.run_turn(prompt, |_| {}, &mut messages, &cancel).await;
+        let result = engine
+            .run_turn(prompt, |_| {}, &mut messages, &cancel)
+            .await;
 
         // Fire SubagentStop regardless of turn outcome — mirrors TS behavior
         // where Stop hooks run in the agent's finally path. We don't act on

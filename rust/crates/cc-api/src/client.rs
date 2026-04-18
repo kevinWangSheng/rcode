@@ -47,8 +47,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ANTHROPIC_BETAS_API_KEY: &str = "interleaved-thinking-2025-05-14";
 
 /// Beta headers for OAuth Bearer token auth.
-const ANTHROPIC_BETAS_OAUTH: &str =
-    "interleaved-thinking-2025-05-14,oauth-2025-04-20";
+const ANTHROPIC_BETAS_OAUTH: &str = "interleaved-thinking-2025-05-14,oauth-2025-04-20";
 
 /// How the client authenticates with the API.
 #[derive(Clone)]
@@ -80,8 +79,8 @@ pub struct ApiClient {
 impl ApiClient {
     /// Create a client using a pre-built reqwest::Client from cc-http.
     pub fn new(http: reqwest::Client, auth: AuthCredential) -> Self {
-        let base_url = std::env::var("ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|_| ANTHROPIC_API_URL.to_string());
+        let base_url =
+            std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| ANTHROPIC_API_URL.to_string());
         Self {
             http,
             auth,
@@ -181,7 +180,11 @@ impl ApiClient {
 
             // Check retry policy
             if let Some(delay) = self.retry.should_retry(&err, attempt) {
-                warn!(attempt, delay_ms = delay.as_millis() as u64, "retrying after transient error");
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    "retrying after transient error"
+                );
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(CcError::Cancelled),
@@ -294,8 +297,7 @@ impl ApiClient {
                     ..
                 } => on_delta(StreamDelta::InputJsonDelta(partial_json.clone())),
                 StreamEvent::ContentBlockStart {
-                    content_block:
-                        crate::stream::ContentBlockStartData::ToolUse { id, name, .. },
+                    content_block: crate::stream::ContentBlockStartData::ToolUse { id, name, .. },
                     ..
                 } => on_delta(StreamDelta::ToolUseStart {
                     id: id.clone(),
@@ -420,7 +422,15 @@ mod tests {
         let result = client.stream_message(req, &cancel).await;
         let elapsed = start.elapsed();
 
-        assert!(matches!(result, Err(CcError::Cancelled)), "got {:?}", result.err());
-        assert!(elapsed < std::time::Duration::from_secs(1), "took {:?}", elapsed);
+        assert!(
+            matches!(result, Err(CcError::Cancelled)),
+            "got {:?}",
+            result.err()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {:?}",
+            elapsed
+        );
     }
 }

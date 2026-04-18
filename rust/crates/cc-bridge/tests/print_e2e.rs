@@ -89,12 +89,18 @@ async fn print_mode_streams_text_through_bridge() {
         std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{addr}"));
     }
 
-    let api = ApiClient::new(reqwest::Client::new(), AuthCredential::ApiKey("sk-ant-test-key".into()));
+    let api = ApiClient::new(
+        reqwest::Client::new(),
+        AuthCredential::ApiKey("sk-ant-test-key".into()),
+    );
 
     let req = BridgeRequest {
         api,
         tools: Vec::new(),
-        permissions: PermissionEngine::from_settings(Vec::<serde_json::Value>::new(), Vec::<serde_json::Value>::new()),
+        permissions: PermissionEngine::from_settings(
+            Vec::<serde_json::Value>::new(),
+            Vec::<serde_json::Value>::new(),
+        ),
         hooks: std::sync::Arc::new(HookRunner::empty()),
         session: Session::new().expect("session"),
         system_blocks: Vec::new(),

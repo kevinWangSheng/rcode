@@ -38,8 +38,7 @@ async fn one_thousand_deltas_slow_consumer_no_drops() {
     });
 
     // Forwarder uses `send().await` → no drops under backpressure.
-    let forwarder =
-        tokio::spawn(async move { forward_stream_events(&mut in_rx, &out_tx).await });
+    let forwarder = tokio::spawn(async move { forward_stream_events(&mut in_rx, &out_tx).await });
 
     // Slow consumer: 1 ms between reads.
     let mut received: Vec<String> = Vec::with_capacity(1000);
@@ -113,8 +112,7 @@ async fn mixed_event_stream_is_delivered_in_order() {
         drop(in_tx);
     });
 
-    let handle =
-        tokio::spawn(async move { forward_stream_events(&mut in_rx, &out_tx).await });
+    let handle = tokio::spawn(async move { forward_stream_events(&mut in_rx, &out_tx).await });
 
     let mut evs = Vec::new();
     while let Some(ev) = out_rx.recv().await {

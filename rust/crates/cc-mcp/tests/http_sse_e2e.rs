@@ -50,9 +50,7 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Value {
 }
 
 fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 async fn write_json_response(sock: &mut tokio::net::TcpStream, body: &Value) {
@@ -181,9 +179,7 @@ async fn http_sse_initialize_list_call_roundtrip() {
     assert_eq!(tools[0].name, "echo");
     assert_eq!(tools[0].server_name, "stub");
 
-    let result = client
-        .call_tool("echo", json!({"text": "hi there"}))
-        .await;
+    let result = client.call_tool("echo", json!({"text": "hi there"})).await;
     assert!(!result.is_error);
     assert_eq!(result.content, "hi there");
 }

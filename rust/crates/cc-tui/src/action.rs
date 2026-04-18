@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use crate::app::{App, AppMode, PendingPermission};
 use crate::commands::{parse, CommandOutcome, CommandRegistry};
-use cc_core::Usage;
 use cc_core::PromptDecision;
+use cc_core::Usage;
 use tokio::sync::oneshot;
 
 /// All actions the TUI can take.
@@ -27,8 +27,15 @@ pub enum AppAction {
 
     // Streaming
     StreamDelta(String),
-    ToolStart { name: String, input_summary: String },
-    ToolEnd { name: String, output: String, is_error: bool },
+    ToolStart {
+        name: String,
+        input_summary: String,
+    },
+    ToolEnd {
+        name: String,
+        output: String,
+        is_error: bool,
+    },
 
     // Permission
     ShowPermission {
@@ -53,7 +60,9 @@ pub enum AppAction {
     Quit,
     CompactBoundary,
     /// Turn completed: update token usage, finish stream, drain queued input.
-    TurnComplete { usage: Usage },
+    TurnComplete {
+        usage: Usage,
+    },
     Error(String),
     Tick,
 }
@@ -171,22 +180,30 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
         AppAction::StreamDelta(delta) => {
             app.on_token(&delta);
         }
-        AppAction::ToolStart { name, input_summary } => {
+        AppAction::ToolStart {
+            name,
+            input_summary,
+        } => {
             app.push_tool_call(name, input_summary);
         }
-        AppAction::ToolEnd { name, output, is_error } => {
+        AppAction::ToolEnd {
+            name,
+            output,
+            is_error,
+        } => {
             app.push_tool_result(name, output, is_error);
         }
-        AppAction::ShowPermission { tool_name, summary, reply } => {
+        AppAction::ShowPermission {
+            tool_name,
+            summary,
+            reply,
+        } => {
             // Snapshot the pre-dialog mode so decision arms can restore it
             // rather than hard-coding Streaming (which is wrong when the
             // dialog arrives after the final assistant block has landed and
             // mode is already Input).
             app.pre_permission_mode = Some(app.mode);
-            app.permission = Some(PendingPermission {
-                tool_name,
-                summary,
-            });
+            app.permission = Some(PendingPermission { tool_name, summary });
             app.mode = AppMode::PermissionPrompt;
             app.pending_reply = Some(reply);
         }
@@ -366,7 +383,10 @@ mod tests {
         app.start_stream();
         app.on_token("hello");
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         let usage = cc_core::Usage {
             input_tokens: 10,
@@ -379,7 +399,10 @@ mod tests {
         assert_eq!(app.status.input_tokens, 10);
         assert_eq!(app.status.output_tokens, 5);
         assert_eq!(app.status.turn_count, 1);
-        assert!(matches!(app.transcript.last(), Some(crate::app::TranscriptItem::AssistantText(_))));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(crate::app::TranscriptItem::AssistantText(_))
+        ));
     }
 
     #[test]
@@ -388,7 +411,10 @@ mod tests {
         app.mode = AppMode::Streaming;
         app.queued.push_back("queued msg".into());
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         let usage = cc_core::Usage::default();
         let result = update(&mut app, AppAction::TurnComplete { usage }, &uctx);
@@ -403,7 +429,10 @@ mod tests {
         app.start_stream();
         app.on_token("partial");
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         update(&mut app, AppAction::Abort, &uctx);
 
@@ -422,14 +451,20 @@ mod tests {
     fn abort_stamps_last_abort_at_and_shows_hint() {
         let mut app = App::new("s".into(), "m".into());
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         assert!(app.last_abort_at.is_none());
         assert!(app.status_hint.is_none());
 
         update(&mut app, AppAction::Abort, &uctx);
 
-        assert!(app.last_abort_at.is_some(), "first Abort must stamp last_abort_at");
+        assert!(
+            app.last_abort_at.is_some(),
+            "first Abort must stamp last_abort_at"
+        );
         assert!(
             app.status_hint
                 .as_deref()
@@ -444,7 +479,10 @@ mod tests {
         let mut app = App::new("s".into(), "m".into());
         app.start_stream();
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         // First Ctrl+C → graceful Abort.
         let r1 = update(&mut app, AppAction::Abort, &uctx);
@@ -464,7 +502,10 @@ mod tests {
         let mut app = App::new("s".into(), "m".into());
         app.start_stream();
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         // Prime a stale abort 3s ago.
         app.last_abort_at = Instant::now().checked_sub(Duration::from_secs(3));
@@ -482,20 +523,29 @@ mod tests {
 
         let mut app = App::new("s".into(), "m".into());
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         app.status_hint = Some("press Ctrl+C again to force quit".into());
         app.last_abort_at = Instant::now().checked_sub(Duration::from_secs(3));
 
         update(&mut app, AppAction::Tick, &uctx);
-        assert!(app.status_hint.is_none(), "stale hint must be cleared on tick");
+        assert!(
+            app.status_hint.is_none(),
+            "stale hint must be cleared on tick"
+        );
     }
 
     #[test]
     fn tick_preserves_fresh_status_hint() {
         let mut app = App::new("s".into(), "m".into());
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         app.status_hint = Some("press Ctrl+C again to force quit".into());
         app.last_abort_at = Some(Instant::now());
@@ -525,7 +575,10 @@ mod tests {
         assert_eq!(app.mode, AppMode::Streaming);
 
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         let (show, _rx) = show_permission();
         update(&mut app, show, &uctx);
@@ -538,7 +591,10 @@ mod tests {
             AppMode::Streaming,
             "dialog opened mid-stream must return to Streaming on Deny"
         );
-        assert!(app.pre_permission_mode.is_none(), "snapshot must be consumed");
+        assert!(
+            app.pre_permission_mode.is_none(),
+            "snapshot must be consumed"
+        );
     }
 
     #[test]
@@ -551,7 +607,10 @@ mod tests {
         assert_eq!(app.mode, AppMode::Input, "pre-condition: Input mode");
 
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         let (show, _rx) = show_permission();
         update(&mut app, show, &uctx);
@@ -573,7 +632,10 @@ mod tests {
         app.start_stream();
 
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         let (show, _rx) = show_permission();
         update(&mut app, show, &uctx);
@@ -586,7 +648,10 @@ mod tests {
         let mut app = App::new("s".into(), "m".into());
         // Mode is Input (stream already done).
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         let (show, _rx) = show_permission();
         update(&mut app, show, &uctx);
@@ -605,7 +670,10 @@ mod tests {
         app.pre_permission_mode = None;
 
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         update(&mut app, AppAction::PermissionDeny, &uctx);
         assert_eq!(app.mode, AppMode::Input);

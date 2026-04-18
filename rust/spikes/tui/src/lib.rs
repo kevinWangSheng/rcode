@@ -95,8 +95,7 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
-        if self.stream_state == StreamState::Streaming
-            || self.stream_state == StreamState::Aborted
+        if self.stream_state == StreamState::Streaming || self.stream_state == StreamState::Aborted
         {
             // [AC-3] Queue during active stream
             self.queued_inputs.push(text);

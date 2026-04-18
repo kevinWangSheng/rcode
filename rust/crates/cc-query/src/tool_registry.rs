@@ -93,7 +93,11 @@ mod tests {
         fn is_read_only(&self) -> bool {
             self.read_only
         }
-        async fn execute(&self, _input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+        async fn execute(
+            &self,
+            _input: Value,
+            _cancel: &CancellationToken,
+        ) -> CcResult<ToolResult> {
             Ok(ToolResult::ok("ok"))
         }
     }

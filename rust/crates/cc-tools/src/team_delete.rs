@@ -63,9 +63,7 @@ impl Tool for TeamDeleteTool {
             });
             Ok(ToolResult::ok(result.to_string()))
         } else {
-            Ok(ToolResult::error(format!(
-                "teammate '{name}' not found"
-            )))
+            Ok(ToolResult::error(format!("teammate '{name}' not found")))
         }
     }
 }

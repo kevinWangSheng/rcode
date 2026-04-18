@@ -122,7 +122,10 @@ impl TodoList {
         add_blocked_by: Option<Vec<String>>,
         metadata_patch: Option<HashMap<String, Value>>,
     ) -> Result<(), String> {
-        let task = self.tasks.get_mut(id).ok_or_else(|| format!("task {id} not found"))?;
+        let task = self
+            .tasks
+            .get_mut(id)
+            .ok_or_else(|| format!("task {id} not found"))?;
 
         if let Some(s) = status {
             task.status = s;
@@ -185,8 +188,18 @@ mod tests {
         let mut list = TodoList::new();
         let id1 = list.create("Task 1".into(), "".into(), None, None);
         let id2 = list.create("Task 2".into(), "".into(), None, None);
-        list.update(&id1, Some(TodoStatus::Deleted), None, None, None, None, None, None, None)
-            .unwrap();
+        list.update(
+            &id1,
+            Some(TodoStatus::Deleted),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let tasks = list.list();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, id2);
@@ -218,8 +231,18 @@ mod tests {
         let mut list = TodoList::new();
         let id1 = list.create("Task 1".into(), "".into(), None, None);
         let id2 = list.create("Task 2".into(), "".into(), None, None);
-        list.update(&id2, None, None, None, None, None, None, Some(vec![id1.clone()]), None)
-            .unwrap();
+        list.update(
+            &id2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![id1.clone()]),
+            None,
+        )
+        .unwrap();
         let task2 = list.get(&id2).unwrap();
         assert!(task2.blocked_by.contains(&id1));
     }
@@ -233,13 +256,26 @@ mod tests {
         list.update(&id, None, None, None, None, None, None, None, Some(patch))
             .unwrap();
         let task = list.get(&id).unwrap();
-        assert_eq!(task.metadata.get("key1"), Some(&Value::String("val1".into())));
+        assert_eq!(
+            task.metadata.get("key1"),
+            Some(&Value::String("val1".into()))
+        );
 
         // Delete key via null
         let mut del_patch = HashMap::new();
         del_patch.insert("key1".to_string(), Value::Null);
-        list.update(&id, None, None, None, None, None, None, None, Some(del_patch))
-            .unwrap();
+        list.update(
+            &id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(del_patch),
+        )
+        .unwrap();
         let task = list.get(&id).unwrap();
         assert!(!task.metadata.contains_key("key1"));
     }

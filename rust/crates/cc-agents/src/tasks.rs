@@ -41,10 +41,7 @@ pub struct StallWatchdog {
 impl StallWatchdog {
     /// Default 45s threshold / 5s tick / 1024 byte tail, matching the TS
     /// contract in tasks/LocalShellTask/LocalShellTask.tsx.
-    pub fn new(
-        description: String,
-        notifier: mpsc::UnboundedSender<StallNotification>,
-    ) -> Self {
+    pub fn new(description: String, notifier: mpsc::UnboundedSender<StallNotification>) -> Self {
         Self {
             description,
             notifier,
@@ -234,9 +231,7 @@ pub async fn run_in_process_teammate(
     cancel: CancellationToken,
 ) -> CcResult<TaskOutput> {
     // Run initial turn
-    let mut last_output = runner
-        .run(None, prompt, Vec::new(), cancel.clone())
-        .await?;
+    let mut last_output = runner.run(None, prompt, Vec::new(), cancel.clone()).await?;
 
     // Process inbox messages until cancelled or closed
     loop {
@@ -410,7 +405,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.summary, "exit 0");
-        assert!(rx.try_recv().is_err(), "watchdog should not fire on non-prompt tail");
+        assert!(
+            rx.try_recv().is_err(),
+            "watchdog should not fire on non-prompt tail"
+        );
     }
 
     #[tokio::test]
@@ -430,6 +428,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.summary, "exit 0");
-        assert!(rx.try_recv().is_err(), "watchdog should not fire while output is growing");
+        assert!(
+            rx.try_recv().is_err(),
+            "watchdog should not fire while output is growing"
+        );
     }
 }

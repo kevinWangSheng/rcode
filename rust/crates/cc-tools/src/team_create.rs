@@ -105,7 +105,9 @@ impl Tool for TeamCreateTool {
 
         tokio::spawn(async move {
             // Run initial turn
-            let _ = runner.run(system, prompt, Vec::new(), cancel_clone.clone()).await;
+            let _ = runner
+                .run(system, prompt, Vec::new(), cancel_clone.clone())
+                .await;
 
             // Then process inbox messages until cancelled or inbox closed
             loop {

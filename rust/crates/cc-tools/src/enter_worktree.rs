@@ -22,11 +22,11 @@ fn validate_slug(s: &str) -> Result<(), String> {
     }
     if s.split('/').any(|seg| {
         seg.is_empty()
-            || !seg.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            || !seg
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
     }) {
-        return Err(
-            "each path segment may only contain letters, digits, '.', '_', '-'".into(),
-        );
+        return Err("each path segment may only contain letters, digits, '.', '_', '-'".into());
     }
     Ok(())
 }

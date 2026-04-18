@@ -271,8 +271,7 @@ impl ResolvedConfig {
         let sources = discover_sources(&project, cli_settings_path)?;
         let settings = merge_sources(sources)?;
         let model = resolve_model(cli_model, &settings);
-        let raw =
-            serde_json::to_value(&settings).unwrap_or(Value::Object(Default::default()));
+        let raw = serde_json::to_value(&settings).unwrap_or(Value::Object(Default::default()));
 
         Ok(Self {
             project,
@@ -429,8 +428,7 @@ mod tests {
     #[test]
     fn merge_preserves_unknown_fields_from_all_layers() {
         let user: Settings = serde_json::from_str(r#"{"customUserField": 1}"#).unwrap();
-        let project: Settings =
-            serde_json::from_str(r#"{"customProjectField": 2}"#).unwrap();
+        let project: Settings = serde_json::from_str(r#"{"customProjectField": 2}"#).unwrap();
         let sources = SettingsSources {
             plugin_base: None,
             user: Some(user),

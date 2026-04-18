@@ -37,7 +37,9 @@ impl PermissionPrompter for StdinPrompter {
         cancel: &CancellationToken,
     ) -> CcResult<String> {
         if self.non_interactive {
-            return Ok("User is not available to answer questions in non-interactive mode.".to_string());
+            return Ok(
+                "User is not available to answer questions in non-interactive mode.".to_string(),
+            );
         }
 
         // Print question and options to stderr

@@ -79,24 +79,23 @@ impl Tool for McpToolAdapter {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                let content =
-                    if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
-                        arr.iter()
-                            .filter_map(|block| {
-                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    block
-                                        .get("text")
-                                        .and_then(|t| t.as_str())
-                                        .map(|s| s.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    } else {
-                        value.to_string()
-                    };
+                let content = if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
+                    arr.iter()
+                        .filter_map(|block| {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                block
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    value.to_string()
+                };
 
                 if is_error {
                     Ok(ToolResult::error(content))
@@ -111,9 +110,7 @@ impl Tool for McpToolAdapter {
 
 /// Helper used by `main.rs` (and tests) to convert raw `mcpServers` JSON from
 /// settings.json into a vector of connected `Tool` adapters.
-pub async fn load_mcp_tools_from_config(
-    mcp_servers: &Value,
-) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+pub async fn load_mcp_tools_from_config(mcp_servers: &Value) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 

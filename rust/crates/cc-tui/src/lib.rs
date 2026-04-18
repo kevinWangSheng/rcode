@@ -143,9 +143,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
                     tokio::spawn(async move {
                         let mut guard = es.lock().await;
                         let (engine, messages) = &mut *guard;
-                        if let Err(e) = engine
-                            .run_turn(text, |_| {}, messages, &child_cancel)
-                            .await
+                        if let Err(e) = engine.run_turn(text, |_| {}, messages, &child_cancel).await
                         {
                             // Send the error to the TUI (TurnComplete was not
                             // sent by the engine in this error path).
@@ -234,7 +232,10 @@ fn map_engine_event(event: CoreEvent) -> Option<AppAction> {
         CoreEvent::StreamDelta(text) => Some(AppAction::StreamDelta(text)),
         CoreEvent::ToolStart { name, input } => {
             let input_summary = summarize_input(&input);
-            Some(AppAction::ToolStart { name, input_summary })
+            Some(AppAction::ToolStart {
+                name,
+                input_summary,
+            })
         }
         CoreEvent::ToolEnd { name, result } => {
             // Truncate very long tool output for display.
@@ -247,7 +248,12 @@ fn map_engine_event(event: CoreEvent) -> Option<AppAction> {
         }
         CoreEvent::TurnComplete { usage } => Some(AppAction::TurnComplete { usage }),
         CoreEvent::CompactBoundary => Some(AppAction::CompactBoundary),
-        CoreEvent::PermissionRequest { id: _, tool_name, tool_input, response_tx } => {
+        CoreEvent::PermissionRequest {
+            id: _,
+            tool_name,
+            tool_input,
+            response_tx,
+        } => {
             let summary = summarize_input(&tool_input);
             Some(AppAction::ShowPermission {
                 tool_name,
@@ -296,7 +302,11 @@ fn summarize_input(v: &serde_json::Value) -> String {
         }
         other => {
             let s = other.to_string();
-            if s.len() > 120 { format!("{}…", &s[..120]) } else { s }
+            if s.len() > 120 {
+                format!("{}…", &s[..120])
+            } else {
+                s
+            }
         }
     }
 }
@@ -333,7 +343,10 @@ mod keymap_tests {
 
         // First press: ordinary Abort.
         let first = map_key_event(&ctrl_c, &kb, &app);
-        assert!(matches!(first, Some(AppAction::Abort)), "first Ctrl+C: {first:?}");
+        assert!(
+            matches!(first, Some(AppAction::Abort)),
+            "first Ctrl+C: {first:?}"
+        );
 
         // Stamp as the real update() handler would — within the window.
         app.last_abort_at = Some(Instant::now());

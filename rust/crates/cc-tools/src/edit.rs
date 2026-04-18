@@ -3,7 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 pub struct EditTool;
@@ -42,7 +42,8 @@ impl Tool for EditTool {
                 }
             },
             "required": ["file_path", "old_string", "new_string"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
@@ -88,7 +89,10 @@ impl Tool for EditTool {
         // Capture the existing mode so we can restore it on the tempfile
         // before the rename. Without this a `chmod +x` script edited via the
         // Edit tool loses its executable bit and stops working.
-        let preserved_perms = tokio::fs::metadata(path).await.ok().map(|m| m.permissions());
+        let preserved_perms = tokio::fs::metadata(path)
+            .await
+            .ok()
+            .map(|m| m.permissions());
 
         // Atomic write: same-directory tempfile + fsync + rename. Three bugs
         // this closes:
@@ -101,8 +105,12 @@ impl Tool for EditTool {
         //   * Durability: without fsync + rename, a power loss right after
         //     "success" can still roll the file back.
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let tmp = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| CcError::tool("tool", format!("failed to create tempfile near {file_path}: {e}")))?;
+        let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+            CcError::tool(
+                "tool",
+                format!("failed to create tempfile near {file_path}: {e}"),
+            )
+        })?;
 
         // Preserve mode before persist so the rename lands with the right
         // perms. On Unix we care primarily about the exec bit.
@@ -112,7 +120,8 @@ impl Tool for EditTool {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = perms.mode();
                 let file = tmp.as_file();
-                let mut tmp_perms = file.metadata()
+                let mut tmp_perms = file
+                    .metadata()
                     .map_err(|e| CcError::tool("tool", format!("failed to stat tempfile: {e}")))?
                     .permissions();
                 tmp_perms.set_mode(mode);

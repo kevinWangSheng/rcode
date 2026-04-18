@@ -65,7 +65,10 @@ impl McpClient {
             .map_err(|e| format!("MCP initialize failed: {e}"))?;
 
         if let Some(err) = resp.error {
-            return Err(format!("MCP initialize error: {} ({})", err.message, err.code));
+            return Err(format!(
+                "MCP initialize error: {} ({})",
+                err.message, err.code
+            ));
         }
 
         debug!("MCP server '{}' initialized", client.server_name);
@@ -92,8 +95,8 @@ impl McpClient {
 
         let result = resp.result.unwrap_or(json!({}));
         let tools_val = result.get("tools").cloned().unwrap_or(json!([]));
-        let mut tools: Vec<McpTool> = serde_json::from_value(tools_val)
-            .map_err(|e| format!("failed to parse tools: {e}"))?;
+        let mut tools: Vec<McpTool> =
+            serde_json::from_value(tools_val).map_err(|e| format!("failed to parse tools: {e}"))?;
 
         // Tag with server name
         for tool in &mut tools {
@@ -139,7 +142,10 @@ impl McpClient {
                 .iter()
                 .filter_map(|block| {
                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        block.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        block
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
@@ -159,8 +165,7 @@ impl McpClient {
         params: Option<Value>,
     ) -> Result<JsonRpcResponse, String> {
         let req = JsonRpcRequest::new(next_id(), method, params);
-        let mut line = serde_json::to_string(&req)
-            .map_err(|e| format!("serialize error: {e}"))?;
+        let mut line = serde_json::to_string(&req).map_err(|e| format!("serialize error: {e}"))?;
         line.push('\n');
 
         {
@@ -169,7 +174,10 @@ impl McpClient {
                 .write_all(line.as_bytes())
                 .await
                 .map_err(|e| format!("write error: {e}"))?;
-            stdin.flush().await.map_err(|e| format!("flush error: {e}"))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|e| format!("flush error: {e}"))?;
         }
 
         let mut response_line = String::new();
@@ -203,8 +211,8 @@ impl McpClient {
             method: method.to_string(),
             params,
         };
-        let mut line = serde_json::to_string(&notif)
-            .map_err(|e| format!("serialize error: {e}"))?;
+        let mut line =
+            serde_json::to_string(&notif).map_err(|e| format!("serialize error: {e}"))?;
         line.push('\n');
 
         let mut stdin = self.stdin.lock().await;
@@ -212,7 +220,10 @@ impl McpClient {
             .write_all(line.as_bytes())
             .await
             .map_err(|e| format!("write error: {e}"))?;
-        stdin.flush().await.map_err(|e| format!("flush error: {e}"))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("flush error: {e}"))?;
 
         Ok(())
     }

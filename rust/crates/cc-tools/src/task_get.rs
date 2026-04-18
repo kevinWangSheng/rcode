@@ -86,7 +86,10 @@ mod tests {
     async fn returns_null_for_unknown_id() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let tool = TaskGetTool { list };
-        let r = tool.execute(json!({"taskId": "999"}), &cancel()).await.unwrap();
+        let r = tool
+            .execute(json!({"taskId": "999"}), &cancel())
+            .await
+            .unwrap();
         assert!(!r.is_error);
         assert!(r.content.contains("null"));
     }
@@ -104,7 +107,10 @@ mod tests {
             .unwrap();
 
         let tool = TaskGetTool { list };
-        let r = tool.execute(json!({"taskId": "1"}), &cancel()).await.unwrap();
+        let r = tool
+            .execute(json!({"taskId": "1"}), &cancel())
+            .await
+            .unwrap();
         assert!(!r.is_error);
         let v: Value = serde_json::from_str(&r.content).unwrap();
         let task = &v["task"];
@@ -127,9 +133,15 @@ mod tests {
     async fn blocks_and_blocked_by_present_in_output() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
-        create.execute(json!({"subject": "T", "description": ""}), &cancel()).await.unwrap();
+        create
+            .execute(json!({"subject": "T", "description": ""}), &cancel())
+            .await
+            .unwrap();
         let tool = TaskGetTool { list };
-        let r = tool.execute(json!({"taskId": "1"}), &cancel()).await.unwrap();
+        let r = tool
+            .execute(json!({"taskId": "1"}), &cancel())
+            .await
+            .unwrap();
         let v: Value = serde_json::from_str(&r.content).unwrap();
         assert!(v["task"]["blocks"].is_array());
         assert!(v["task"]["blockedBy"].is_array());

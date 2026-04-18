@@ -58,18 +58,14 @@ fn transcript_survives_abrupt_child_exit() {
         .expect("child must have written its session id before _exit")
         .trim()
         .to_string();
-    assert!(
-        !session_id.is_empty(),
-        "child recorded an empty session id"
-    );
+    assert!(!session_id.is_empty(), "child recorded an empty session id");
 
     // Reopen the transcript in the parent. Both messages must be present
     // because `append` fsynced each one before the child _exited.
     // HOME is scoped via a single test-wide lock to avoid racing the
     // other integration tests in this binary.
     let _env = EnvLock::with_home(tmp_home.path());
-    let (_session, messages) =
-        Session::resume(&session_id).expect("parent resume must succeed");
+    let (_session, messages) = Session::resume(&session_id).expect("parent resume must succeed");
     let transcript = transcript_path_for(tmp_home.path(), &session_id);
     assert_eq!(
         messages.len(),

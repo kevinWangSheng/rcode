@@ -21,13 +21,8 @@ use crate::types::McpTool;
 pub enum McpServerState {
     Pending,
     Connected(ConnectedServer),
-    Failed {
-        error: String,
-        config: Value,
-    },
-    NeedsAuth {
-        auth_url: String,
-    },
+    Failed { error: String, config: Value },
+    NeedsAuth { auth_url: String },
     Disabled,
 }
 
@@ -56,17 +51,16 @@ pub struct McpManager {
 
 impl McpManager {
     /// Initialize all servers from config.
-    pub async fn init_from_config(
-        config: &HashMap<String, Value>,
-        http: reqwest::Client,
-    ) -> Self {
+    pub async fn init_from_config(config: &HashMap<String, Value>, http: reqwest::Client) -> Self {
         let mut manager = McpManager {
             servers: HashMap::new(),
             http,
         };
 
         for (name, cfg) in config {
-            manager.servers.insert(name.clone(), McpServerState::Pending);
+            manager
+                .servers
+                .insert(name.clone(), McpServerState::Pending);
             if let Err(e) = manager.connect_server(name, cfg).await {
                 warn!("MCP server '{name}' failed to connect: {e}");
                 manager.servers.insert(
@@ -97,9 +91,7 @@ impl McpManager {
                     .and_then(|v| v.as_object())
                     .map(|m| {
                         m.iter()
-                            .filter_map(|(k, v)| {
-                                v.as_str().map(|s| (k.clone(), s.to_string()))
-                            })
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -109,17 +101,16 @@ impl McpManager {
                 // lenient on config parsing in case someone hand-edits).
                 let timeout_ms = config
                     .get("timeout_ms")
-                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                     .unwrap_or(30_000);
 
-                let mut client =
-                    McpHttpClient::connect_with(name, url, headers, timeout_ms)
-                        .await
-                        .map_err(cc_core::CcError::Other)?;
-                let tools = client
-                    .list_tools()
+                let mut client = McpHttpClient::connect_with(name, url, headers, timeout_ms)
                     .await
                     .map_err(cc_core::CcError::Other)?;
+                let tools = client.list_tools().await.map_err(cc_core::CcError::Other)?;
                 (Arc::new(Mutex::new(client)), tools)
             }
             (None, Some(command)) => {
@@ -136,10 +127,7 @@ impl McpManager {
                 let mut client = McpClient::connect(name, command, &arg_refs)
                     .await
                     .map_err(cc_core::CcError::Other)?;
-                let tools = client
-                    .list_tools()
-                    .await
-                    .map_err(cc_core::CcError::Other)?;
+                let tools = client.list_tools().await.map_err(cc_core::CcError::Other)?;
                 (Arc::new(Mutex::new(client)), tools)
             }
             (None, None) => {
@@ -149,10 +137,7 @@ impl McpManager {
             }
         };
 
-        debug!(
-            "MCP server '{name}' connected with {} tools",
-            tools.len()
-        );
+        debug!("MCP server '{name}' connected with {} tools", tools.len());
 
         self.servers.insert(
             name.to_string(),

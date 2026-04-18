@@ -82,11 +82,7 @@ async fn write_empty_202(sock: &mut TcpStream) {
 }
 
 /// Write an SSE response with an explicit `id:` line for the final event.
-async fn write_sse_with_event_id(
-    sock: &mut TcpStream,
-    event_id: &str,
-    body_json: &Value,
-) {
+async fn write_sse_with_event_id(sock: &mut TcpStream, event_id: &str, body_json: &Value) {
     let payload = format!(
         "event: message\nid: {event_id}\ndata: {}\n\n",
         serde_json::to_string(body_json).unwrap()
@@ -225,7 +221,10 @@ async fn custom_headers_from_config_reach_server() {
     });
 
     let mut extra = HashMap::new();
-    extra.insert("Authorization".to_string(), "Bearer secret-token-xyz".to_string());
+    extra.insert(
+        "Authorization".to_string(),
+        "Bearer secret-token-xyz".to_string(),
+    );
     extra.insert("X-Api-Version".to_string(), "2025-01".to_string());
 
     let _client = McpHttpClient::connect_with_headers("stub", &url, extra)
@@ -328,9 +327,13 @@ async fn close_sends_delete_with_session_id() {
         let mut total = Vec::new();
         loop {
             let n = sock.read(&mut buf).await.unwrap_or(0);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             total.extend_from_slice(&buf[..n]);
-            if find_subseq(&total, b"\r\n\r\n").is_some() { break; }
+            if find_subseq(&total, b"\r\n\r\n").is_some() {
+                break;
+            }
         }
         let request = std::str::from_utf8(&total).unwrap_or("");
         assert!(
@@ -339,7 +342,9 @@ async fn close_sends_delete_with_session_id() {
             request.lines().next().unwrap_or("")
         );
         assert!(
-            request.to_ascii_lowercase().contains(&format!("mcp-session-id: {SESSION_ID}").to_ascii_lowercase()),
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("mcp-session-id: {SESSION_ID}").to_ascii_lowercase()),
             "DELETE must include Mcp-Session-Id header"
         );
         let _ = sock
@@ -428,7 +433,10 @@ async fn session_404_triggers_reconnect_and_retry() {
         //    with no session ID, for which we hand back v2.
         let (mut sock, _) = listener.accept().await.unwrap();
         let (headers, req) = read_request(&mut sock).await;
-        assert_eq!(req["method"], "initialize", "reconnect must replay initialize");
+        assert_eq!(
+            req["method"], "initialize",
+            "reconnect must replay initialize"
+        );
         assert!(
             !headers.contains_key("mcp-session-id"),
             "reconnected initialize must not carry the expired session id"
@@ -488,7 +496,10 @@ async fn session_404_triggers_reconnect_and_retry() {
 
     // tools/list triggers a 404 → reconnect → retry → success.
     // Caller sees a successful response, not the transient 404.
-    let tools = client.list_tools().await.expect("tools/list after reconnect");
+    let tools = client
+        .list_tools()
+        .await
+        .expect("tools/list after reconnect");
     assert!(tools.is_empty());
 
     // Session state reflects the reconnect: new id + bumped version.
@@ -525,7 +536,8 @@ async fn second_404_in_a_row_surfaces_error() {
                 "result":{"protocolVersion":"2024-11-05","capabilities":{},
                     "serverInfo":{"name":"stub","version":"0.0.1"}}
             }),
-        ).await;
+        )
+        .await;
 
         // initialized notif
         let (mut sock, _) = listener.accept().await.unwrap();
@@ -536,10 +548,16 @@ async fn second_404_in_a_row_surfaces_error() {
         let (mut sock, _) = listener.accept().await.unwrap();
         let _ = read_request(&mut sock).await;
         let body_str = r#"{"jsonrpc":"2.0","error":{"code":-32001,"message":"expired"}}"#;
-        let _ = sock.write_all(
-            format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+        let _ = sock
+            .write_all(
+                format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
-                    body_str.len()).as_bytes()).await;
+                    body_str.len()
+                )
+                .as_bytes(),
+            )
+            .await;
         let _ = sock.shutdown().await;
 
         // reconnect initialize v2
@@ -555,7 +573,8 @@ async fn second_404_in_a_row_surfaces_error() {
                 "result":{"protocolVersion":"2024-11-05","capabilities":{},
                     "serverInfo":{"name":"stub","version":"0.0.1"}}
             }),
-        ).await;
+        )
+        .await;
 
         // reconnect notif
         let (mut sock, _) = listener.accept().await.unwrap();
@@ -570,16 +589,28 @@ async fn second_404_in_a_row_surfaces_error() {
             Some(SESSION_ID_V2),
             "retry carries the post-reconnect session id"
         );
-        let _ = sock.write_all(
-            format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+        let _ = sock
+            .write_all(
+                format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
-                    body_str.len()).as_bytes()).await;
+                    body_str.len()
+                )
+                .as_bytes(),
+            )
+            .await;
         let _ = sock.shutdown().await;
     });
 
     let mut client = McpHttpClient::connect("stub", &url).await.expect("connect");
-    let err = client.list_tools().await.expect_err("second 404 must surface");
-    assert!(err.contains("session expired") || err.contains("404"), "got: {err}");
+    let err = client
+        .list_tools()
+        .await
+        .expect_err("second 404 must surface");
+    assert!(
+        err.contains("session expired") || err.contains("404"),
+        "got: {err}"
+    );
     // The doomed v2 session id is dropped so the *next* caller starts fresh.
     assert_eq!(
         client.session_id().await,
@@ -597,8 +628,8 @@ async fn second_404_in_a_row_surfaces_error() {
 /// the fresh session id. All five must ultimately succeed.
 #[tokio::test]
 async fn concurrent_404s_trigger_only_one_reconnect() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -628,7 +659,8 @@ async fn concurrent_404s_trigger_only_one_reconnect() {
                 "result":{"protocolVersion":"2024-11-05","capabilities":{},
                     "serverInfo":{"name":"stub","version":"0.0.1"}}
             }),
-        ).await;
+        )
+        .await;
         // initialized notif
         let (mut sock, _) = listener.accept().await.unwrap();
         let _ = read_request(&mut sock).await;
@@ -654,10 +686,16 @@ async fn concurrent_404s_trigger_only_one_reconnect() {
         // Now respond 404 to all five simultaneously.
         for mut sock in pending_v1 {
             let body_str = r#"{"jsonrpc":"2.0","error":{"code":-32001,"message":"expired"}}"#;
-            let _ = sock.write_all(
-                format!("HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
-                        body_str.len()).as_bytes()).await;
+                        body_str.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
             let _ = sock.shutdown().await;
         }
 
@@ -666,7 +704,10 @@ async fn concurrent_404s_trigger_only_one_reconnect() {
         // `notifications/initialized` pair.
         let (mut sock, _) = listener.accept().await.unwrap();
         let (headers, req) = read_request(&mut sock).await;
-        assert_eq!(req["method"], "initialize", "reconnect must replay initialize");
+        assert_eq!(
+            req["method"], "initialize",
+            "reconnect must replay initialize"
+        );
         assert!(
             !headers.contains_key("mcp-session-id"),
             "reconnect must not carry the stale session id"
@@ -682,7 +723,8 @@ async fn concurrent_404s_trigger_only_one_reconnect() {
                 "result":{"protocolVersion":"2024-11-05","capabilities":{},
                     "serverInfo":{"name":"stub","version":"0.0.1"}}
             }),
-        ).await;
+        )
+        .await;
         let (mut sock, _) = listener.accept().await.unwrap();
         let _ = read_request(&mut sock).await;
         write_empty_202(&mut sock).await;
@@ -706,7 +748,8 @@ async fn concurrent_404s_trigger_only_one_reconnect() {
                     "jsonrpc":"2.0","id":id,
                     "result":{"content":[{"type":"text","text":"ok"}]}
                 }),
-            ).await;
+            )
+            .await;
         }
     });
 
@@ -728,14 +771,21 @@ async fn concurrent_404s_trigger_only_one_reconnect() {
     }
     for t in tasks {
         let resp = t.await.unwrap().expect("tools/call after reconnect");
-        assert!(resp.error.is_none(), "unexpected JSON-RPC error: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "unexpected JSON-RPC error: {:?}",
+            resp.error
+        );
     }
 
     // Final state: exactly two `initialize` calls hit the server
     // (original connect + one reconnect), session version bumped once,
     // fresh session id installed.
-    assert_eq!(initialize_count.load(Ordering::SeqCst), 2,
-        "must be exactly one reconnect for the whole 5-way race");
+    assert_eq!(
+        initialize_count.load(Ordering::SeqCst),
+        2,
+        "must be exactly one reconnect for the whole 5-way race"
+    );
     assert_eq!(client.session_version(), 1);
     assert_eq!(client.session_id().await.as_deref(), Some(SESSION_ID_V2));
     server.await.unwrap();

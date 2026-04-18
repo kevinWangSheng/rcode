@@ -9,8 +9,7 @@
 
 // Re-export cc_core hook types for convenience of downstream crates.
 pub use cc_core::hook::{
-    HookConfig, HookInput, HookJsonResponse, HookKind, HookMatcherGroup, HookOutcome,
-    HooksSettings,
+    HookConfig, HookInput, HookJsonResponse, HookKind, HookMatcherGroup, HookOutcome, HooksSettings,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -330,7 +329,10 @@ async fn execute_one_hook(
                 warn!("http hook missing `url` field; skipping");
                 return (HookOutcome::Ok, None);
             };
-            (run_http_hook(http, url, input_json, &hook.headers).await, None)
+            (
+                run_http_hook(http, url, input_json, &hook.headers).await,
+                None,
+            )
         }
         HookKind::Agent => {
             let agent_name = hook.agent.as_deref().unwrap_or("unknown");
@@ -364,7 +366,12 @@ async fn run_command_hook(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (HookOutcome::Failed(format!("failed to spawn hook: {e}")), None),
+        Err(e) => {
+            return (
+                HookOutcome::Failed(format!("failed to spawn hook: {e}")),
+                None,
+            )
+        }
     };
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -374,7 +381,12 @@ async fn run_command_hook(
 
     let output = match child.wait_with_output().await {
         Ok(o) => o,
-        Err(e) => return (HookOutcome::Failed(format!("failed to wait for hook: {e}")), None),
+        Err(e) => {
+            return (
+                HookOutcome::Failed(format!("failed to wait for hook: {e}")),
+                None,
+            )
+        }
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
@@ -588,8 +600,7 @@ mod tests {
 
     #[test]
     fn matcher_group_deserialization() {
-        let json =
-            r#"{"matcher":"Bash(git *)","hooks":[{"type":"command","command":"echo hi"}]}"#;
+        let json = r#"{"matcher":"Bash(git *)","hooks":[{"type":"command","command":"echo hi"}]}"#;
         let group: HookMatcherGroup = serde_json::from_str(json).unwrap();
         assert_eq!(group.matcher.as_deref(), Some("Bash(git *)"));
         assert_eq!(group.hooks.len(), 1);
@@ -718,7 +729,11 @@ mod tests {
         let result = runner.run("PreToolUse", &input, &cancel).await;
         // Command exits 0 if both vars are set → not blocked, no failures
         assert!(!result.blocked);
-        assert!(result.failures.is_empty(), "failures: {:?}", result.failures);
+        assert!(
+            result.failures.is_empty(),
+            "failures: {:?}",
+            result.failures
+        );
     }
 
     #[tokio::test]
@@ -784,6 +799,10 @@ mod tests {
         let elapsed = start.elapsed();
         std::env::remove_var("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS");
         // Should return in ~100ms, well under 1 second
-        assert!(elapsed < std::time::Duration::from_secs(1), "took {:?}", elapsed);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {:?}",
+            elapsed
+        );
     }
 }

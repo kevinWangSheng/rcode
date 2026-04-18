@@ -118,20 +118,36 @@ impl Tool for ToolSearchTool {
                 })
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0));
-            scored.into_iter().map(|(_, t)| t).take(max_results).collect()
+            scored
+                .into_iter()
+                .map(|(_, t)| t)
+                .take(max_results)
+                .collect()
         } else {
             // Keyword search — rank by matches in name + description
-            let keywords: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
+            let keywords: Vec<String> =
+                query.split_whitespace().map(|s| s.to_lowercase()).collect();
             let mut scored: Vec<(usize, ToolEntry)> = tools
                 .into_iter()
                 .filter_map(|t| {
                     let haystack = format!("{} {}", t.name, t.description).to_lowercase();
-                    let score = keywords.iter().filter(|kw| haystack.contains(kw.as_str())).count();
-                    if score > 0 { Some((score, t)) } else { None }
+                    let score = keywords
+                        .iter()
+                        .filter(|kw| haystack.contains(kw.as_str()))
+                        .count();
+                    if score > 0 {
+                        Some((score, t))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0));
-            scored.into_iter().map(|(_, t)| t).take(max_results).collect()
+            scored
+                .into_iter()
+                .map(|(_, t)| t)
+                .take(max_results)
+                .collect()
         };
 
         if matches.is_empty() {
@@ -148,7 +164,10 @@ impl Tool for ToolSearchTool {
                 "name": tool.name,
                 "parameters": tool.schema,
             });
-            lines.push(format!("<function>{}</function>", serde_json::to_string(&def).unwrap()));
+            lines.push(format!(
+                "<function>{}</function>",
+                serde_json::to_string(&def).unwrap()
+            ));
         }
         lines.push("</functions>".to_string());
 
@@ -162,11 +181,16 @@ mod tests {
 
     fn make_tool(entries: Vec<ToolEntry>) -> ToolSearchTool {
         ToolSearchTool {
-            list_tools: Some(Arc::new(move || entries.iter().map(|e| ToolEntry {
-                name: e.name.clone(),
-                description: e.description.clone(),
-                schema: e.schema.clone(),
-            }).collect())),
+            list_tools: Some(Arc::new(move || {
+                entries
+                    .iter()
+                    .map(|e| ToolEntry {
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        schema: e.schema.clone(),
+                    })
+                    .collect()
+            })),
         }
     }
 
@@ -194,7 +218,10 @@ mod tests {
     async fn select_exact_names() {
         let tool = make_tool(sample_tools());
         let r = tool
-            .execute(json!({"query": "select:Read,Write"}), &CancellationToken::new())
+            .execute(
+                json!({"query": "select:Read,Write"}),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -220,7 +247,10 @@ mod tests {
     async fn no_match_returns_message() {
         let tool = make_tool(sample_tools());
         let r = tool
-            .execute(json!({"query": "nonexistent_xyz"}), &CancellationToken::new())
+            .execute(
+                json!({"query": "nonexistent_xyz"}),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);

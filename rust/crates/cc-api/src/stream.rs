@@ -18,7 +18,11 @@ pub enum StreamError {
     /// The accumulated JSON buffer for a `tool_use` block could not be parsed
     /// at end-of-stream. `raw` is truncated to `TOOL_INPUT_RAW_MAX` bytes.
     #[error("tool_use input for tool '{name}' (id {id}) was not valid JSON: {raw}")]
-    ToolInputNotJson { id: String, name: String, raw: String },
+    ToolInputNotJson {
+        id: String,
+        name: String,
+        raw: String,
+    },
 }
 
 impl From<StreamError> for CcError {
@@ -95,9 +99,17 @@ pub struct MessageStartData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockStartData {
-    Text { text: String },
-    Thinking { thinking: String },
-    ToolUse { id: String, name: String, input: Value },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,9 +148,18 @@ pub struct StreamAccumulator {
 
 #[derive(Debug)]
 enum BlockState {
-    Text { text: String },
-    Thinking { thinking: String, signature: Option<String> },
-    ToolUse { id: String, name: String, json: String },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
 }
 
 impl StreamAccumulator {
@@ -151,11 +172,16 @@ impl StreamAccumulator {
                 self.cache_creation_input_tokens = message.usage.cache_creation_input_tokens;
                 self.cache_read_input_tokens = message.usage.cache_read_input_tokens;
             }
-            StreamEvent::ContentBlockStart { index, content_block } => {
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
                 let idx = *index as usize;
                 // Grow if needed.
                 while self.blocks.len() <= idx {
-                    self.blocks.push(BlockState::Text { text: String::new() });
+                    self.blocks.push(BlockState::Text {
+                        text: String::new(),
+                    });
                 }
                 match content_block {
                     ContentBlockStartData::Text { text } => {
@@ -183,13 +209,22 @@ impl StreamAccumulator {
                         (BlockState::Text { text }, ContentBlockDelta::TextDelta { text: d }) => {
                             text.push_str(d);
                         }
-                        (BlockState::Thinking { thinking, .. }, ContentBlockDelta::ThinkingDelta { thinking: d }) => {
+                        (
+                            BlockState::Thinking { thinking, .. },
+                            ContentBlockDelta::ThinkingDelta { thinking: d },
+                        ) => {
                             thinking.push_str(d);
                         }
-                        (BlockState::Thinking { signature, .. }, ContentBlockDelta::SignatureDelta { signature: s }) => {
+                        (
+                            BlockState::Thinking { signature, .. },
+                            ContentBlockDelta::SignatureDelta { signature: s },
+                        ) => {
                             *signature = Some(s.clone());
                         }
-                        (BlockState::ToolUse { json, .. }, ContentBlockDelta::InputJsonDelta { partial_json }) => {
+                        (
+                            BlockState::ToolUse { json, .. },
+                            ContentBlockDelta::InputJsonDelta { partial_json },
+                        ) => {
                             json.push_str(partial_json);
                         }
                         _ => {}
@@ -220,7 +255,10 @@ impl StreamAccumulator {
                     out.push(ContentBlock::text(text));
                 }
                 BlockState::Text { .. } => {}
-                BlockState::Thinking { thinking, signature } if !thinking.is_empty() => {
+                BlockState::Thinking {
+                    thinking,
+                    signature,
+                } if !thinking.is_empty() => {
                     out.push(ContentBlock::Thinking(cc_core::ThinkingBlock {
                         thinking,
                         signature,
@@ -228,13 +266,12 @@ impl StreamAccumulator {
                 }
                 BlockState::Thinking { .. } => {}
                 BlockState::ToolUse { id, name, json } => {
-                    let input: Value = serde_json::from_str(&json).map_err(|_| {
-                        StreamError::ToolInputNotJson {
+                    let input: Value =
+                        serde_json::from_str(&json).map_err(|_| StreamError::ToolInputNotJson {
                             id: id.clone(),
                             name: name.clone(),
                             raw: truncate_raw(&json),
-                        }
-                    })?;
+                        })?;
                     out.push(ContentBlock::ToolUse(cc_core::ToolUseBlock {
                         id,
                         name,
@@ -303,26 +340,40 @@ mod tests {
                 model: "claude-sonnet-4-6".into(),
                 stop_reason: None,
                 stop_sequence: None,
-                usage: Usage { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: None, cache_read_input_tokens: None },
+                usage: Usage {
+                    input_tokens: 100,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
             },
         });
 
         acc.apply(&StreamEvent::ContentBlockStart {
             index: 0,
-            content_block: ContentBlockStartData::Text { text: String::new() },
+            content_block: ContentBlockStartData::Text {
+                text: String::new(),
+            },
         });
 
         acc.apply(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentBlockDelta::TextDelta { text: "Hello ".into() },
+            delta: ContentBlockDelta::TextDelta {
+                text: "Hello ".into(),
+            },
         });
         acc.apply(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentBlockDelta::TextDelta { text: "world!".into() },
+            delta: ContentBlockDelta::TextDelta {
+                text: "world!".into(),
+            },
         });
 
         acc.apply(&StreamEvent::MessageDelta {
-            delta: MessageDeltaData { stop_reason: Some(StopReason::EndTurn), stop_sequence: None },
+            delta: MessageDeltaData {
+                stop_reason: Some(StopReason::EndTurn),
+                stop_sequence: None,
+            },
             usage: MessageDeltaUsage { output_tokens: 10 },
         });
 
@@ -362,11 +413,15 @@ mod tests {
 
         acc.apply(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentBlockDelta::InputJsonDelta { partial_json: r#"{"com"#.into() },
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: r#"{"com"#.into(),
+            },
         });
         acc.apply(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentBlockDelta::InputJsonDelta { partial_json: r#"mand":"ls"}"#.into() },
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: r#"mand":"ls"}"#.into(),
+            },
         });
 
         let content = acc.into_content().expect("tool_use JSON parses");
@@ -387,7 +442,8 @@ mod tests {
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, StreamEvent::MessageStart { .. }));
 
-        let json = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#;
+        let json =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#;
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(event, StreamEvent::ContentBlockDelta { .. }));
 
@@ -419,8 +475,14 @@ mod tests {
             StreamError::ToolInputNotJson { id, name, raw } => {
                 assert_eq!(id, "tool_abc");
                 assert_eq!(name, "Write");
-                assert!(raw.contains("/tmp/x"), "raw should include buffer fragment: {raw}");
-                assert!(raw.contains("\"content"), "raw should show truncation point: {raw}");
+                assert!(
+                    raw.contains("/tmp/x"),
+                    "raw should include buffer fragment: {raw}"
+                );
+                assert!(
+                    raw.contains("\"content"),
+                    "raw should show truncation point: {raw}"
+                );
             }
         }
     }
@@ -459,7 +521,9 @@ mod tests {
             &[
                 StreamEvent::ContentBlockStart {
                     index: 0,
-                    content_block: ContentBlockStartData::Text { text: String::new() },
+                    content_block: ContentBlockStartData::Text {
+                        text: String::new(),
+                    },
                 },
                 StreamEvent::ContentBlockDelta {
                     index: 0,

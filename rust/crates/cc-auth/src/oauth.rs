@@ -215,7 +215,8 @@ pub async fn wait_for_callback(
                 }
                 (Some(code), Some(_)) => {
                     // Success — redirect browser to the claude.ai success page.
-                    let body = b"<html><body>Login complete - you can close this tab.</body></html>";
+                    let body =
+                        b"<html><body>Login complete - you can close this tab.</body></html>";
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
                         body.len()
@@ -241,9 +242,12 @@ pub async fn wait_for_callback(
         }
     };
 
-    tokio::time::timeout(timeout, fut)
-        .await
-        .map_err(|_| CcError::Auth(format!("timed out after {:?} waiting for OAuth callback", timeout)))?
+    tokio::time::timeout(timeout, fut).await.map_err(|_| {
+        CcError::Auth(format!(
+            "timed out after {:?} waiting for OAuth callback",
+            timeout
+        ))
+    })?
 }
 
 /// 5-minute safety buffer for expiry checks. Matches TS `isOAuthTokenExpired`
@@ -406,7 +410,9 @@ pub async fn run_login_flow(cfg: OAuthConfig) -> CcResult<std::path::PathBuf> {
 fn open_in_browser(url: &str) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("/usr/bin/open").arg(url).status()
+        std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .status()
     }
     #[cfg(target_os = "linux")]
     {
@@ -414,7 +420,9 @@ fn open_in_browser(url: &str) -> std::io::Result<std::process::ExitStatus> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd").args(["/c", "start", "", url]).status()
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .status()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -434,7 +442,9 @@ mod tests {
         let v = generate_code_verifier();
         // 32 bytes base64url-no-pad = 43 chars
         assert_eq!(v.len(), 43);
-        assert!(v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(v
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -517,7 +527,9 @@ mod tests {
     /// Minimal one-shot HTTP/1.1 handler for the token endpoint. Reads the
     /// request, discards it, and replies with `body`. Used by refresh tests
     /// to avoid pulling in wiremock/mockito just for a single endpoint.
-    async fn spawn_mock_token_endpoint(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_token_endpoint(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let url = format!("http://127.0.0.1:{port}/v1/oauth/token");
@@ -566,7 +578,9 @@ mod tests {
             ..OAuthConfig::default()
         };
         let http = reqwest::Client::new();
-        let tokens = refresh_oauth_token(&cfg, &http, "old-refresh-123").await.unwrap();
+        let tokens = refresh_oauth_token(&cfg, &http, "old-refresh-123")
+            .await
+            .unwrap();
         assert_eq!(tokens.access_token, "new-access-xyz");
         assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh-abc"));
         assert_eq!(tokens.expires_in, Some(28800));
@@ -576,16 +590,17 @@ mod tests {
     #[tokio::test]
     async fn refresh_oauth_token_carries_old_refresh_forward() {
         // Server returns no refresh_token — we should fall back to the one we sent.
-        let (token_url, server) = spawn_mock_token_endpoint(
-            r#"{"access_token":"new-access-xyz","expires_in":28800}"#,
-        )
-        .await;
+        let (token_url, server) =
+            spawn_mock_token_endpoint(r#"{"access_token":"new-access-xyz","expires_in":28800}"#)
+                .await;
         let cfg = OAuthConfig {
             token_url,
             ..OAuthConfig::default()
         };
         let http = reqwest::Client::new();
-        let tokens = refresh_oauth_token(&cfg, &http, "kept-refresh-999").await.unwrap();
+        let tokens = refresh_oauth_token(&cfg, &http, "kept-refresh-999")
+            .await
+            .unwrap();
         assert_eq!(tokens.refresh_token.as_deref(), Some("kept-refresh-999"));
         server.await.unwrap();
     }
@@ -616,7 +631,9 @@ mod tests {
             ..OAuthConfig::default()
         };
         let http = reqwest::Client::new();
-        let err = refresh_oauth_token(&cfg, &http, "dead-refresh").await.unwrap_err();
+        let err = refresh_oauth_token(&cfg, &http, "dead-refresh")
+            .await
+            .unwrap_err();
         assert!(matches!(err, CcError::Auth(msg) if msg.contains("refresh failed")));
         server.await.unwrap();
     }
@@ -629,7 +646,9 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = client
-                .get(format!("http://localhost:{port}/callback?code=x&state=wrong"))
+                .get(format!(
+                    "http://localhost:{port}/callback?code=x&state=wrong"
+                ))
                 .send()
                 .await;
         });

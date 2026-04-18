@@ -13,14 +13,12 @@ use cc_hooks::{HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryOptions},
-    SubAgentRunnerImpl, StdinPrompter, ToolRegistry,
+    StdinPrompter, SubAgentRunnerImpl, ToolRegistry,
 };
 use cc_session::{list_sessions, Session, SessionMetadata};
 use cc_tools::{
-    agent_tool::AgentTool,
-    ask_user_question::AskUserQuestionTool,
+    agent_tool::AgentTool, all_tools, ask_user_question::AskUserQuestionTool,
     team_create::TeamCreateTool,
-    all_tools,
 };
 use cc_tui::TuiConfig;
 
@@ -201,10 +199,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             serde_json::from_value(hooks_raw_pre).unwrap_or_default()
         };
-        let http_pre = cc_http::build_client(&cc_http::HttpClientConfig::from_env()).unwrap_or_default();
+        let http_pre =
+            cc_http::build_client(&cc_http::HttpClientConfig::from_env()).unwrap_or_default();
         let pre_runner = HookRunner::new(&hooks_config_pre, http_pre);
         let cancel_pre = tokio_util::sync::CancellationToken::new();
-        let _ = pre_runner.run("SessionStart", &session_start_input, &cancel_pre).await;
+        let _ = pre_runner
+            .run("SessionStart", &session_start_input, &cancel_pre)
+            .await;
     }
 
     eprintln!("Session: {}", session.id);
@@ -231,13 +232,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Some(text) => text.clone(),
             None => {
                 if atty_is_stdin() && resume_id.is_none() {
-                    return Err(
-                        "no message provided — use --message or pipe text via stdin".into(),
-                    );
+                    return Err("no message provided — use --message or pipe text via stdin".into());
                 }
                 if resume_id.is_some() && cli.message.is_none() {
                     return Err(
-                        "--resume/--continue without TUI requires --message for the next turn".into(),
+                        "--resume/--continue without TUI requires --message for the next turn"
+                            .into(),
                     );
                 }
                 let mut buf = String::new();
@@ -314,7 +314,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     {
         let ask_prompter: Arc<dyn cc_core::PermissionPrompter> =
             Arc::new(StdinPrompter::new(non_interactive));
-        tools.push(Arc::new(AskUserQuestionTool { prompter: ask_prompter }));
+        tools.push(Arc::new(AskUserQuestionTool {
+            prompter: ask_prompter,
+        }));
     }
 
     // Wire AgentTool: build a base registry (without AgentTool) to give to the
@@ -348,11 +350,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         // Wire ToolSearchTool: snapshot the current tool list as a lister closure.
         let snapshot: Vec<Arc<dyn cc_core::tool::Tool>> = tools.clone();
         let lister: cc_tools::tool_search::ToolLister = Arc::new(move || {
-            snapshot.iter().map(|t| cc_tools::tool_search::ToolEntry {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                schema: serde_json::to_value(t.input_schema()).unwrap_or_default(),
-            }).collect()
+            snapshot
+                .iter()
+                .map(|t| cc_tools::tool_search::ToolEntry {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    schema: serde_json::to_value(t.input_schema()).unwrap_or_default(),
+                })
+                .collect()
         });
         tools.push(Arc::new(cc_tools::tool_search::ToolSearchTool {
             list_tools: Some(lister),
@@ -398,8 +403,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         //
         // The events channel must be pre-created here so that ChannelPrompter
         // (passed to QueryEngine) and the engine itself share the same sender.
-        let (events_tx, events_rx) =
-            tokio::sync::mpsc::channel::<cc_core::AppEvent>(512);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel::<cc_core::AppEvent>(512);
         let tui_prompter: Arc<dyn cc_core::PermissionPrompter> =
             Arc::new(cc_tui::ChannelPrompter::new(events_tx.clone()));
 
@@ -419,9 +423,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
 
         // Discover skills and build the command registry.
-        let config_dir = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".claude");
+        let config_dir = dirs::home_dir().unwrap_or_default().join(".claude");
         let commands = cc_tui::CommandRegistry::discover(&config_dir);
         let cmd_ctx = cc_tui::CommandContext {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -478,10 +480,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let stdout = io::stdout();
             let mut out = stdout.lock();
             let final_text = engine
-                .run_turn(user_text, |delta| {
-                    let _ = out.write_all(delta.as_bytes());
-                    let _ = out.flush();
-                }, &mut messages, &cancel)
+                .run_turn(
+                    user_text,
+                    |delta| {
+                        let _ = out.write_all(delta.as_bytes());
+                        let _ = out.flush();
+                    },
+                    &mut messages,
+                    &cancel,
+                )
                 .await?;
             writeln!(out)?;
             tracing::debug!("session: {}", engine.session().id);
@@ -490,9 +497,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         OutputFormat::Json => {
             let mut full_text = String::new();
             let final_text = engine
-                .run_turn(user_text, |delta| {
-                    full_text.push_str(delta);
-                }, &mut messages, &cancel)
+                .run_turn(
+                    user_text,
+                    |delta| {
+                        full_text.push_str(delta);
+                    },
+                    &mut messages,
+                    &cancel,
+                )
                 .await?;
             let output = json!({
                 "session_id": engine.session().id,
@@ -641,7 +653,10 @@ mod tests {
     use serde_json::json;
 
     fn cc_scope(block: &SystemBlock) -> Option<&str> {
-        block.cache_control.as_ref().and_then(|c| c.scope.as_deref())
+        block
+            .cache_control
+            .as_ref()
+            .and_then(|c| c.scope.as_deref())
     }
 
     fn cc_kind(block: &SystemBlock) -> Option<&str> {
@@ -657,7 +672,11 @@ mod tests {
             &[],
         );
 
-        assert_eq!(blocks.len(), 4, "expected 4 blocks (attr + static + git + memory)");
+        assert_eq!(
+            blocks.len(),
+            4,
+            "expected 4 blocks (attr + static + git + memory)"
+        );
 
         // Block 0: attribution, no cache_control.
         assert!(
@@ -681,12 +700,7 @@ mod tests {
 
     #[test]
     fn three_tier_tagging_serialized_wire_shape() {
-        let blocks = build_system_blocks_inner(
-            "claude-sonnet-4-6",
-            None,
-            Some("mem".into()),
-            &[],
-        );
+        let blocks = build_system_blocks_inner("claude-sonnet-4-6", None, Some("mem".into()), &[]);
         let wire = serde_json::to_value(&blocks).expect("serialize");
 
         // Attribution block: no cache_control key at all (skip_serializing_if).

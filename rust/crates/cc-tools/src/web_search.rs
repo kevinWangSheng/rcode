@@ -18,7 +18,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 
 use crate::web_fetch::ssrf;
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 const BRAVE_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
@@ -54,7 +54,8 @@ impl Tool for WebSearchTool {
                 }
             },
             "required": ["query"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn is_read_only(&self) -> bool {
@@ -174,7 +175,10 @@ fn format_brave_results(body: &Value, query: &str) -> String {
 
     let mut out = format!("Search query: {query}\n\n");
     for (i, item) in results.iter().enumerate() {
-        let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no title)");
         let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let desc = item
             .get("description")
@@ -201,7 +205,10 @@ mod tests {
     async fn execute_empty_query_returns_error_result() {
         let cancel = CancellationToken::new();
         let tool = WebSearchTool;
-        let result = tool.execute(json!({"query": "   "}), &cancel).await.unwrap();
+        let result = tool
+            .execute(json!({"query": "   "}), &cancel)
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("empty"));
     }

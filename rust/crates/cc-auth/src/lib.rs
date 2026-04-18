@@ -178,9 +178,12 @@ async fn maybe_refresh_file_tokens(
                 refresh_token: resp.refresh_token.clone(),
                 expires_at,
             };
-            if let Err(e) =
-                write_oauth_token_to_path(path, &new_tokens.access_token, new_tokens.refresh_token.clone(), expires_at)
-            {
+            if let Err(e) = write_oauth_token_to_path(
+                path,
+                &new_tokens.access_token,
+                new_tokens.refresh_token.clone(),
+                expires_at,
+            ) {
                 tracing::warn!("refreshed token but failed to persist: {e}");
             }
             Ok(new_tokens)
@@ -247,7 +250,10 @@ mod tests {
 
     #[test]
     fn api_key_source_display() {
-        assert_eq!(ApiKeySource::EnvVar.to_string(), "ANTHROPIC_API_KEY env var");
+        assert_eq!(
+            ApiKeySource::EnvVar.to_string(),
+            "ANTHROPIC_API_KEY env var"
+        );
         assert_eq!(ApiKeySource::File.to_string(), "credentials file");
         assert_eq!(ApiKeySource::Keychain.to_string(), "system keychain");
     }
@@ -255,7 +261,9 @@ mod tests {
     /// Same hand-rolled token endpoint used by `oauth::tests`. Duplicated here
     /// to keep the refresh-through-file integration test self-contained —
     /// the oauth module's copy is `mod tests`-private.
-    async fn spawn_mock_token_endpoint(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_token_endpoint(
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -358,7 +366,12 @@ mod tests {
         let path = dir.path().join("creds.json");
         std::env::set_var("CLAUDE_CREDENTIALS_FILE", &path);
         let expires_at = oauth::now_ms() + 60 * 60 * 1000;
-        write_oauth_token("fresh-access", Some("fresh-refresh".into()), Some(expires_at)).unwrap();
+        write_oauth_token(
+            "fresh-access",
+            Some("fresh-refresh".into()),
+            Some(expires_at),
+        )
+        .unwrap();
 
         // Point at an unreachable URL — if the code tried to refresh, the
         // network call would fail and we'd fall back to the stale token,

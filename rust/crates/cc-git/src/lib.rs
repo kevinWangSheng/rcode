@@ -59,13 +59,16 @@ impl GitContext {
         }
 
         // Get repo root
-        if let Some(output) =
-            run_git_output(&["rev-parse", "--show-toplevel"], cwd, bound, "rev-parse --show-toplevel")
-                .await
+        if let Some(output) = run_git_output(
+            &["rev-parse", "--show-toplevel"],
+            cwd,
+            bound,
+            "rev-parse --show-toplevel",
+        )
+        .await
         {
             if output.status.success() {
-                ctx.repo_root =
-                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                ctx.repo_root = Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
             }
         }
 
@@ -172,9 +175,7 @@ pub async fn is_bare_repo(cwd: &Path) -> bool {
     )
     .await
     {
-        Some(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim() == "true"
-        }
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "true",
         _ => false,
     }
 }
@@ -541,10 +542,9 @@ mod tests {
         // SAFETY: env access in tests — restored before returning.
         std::env::set_var(
             "PATH",
-            std::env::join_paths(
-                std::iter::once(stub_dir.path().to_path_buf())
-                    .chain(std::env::split_paths(orig_path.as_deref().unwrap_or_default())),
-            )
+            std::env::join_paths(std::iter::once(stub_dir.path().to_path_buf()).chain(
+                std::env::split_paths(orig_path.as_deref().unwrap_or_default()),
+            ))
             .unwrap(),
         );
         std::env::set_var("CC_GIT_IGNORE_TIMEOUT_MS", "300");
@@ -555,9 +555,11 @@ mod tests {
         let paths: Vec<&Path> = vec![p1.as_path(), p2.as_path()];
 
         let started = std::time::Instant::now();
-        let result =
-            tokio::time::timeout(Duration::from_secs(6), filter_git_ignored(&paths, cwd.path()))
-                .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            filter_git_ignored(&paths, cwd.path()),
+        )
+        .await;
         let elapsed = started.elapsed();
 
         // Restore env first, then assert, so a failure doesn't poison other tests.

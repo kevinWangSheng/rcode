@@ -98,20 +98,40 @@ impl Tool for TaskUpdateTool {
             .and_then(Value::as_str)
             .and_then(parse_status);
 
-        let subject = input.get("subject").and_then(Value::as_str).map(str::to_string);
-        let description = input.get("description").and_then(Value::as_str).map(str::to_string);
-        let active_form = input.get("activeForm").and_then(Value::as_str).map(str::to_string);
-        let owner = input.get("owner").and_then(Value::as_str).map(str::to_string);
+        let subject = input
+            .get("subject")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let description = input
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let active_form = input
+            .get("activeForm")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let owner = input
+            .get("owner")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
-        let add_blocks: Option<Vec<String>> = input
-            .get("addBlocks")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect());
+        let add_blocks: Option<Vec<String>> =
+            input.get("addBlocks").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
 
         let add_blocked_by: Option<Vec<String>> = input
             .get("addBlockedBy")
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_string).collect());
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
 
         let metadata_patch: Option<HashMap<String, Value>> = input
             .get("metadata")
@@ -119,14 +139,30 @@ impl Tool for TaskUpdateTool {
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
 
         let mut updated_fields: Vec<&str> = Vec::new();
-        if status.is_some() { updated_fields.push("status"); }
-        if subject.is_some() { updated_fields.push("subject"); }
-        if description.is_some() { updated_fields.push("description"); }
-        if active_form.is_some() { updated_fields.push("activeForm"); }
-        if owner.is_some() { updated_fields.push("owner"); }
-        if add_blocks.is_some() { updated_fields.push("blocks"); }
-        if add_blocked_by.is_some() { updated_fields.push("blockedBy"); }
-        if metadata_patch.is_some() { updated_fields.push("metadata"); }
+        if status.is_some() {
+            updated_fields.push("status");
+        }
+        if subject.is_some() {
+            updated_fields.push("subject");
+        }
+        if description.is_some() {
+            updated_fields.push("description");
+        }
+        if active_form.is_some() {
+            updated_fields.push("activeForm");
+        }
+        if owner.is_some() {
+            updated_fields.push("owner");
+        }
+        if add_blocks.is_some() {
+            updated_fields.push("blocks");
+        }
+        if add_blocked_by.is_some() {
+            updated_fields.push("blockedBy");
+        }
+        if metadata_patch.is_some() {
+            updated_fields.push("metadata");
+        }
 
         let result = {
             let mut list = self.list.lock().unwrap();
@@ -170,10 +206,16 @@ mod tests {
     async fn update_status_to_in_progress() {
         let list = make_list();
         let create = TaskCreateTool { list: list.clone() };
-        create.execute(json!({"subject": "T", "description": ""}), &cancel()).await.unwrap();
+        create
+            .execute(json!({"subject": "T", "description": ""}), &cancel())
+            .await
+            .unwrap();
 
         let update = TaskUpdateTool { list: list.clone() };
-        let r = update.execute(json!({"taskId": "1", "status": "in_progress"}), &cancel()).await.unwrap();
+        let r = update
+            .execute(json!({"taskId": "1", "status": "in_progress"}), &cancel())
+            .await
+            .unwrap();
         assert!(!r.is_error);
         assert!(r.content.contains("status"));
 
@@ -185,11 +227,17 @@ mod tests {
     async fn update_owner_and_subject() {
         let list = make_list();
         let create = TaskCreateTool { list: list.clone() };
-        create.execute(json!({"subject": "Old", "description": ""}), &cancel()).await.unwrap();
+        create
+            .execute(json!({"subject": "Old", "description": ""}), &cancel())
+            .await
+            .unwrap();
 
         let update = TaskUpdateTool { list: list.clone() };
         update
-            .execute(json!({"taskId": "1", "owner": "alice", "subject": "New"}), &cancel())
+            .execute(
+                json!({"taskId": "1", "owner": "alice", "subject": "New"}),
+                &cancel(),
+            )
             .await
             .unwrap();
 
@@ -203,7 +251,10 @@ mod tests {
     async fn unknown_task_id_returns_error() {
         let list = make_list();
         let update = TaskUpdateTool { list };
-        let r = update.execute(json!({"taskId": "99", "status": "completed"}), &cancel()).await.unwrap();
+        let r = update
+            .execute(json!({"taskId": "99", "status": "completed"}), &cancel())
+            .await
+            .unwrap();
         assert!(r.is_error);
     }
 
@@ -211,7 +262,10 @@ mod tests {
     async fn missing_task_id_returns_error() {
         let list = make_list();
         let update = TaskUpdateTool { list };
-        let r = update.execute(json!({"status": "completed"}), &cancel()).await.unwrap();
+        let r = update
+            .execute(json!({"status": "completed"}), &cancel())
+            .await
+            .unwrap();
         assert!(r.is_error);
     }
 
@@ -219,8 +273,14 @@ mod tests {
     async fn add_blocked_by_dependency() {
         let list = make_list();
         let create = TaskCreateTool { list: list.clone() };
-        create.execute(json!({"subject": "T1", "description": ""}), &cancel()).await.unwrap();
-        create.execute(json!({"subject": "T2", "description": ""}), &cancel()).await.unwrap();
+        create
+            .execute(json!({"subject": "T1", "description": ""}), &cancel())
+            .await
+            .unwrap();
+        create
+            .execute(json!({"subject": "T2", "description": ""}), &cancel())
+            .await
+            .unwrap();
 
         let update = TaskUpdateTool { list: list.clone() };
         update
@@ -229,6 +289,10 @@ mod tests {
             .unwrap();
 
         let guard = list.lock().unwrap();
-        assert!(guard.get("2").unwrap().blocked_by.contains(&"1".to_string()));
+        assert!(guard
+            .get("2")
+            .unwrap()
+            .blocked_by
+            .contains(&"1".to_string()));
     }
 }

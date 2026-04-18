@@ -3,7 +3,7 @@ use cc_core::CcResult;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 pub struct BashTool;
@@ -38,7 +38,8 @@ impl Tool for BashTool {
                 }
             },
             "required": ["command"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn is_read_only(&self) -> bool {
@@ -167,7 +168,10 @@ mod tests {
     async fn bash_echo() {
         let tool = BashTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(json!({"command": "echo hello"}), &cancel).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "echo hello"}), &cancel)
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert_eq!(result.content, "hello");
     }
@@ -176,7 +180,10 @@ mod tests {
     async fn bash_nonzero_exit_includes_code_no_is_error() {
         let tool = BashTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(json!({"command": "exit 42"}), &cancel).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "exit 42"}), &cancel)
+            .await
+            .unwrap();
         // Per behavior contract: no is_error for bash failures
         assert!(!result.is_error);
         assert!(result.content.contains("Exit code: 42"));
@@ -186,7 +193,10 @@ mod tests {
     async fn bash_stderr_included_on_failure() {
         let tool = BashTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(json!({"command": "echo err >&2 && exit 1"}), &cancel).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "echo err >&2 && exit 1"}), &cancel)
+            .await
+            .unwrap();
         assert!(result.content.contains("STDERR:"));
         assert!(result.content.contains("err"));
     }
@@ -211,15 +221,24 @@ mod tests {
         let tool = BashTool;
         let cancel = CancellationToken::new();
         let result = tool
-            .execute(
-                json!({"command": "echo out && echo err >&2"}),
-                &cancel,
-            )
+            .execute(json!({"command": "echo out && echo err >&2"}), &cancel)
             .await
             .unwrap();
-        assert!(result.content.contains("out"), "stdout missing: {:?}", result.content);
-        assert!(result.content.contains("STDERR:"), "stderr marker missing: {:?}", result.content);
-        assert!(result.content.contains("err"), "stderr body missing: {:?}", result.content);
+        assert!(
+            result.content.contains("out"),
+            "stdout missing: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("STDERR:"),
+            "stderr marker missing: {:?}",
+            result.content
+        );
+        assert!(
+            result.content.contains("err"),
+            "stderr body missing: {:?}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -268,7 +287,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(!alive, "pid {pid} still alive after cancel — kill+reap failed");
+        assert!(
+            !alive,
+            "pid {pid} still alive after cancel — kill+reap failed"
+        );
     }
 
     #[tokio::test]
@@ -282,9 +304,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             cancel2.cancel();
         });
-        let result = tool
-            .execute(json!({"command": "sleep 5"}), &cancel)
-            .await;
+        let result = tool.execute(json!({"command": "sleep 5"}), &cancel).await;
         // Cancelled before the 5s sleep finishes.
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
         assert!(result.unwrap_err().to_string().contains("cancelled"));

@@ -230,7 +230,9 @@ impl McpHttpClient {
 
         // Best-effort initialized notification — many servers ignore it but
         // the spec says clients MUST send it.
-        let _ = self.send_notification("notifications/initialized", None).await;
+        let _ = self
+            .send_notification("notifications/initialized", None)
+            .await;
         Ok(())
     }
 
@@ -246,8 +248,8 @@ impl McpHttpClient {
 
         let result = resp.result.unwrap_or(json!({}));
         let tools_val = result.get("tools").cloned().unwrap_or(json!([]));
-        let mut tools: Vec<McpTool> = serde_json::from_value(tools_val)
-            .map_err(|e| format!("failed to parse tools: {e}"))?;
+        let mut tools: Vec<McpTool> =
+            serde_json::from_value(tools_val).map_err(|e| format!("failed to parse tools: {e}"))?;
 
         for tool in &mut tools {
             tool.server_name = self.server_name.clone();
@@ -285,7 +287,10 @@ impl McpHttpClient {
             arr.iter()
                 .filter_map(|block| {
                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        block.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        block
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
@@ -448,7 +453,11 @@ impl McpHttpClient {
         }
 
         if !resp.status().is_success() {
-            return Err(format!("http {}: {}", resp.status(), resp.status().as_str()));
+            return Err(format!(
+                "http {}: {}",
+                resp.status(),
+                resp.status().as_str()
+            ));
         }
 
         // Capture Mcp-Session-Id from the response (initialize sets this).
@@ -710,7 +719,8 @@ mod tests {
 
     #[test]
     fn parses_simple_sse_response() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n\n";
         let resp = parse_sse_for_id(body, 7).unwrap();
         assert_eq!(resp.id, Some(7));
         assert!(resp.result.is_some());

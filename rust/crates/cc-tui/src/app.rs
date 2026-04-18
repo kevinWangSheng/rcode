@@ -20,8 +20,15 @@ pub const FORCE_QUIT_WINDOW_MS: u64 = 2_000;
 pub enum TranscriptItem {
     UserMessage(String),
     AssistantText(String),
-    ToolCall { name: String, input_summary: String },
-    ToolResult { name: String, output: String, is_error: bool },
+    ToolCall {
+        name: String,
+        input_summary: String,
+    },
+    ToolResult {
+        name: String,
+        output: String,
+        is_error: bool,
+    },
     /// A compaction marker; rendered specially.
     CompactBoundary,
     /// System / info messages — slash command output, errors, info banners.
@@ -159,10 +166,7 @@ impl App {
     /// should force-quit rather than start a new graceful abort?
     pub fn within_force_quit_window(&self, now: Instant) -> bool {
         match self.last_abort_at {
-            Some(stamp) => now
-                .duration_since(stamp)
-                .as_millis()
-                < FORCE_QUIT_WINDOW_MS as u128,
+            Some(stamp) => now.duration_since(stamp).as_millis() < FORCE_QUIT_WINDOW_MS as u128,
             None => false,
         }
     }
@@ -178,12 +182,19 @@ impl App {
     }
 
     pub fn push_tool_call(&mut self, name: String, input_summary: String) {
-        self.transcript.push(TranscriptItem::ToolCall { name, input_summary });
+        self.transcript.push(TranscriptItem::ToolCall {
+            name,
+            input_summary,
+        });
         self.scroll = 0;
     }
 
     pub fn push_tool_result(&mut self, name: String, output: String, is_error: bool) {
-        self.transcript.push(TranscriptItem::ToolResult { name, output, is_error });
+        self.transcript.push(TranscriptItem::ToolResult {
+            name,
+            output,
+            is_error,
+        });
         self.scroll = 0;
     }
 
@@ -250,7 +261,9 @@ mod tests {
         app.on_token("partial");
         app.abort_stream();
         match app.transcript.last() {
-            Some(TranscriptItem::AssistantText(t)) => assert!(t.contains("partial") && t.contains("aborted")),
+            Some(TranscriptItem::AssistantText(t)) => {
+                assert!(t.contains("partial") && t.contains("aborted"))
+            }
             _ => panic!("expected assistant message with aborted marker"),
         }
     }
@@ -259,7 +272,10 @@ mod tests {
     fn compact_boundary_appears_in_transcript() {
         let mut app = App::new("s".into(), "m".into());
         app.push_compact_boundary();
-        assert!(matches!(app.transcript.last(), Some(TranscriptItem::CompactBoundary)));
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::CompactBoundary)
+        ));
     }
 
     #[test]
@@ -267,8 +283,12 @@ mod tests {
         let mut app = App::new("s".into(), "m".into());
         app.push_tool_call("Bash".into(), "ls -la".into());
         app.push_tool_result("Bash".into(), "file1.rs\nfile2.rs".into(), false);
-        assert!(matches!(&app.transcript[0], TranscriptItem::ToolCall { name, .. } if name == "Bash"));
-        assert!(matches!(&app.transcript[1], TranscriptItem::ToolResult { is_error, .. } if !is_error));
+        assert!(
+            matches!(&app.transcript[0], TranscriptItem::ToolCall { name, .. } if name == "Bash")
+        );
+        assert!(
+            matches!(&app.transcript[1], TranscriptItem::ToolResult { is_error, .. } if !is_error)
+        );
     }
 
     #[test]

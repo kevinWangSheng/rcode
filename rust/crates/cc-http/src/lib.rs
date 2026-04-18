@@ -100,9 +100,8 @@ pub fn build_client(config: &HttpClientConfig) -> CcResult<reqwest::Client> {
             ))
         })?;
         identity_pem.extend_from_slice(&key_pem);
-        let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
-            cc_core::CcError::Config(format!("invalid mTLS identity: {e}"))
-        })?;
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .map_err(|e| cc_core::CcError::Config(format!("invalid mTLS identity: {e}")))?;
         builder = builder.identity(identity);
     }
 

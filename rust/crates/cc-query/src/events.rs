@@ -97,8 +97,7 @@ pub async fn forward_stream_events(
                 sent += 1;
             }
             StreamEvent::ContentBlockStart {
-                content_block:
-                    ContentBlockStartData::ToolUse { id, name, input },
+                content_block: ContentBlockStartData::ToolUse { id, name, input },
                 ..
             } => {
                 seen += 1;
@@ -119,7 +118,8 @@ pub async fn forward_stream_events(
 
     // Invariant: every inbound user-visible delta was forwarded.
     debug_assert_eq!(
-        seen, sent,
+        seen,
+        sent,
         "forward_stream_events dropped {} events (seen={seen}, sent={sent})",
         seen - sent
     );
@@ -233,7 +233,10 @@ mod tests {
         tokio::spawn(async move {
             in_tx.send(Ok(text_delta("hi"))).await.unwrap();
             in_tx.send(Ok(thinking_delta("ponder"))).await.unwrap();
-            in_tx.send(Ok(tool_use_start("toolu_1", "read"))).await.unwrap();
+            in_tx
+                .send(Ok(tool_use_start("toolu_1", "read")))
+                .await
+                .unwrap();
             // A MessageDelta (non-user-visible) — must be ignored, not sent.
             in_tx
                 .send(Ok(StreamEvent::MessageDelta {
@@ -248,8 +251,7 @@ mod tests {
             drop(in_tx);
         });
 
-        let handle =
-            tokio::spawn(async move { forward_stream_events(&mut in_rx, &out_tx).await });
+        let handle = tokio::spawn(async move { forward_stream_events(&mut in_rx, &out_tx).await });
 
         let mut got = Vec::new();
         while let Some(ev) = out_rx.recv().await {
@@ -260,7 +262,9 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert!(matches!(got[0], AppEvent::StreamDelta(ref s) if s == "hi"));
         assert!(matches!(got[1], AppEvent::StreamThinking(ref s) if s == "ponder"));
-        assert!(matches!(got[2], AppEvent::StreamToolUse(ref tu) if tu.id == "toolu_1" && tu.name == "read"));
+        assert!(
+            matches!(got[2], AppEvent::StreamToolUse(ref tu) if tu.id == "toolu_1" && tu.name == "read")
+        );
     }
 
     /// Upstream transport error propagates out of forward_stream_events as

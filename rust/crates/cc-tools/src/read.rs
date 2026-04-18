@@ -3,7 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 const MAX_LINES_DEFAULT: usize = 2000;
@@ -46,7 +46,8 @@ impl Tool for ReadTool {
                 }
             },
             "required": ["file_path"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn is_read_only(&self) -> bool {
@@ -96,7 +97,10 @@ impl Tool for ReadTool {
                 m.len()
             }
             Err(e) => {
-                return Err(CcError::tool("tool", format!("failed to stat {file_path}: {e}")));
+                return Err(CcError::tool(
+                    "tool",
+                    format!("failed to stat {file_path}: {e}"),
+                ));
             }
         };
         if size > MAX_FILE_BYTES {
@@ -131,7 +135,8 @@ impl Tool for ReadTool {
                 return Err(CcError::tool("tool", "Read cancelled"));
             }
         };
-        read_result.map_err(|e| CcError::tool("tool", format!("failed to read {file_path}: {e}")))?;
+        read_result
+            .map_err(|e| CcError::tool("tool", format!("failed to read {file_path}: {e}")))?;
         if buf.len() as u64 > MAX_FILE_BYTES {
             let cap_mb = MAX_FILE_BYTES / (1024 * 1024);
             return Ok(ToolResult::error(format!(
@@ -175,10 +180,10 @@ mod tests {
 
         let tool = ReadTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(
-            json!({"file_path": file.to_string_lossy()}),
-            &cancel,
-        ).await.unwrap();
+        let result = tool
+            .execute(json!({"file_path": file.to_string_lossy()}), &cancel)
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("1\tline1"));
         assert!(result.content.contains("2\tline2"));
@@ -189,10 +194,10 @@ mod tests {
     async fn read_not_found() {
         let tool = ReadTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(
-            json!({"file_path": "/nonexistent/file.txt"}),
-            &cancel,
-        ).await.unwrap();
+        let result = tool
+            .execute(json!({"file_path": "/nonexistent/file.txt"}), &cancel)
+            .await
+            .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("not found"));
     }
@@ -205,10 +210,13 @@ mod tests {
 
         let tool = ReadTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(
-            json!({"file_path": file.to_string_lossy(), "offset": 2, "limit": 2}),
-            &cancel,
-        ).await.unwrap();
+        let result = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "offset": 2, "limit": 2}),
+                &cancel,
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("2\tb"));
         assert!(result.content.contains("3\tc"));
@@ -232,8 +240,7 @@ mod tests {
             .unwrap();
         assert!(result.is_error, "oversize file must be rejected");
         assert!(
-            result.content.contains("above the")
-                && result.content.contains("Read cap"),
+            result.content.contains("above the") && result.content.contains("Read cap"),
             "error must mention the cap: {}",
             result.content
         );
@@ -348,10 +355,7 @@ mod tests {
         let cancel = CancellationToken::new();
         for _ in 0..50 {
             let result = tool
-                .execute(
-                    json!({"file_path": link.to_string_lossy()}),
-                    &cancel,
-                )
+                .execute(json!({"file_path": link.to_string_lossy()}), &cancel)
                 .await;
             // Acceptable outcomes:
             //   - Ok with is_error=false (happy path)

@@ -204,9 +204,8 @@ impl Session {
 }
 
 fn sessions_root() -> CcResult<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        CcError::io("could not determine home directory for session storage")
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| CcError::io("could not determine home directory for session storage"))?;
     if home.as_os_str().is_empty() {
         return Err(CcError::io(
             "home directory is empty; cannot locate session storage",
@@ -285,8 +284,12 @@ fn find_ts_session(id: &str) -> Option<PathBuf> {
 /// skipped rather than failing the whole load — we prefer a partial replay over
 /// refusing to resume.
 fn load_ts_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
-    let file = File::open(path)
-        .map_err(|e| CcError::io(format!("failed to open ts transcript {}: {e}", path.display())))?;
+    let file = File::open(path).map_err(|e| {
+        CcError::io(format!(
+            "failed to open ts transcript {}: {e}",
+            path.display()
+        ))
+    })?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
 
@@ -374,9 +377,7 @@ pub fn list_session_infos() -> Vec<SessionInfo> {
                 .metadata()
                 .ok()
                 .and_then(|m| m.created().ok())
-                .map(|t| {
-                    chrono::DateTime::<Utc>::from(t).to_rfc3339()
-                });
+                .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
             SessionInfo {
                 id,
                 started_at,
@@ -555,7 +556,11 @@ mod tests {
         let mut f = File::create(&path).unwrap();
         // Non-message entries that should be skipped
         writeln!(f, r#"{{"type":"summary","text":"ignore me"}}"#).unwrap();
-        writeln!(f, r#"{{"type":"system","message":{{"role":"system","content":"x"}}}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"system","message":{{"role":"system","content":"x"}}}}"#
+        )
+        .unwrap();
         // Real assistant turn with blocks
         writeln!(
             f,
@@ -629,7 +634,11 @@ mod tests {
         )
         .unwrap();
         // Partial / invalid JSON — crashed mid-flush.
-        writeln!(f, "{{\"message\":{{\"role\":\"user\",\"content\":\"# broken trailing line").unwrap();
+        writeln!(
+            f,
+            "{{\"message\":{{\"role\":\"user\",\"content\":\"# broken trailing line"
+        )
+        .unwrap();
         // Another bit of noise for good measure.
         writeln!(f, "not json").unwrap();
 

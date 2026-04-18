@@ -87,10 +87,19 @@ mod tests {
     async fn lists_all_non_deleted_tasks() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
-        create.execute(json!({"subject": "T1", "description": ""}), &cancel()).await.unwrap();
-        create.execute(json!({"subject": "T2", "description": ""}), &cancel()).await.unwrap();
+        create
+            .execute(json!({"subject": "T1", "description": ""}), &cancel())
+            .await
+            .unwrap();
+        create
+            .execute(json!({"subject": "T2", "description": ""}), &cancel())
+            .await
+            .unwrap();
         let update = TaskUpdateTool { list: list.clone() };
-        update.execute(json!({"taskId": "1", "status": "deleted"}), &cancel()).await.unwrap();
+        update
+            .execute(json!({"taskId": "1", "status": "deleted"}), &cancel())
+            .await
+            .unwrap();
 
         let list_tool = TaskListTool { list };
         let r = list_tool.execute(json!({}), &cancel()).await.unwrap();
@@ -104,11 +113,20 @@ mod tests {
     async fn shows_owner_and_blocked_by_when_set() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
-        create.execute(json!({"subject": "T1", "description": ""}), &cancel()).await.unwrap();
-        create.execute(json!({"subject": "T2", "description": ""}), &cancel()).await.unwrap();
+        create
+            .execute(json!({"subject": "T1", "description": ""}), &cancel())
+            .await
+            .unwrap();
+        create
+            .execute(json!({"subject": "T2", "description": ""}), &cancel())
+            .await
+            .unwrap();
         let update = TaskUpdateTool { list: list.clone() };
         update
-            .execute(json!({"taskId": "2", "owner": "bob", "addBlockedBy": ["1"]}), &cancel())
+            .execute(
+                json!({"taskId": "2", "owner": "bob", "addBlockedBy": ["1"]}),
+                &cancel(),
+            )
             .await
             .unwrap();
 
@@ -124,9 +142,15 @@ mod tests {
     async fn status_shown_correctly() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
-        create.execute(json!({"subject": "T", "description": ""}), &cancel()).await.unwrap();
+        create
+            .execute(json!({"subject": "T", "description": ""}), &cancel())
+            .await
+            .unwrap();
         let update = TaskUpdateTool { list: list.clone() };
-        update.execute(json!({"taskId": "1", "status": "in_progress"}), &cancel()).await.unwrap();
+        update
+            .execute(json!({"taskId": "1", "status": "in_progress"}), &cancel())
+            .await
+            .unwrap();
 
         let list_tool = TaskListTool { list };
         let r = list_tool.execute(json!({}), &cancel()).await.unwrap();

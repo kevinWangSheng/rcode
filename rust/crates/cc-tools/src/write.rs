@@ -3,7 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 pub struct WriteTool;
@@ -34,7 +34,8 @@ impl Tool for WriteTool {
                 }
             },
             "required": ["file_path", "content"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
@@ -47,9 +48,12 @@ impl Tool for WriteTool {
 
         let path = Path::new(file_path);
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| CcError::tool("tool", format!("failed to create dirs for {file_path}: {e}")))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                CcError::tool(
+                    "tool",
+                    format!("failed to create dirs for {file_path}: {e}"),
+                )
+            })?;
         }
 
         // Capture the existing file mode (if any) so we can preserve it
@@ -66,8 +70,12 @@ impl Tool for WriteTool {
         // write crash doesn't leave the file truncated. Preserve the mode on
         // the tempfile before persist.
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let tmp = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| CcError::tool("tool", format!("failed to create tempfile near {file_path}: {e}")))?;
+        let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+            CcError::tool(
+                "tool",
+                format!("failed to create tempfile near {file_path}: {e}"),
+            )
+        })?;
 
         // Apply preserved mode before writing contents. On Unix the mode
         // bits (esp. the executable bit) are what we care about.
@@ -77,7 +85,8 @@ impl Tool for WriteTool {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = perms.mode();
                 let file = tmp.as_file();
-                let mut tmp_perms = file.metadata()
+                let mut tmp_perms = file
+                    .metadata()
                     .map_err(|e| CcError::tool("tool", format!("failed to stat tempfile: {e}")))?
                     .permissions();
                 tmp_perms.set_mode(mode);
@@ -107,7 +116,9 @@ impl Tool for WriteTool {
         tmp.persist(path)
             .map_err(|e| CcError::tool("tool", format!("failed to persist {file_path}: {e}")))?;
 
-        Ok(ToolResult::ok(format!("File written successfully to {file_path}")))
+        Ok(ToolResult::ok(format!(
+            "File written successfully to {file_path}"
+        )))
     }
 }
 
@@ -123,10 +134,13 @@ mod tests {
 
         let tool = WriteTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(
-            json!({"file_path": file.to_string_lossy(), "content": "hello world"}),
-            &cancel,
-        ).await.unwrap();
+        let result = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "content": "hello world"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
@@ -138,10 +152,13 @@ mod tests {
 
         let tool = WriteTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(
-            json!({"file_path": file.to_string_lossy(), "content": "deep"}),
-            &cancel,
-        ).await.unwrap();
+        let result = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "content": "deep"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "deep");
     }
@@ -154,10 +171,13 @@ mod tests {
 
         let tool = WriteTool;
         let cancel = CancellationToken::new();
-        let result = tool.execute(
-            json!({"file_path": file.to_string_lossy(), "content": "new content"}),
-            &cancel,
-        ).await.unwrap();
+        let result = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "content": "new content"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new content");
     }
@@ -186,7 +206,10 @@ mod tests {
 
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "executable bit must be preserved across Write");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "#!/bin/sh\necho new\n");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
     }
 
     #[cfg(unix)]
@@ -213,6 +236,10 @@ mod tests {
         // executable bit is acceptable — assert the critical property: NOT
         // executable.
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode & 0o111, 0, "new file must not acquire exec bits: {mode:o}");
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "new file must not acquire exec bits: {mode:o}"
+        );
     }
 }

@@ -21,12 +21,46 @@ enum Event {
 /// Stops early if abort_rx receives a signal.
 async fn simulate_stream(tx: mpsc::Sender<Event>, mut abort_rx: mpsc::Receiver<()>) {
     let tokens: Vec<&str> = vec![
-        "The ", "quick ", "brown ", "fox ", "jumps ", "over ", "the ", "lazy ", "dog. ",
-        "Ratatui ", "handles ", "streaming ", "well. ", "Each ", "token ", "arrives ",
-        "with ", "a ", "small ", "delay. ", "The ", "event ", "loop ", "remains ",
-        "responsive. ", "Ctrl+C ", "aborts ", "immediately. ", "Partial ", "text ",
-        "is ", "preserved. ", "AC-2 ", "verified. ", "AC-3 ", "queuing ", "works. ",
-        "AC-4 ", "memory ", "stable.",
+        "The ",
+        "quick ",
+        "brown ",
+        "fox ",
+        "jumps ",
+        "over ",
+        "the ",
+        "lazy ",
+        "dog. ",
+        "Ratatui ",
+        "handles ",
+        "streaming ",
+        "well. ",
+        "Each ",
+        "token ",
+        "arrives ",
+        "with ",
+        "a ",
+        "small ",
+        "delay. ",
+        "The ",
+        "event ",
+        "loop ",
+        "remains ",
+        "responsive. ",
+        "Ctrl+C ",
+        "aborts ",
+        "immediately. ",
+        "Partial ",
+        "text ",
+        "is ",
+        "preserved. ",
+        "AC-2 ",
+        "verified. ",
+        "AC-3 ",
+        "queuing ",
+        "works. ",
+        "AC-4 ",
+        "memory ",
+        "stable.",
     ];
     for token in tokens {
         if abort_rx.try_recv().is_ok() {
@@ -72,7 +106,11 @@ async fn ac2_partial_text_preserved_after_abort() {
         }
     }
 
-    assert_eq!(app.stream_state, StreamState::Idle, "should be Idle after stream_done");
+    assert_eq!(
+        app.stream_state,
+        StreamState::Idle,
+        "should be Idle after stream_done"
+    );
     assert!(app.turn_count == 1, "one turn completed");
 
     let (_, assistant) = &app.history[0];
@@ -82,7 +120,11 @@ async fn ac2_partial_text_preserved_after_abort() {
     );
     // Partial text (5 tokens) must be preserved, not empty
     let partial = assistant.replace(" [ABORTED]", "");
-    assert!(!partial.is_empty(), "partial text must be non-empty: got '{}'", partial);
+    assert!(
+        !partial.is_empty(),
+        "partial text must be non-empty: got '{}'",
+        partial
+    );
     assert!(
         partial.contains("The "),
         "partial text should contain at least the first token"
@@ -178,7 +220,11 @@ async fn ac3_empty_submit_ignored() {
     app.on_submit("".into());
     app.on_submit("   ".into());
 
-    assert_eq!(app.queued_inputs.len(), 0, "empty inputs must not be queued");
+    assert_eq!(
+        app.queued_inputs.len(),
+        0,
+        "empty inputs must not be queued"
+    );
 }
 
 /// AC-3c: Queued inputs survive stream completion and are accessible.
@@ -194,7 +240,11 @@ async fn ac3_queued_inputs_survive_stream_done() {
     app.on_stream_done();
 
     assert_eq!(app.stream_state, StreamState::Idle);
-    assert_eq!(app.queued_inputs.len(), 1, "queued input must survive stream_done");
+    assert_eq!(
+        app.queued_inputs.len(),
+        1,
+        "queued input must survive stream_done"
+    );
     assert_eq!(app.queued_inputs[0], "queued while streaming");
 }
 
@@ -251,10 +301,7 @@ async fn ac4_100_turns_complete() {
             !assistant.is_empty(),
             "each history entry must have non-empty assistant text"
         );
-        assert!(
-            !assistant.contains("[ABORTED]"),
-            "no aborts in this test"
-        );
+        assert!(!assistant.contains("[ABORTED]"), "no aborts in this test");
     }
 }
 

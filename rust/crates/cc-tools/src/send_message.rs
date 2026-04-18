@@ -70,9 +70,7 @@ impl Tool for SendMessageTool {
             // Broadcast
             let names = dir.names();
             if names.is_empty() {
-                return Ok(ToolResult::ok(
-                    "Broadcast: no active teammates to send to.",
-                ));
+                return Ok(ToolResult::ok("Broadcast: no active teammates to send to."));
             }
             let mut sent_to = Vec::new();
             let mut failed = Vec::new();
@@ -159,10 +157,7 @@ mod tests {
     async fn send_to_unknown_returns_error() {
         let (tool, _rx) = make_tool();
         let r = tool
-            .execute(
-                json!({"to": "nobody", "message": "hello"}),
-                &cancel(),
-            )
+            .execute(json!({"to": "nobody", "message": "hello"}), &cancel())
             .await
             .unwrap();
         assert!(r.is_error);
@@ -172,7 +167,10 @@ mod tests {
     #[tokio::test]
     async fn missing_fields_return_errors() {
         let (tool, _rx) = make_tool();
-        let r = tool.execute(json!({"to": "worker"}), &cancel()).await.unwrap();
+        let r = tool
+            .execute(json!({"to": "worker"}), &cancel())
+            .await
+            .unwrap();
         assert!(r.is_error);
     }
 }

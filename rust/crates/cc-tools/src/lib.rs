@@ -20,8 +20,8 @@ pub mod task_update;
 pub mod team_create;
 pub mod team_delete;
 pub mod todo;
-pub mod tool_search;
 pub mod todo_write;
+pub mod tool_search;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write;
@@ -73,7 +73,9 @@ pub fn task_tools(list: Arc<Mutex<TodoList>>) -> Vec<Arc<dyn Tool>> {
 /// The registry should be the same one used by cc-agents to spawn background tasks.
 pub fn background_task_tools(registry: Arc<Mutex<TaskRegistry>>) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(task_stop::TaskStopTool { registry: registry.clone() }),
+        Arc::new(task_stop::TaskStopTool {
+            registry: registry.clone(),
+        }),
         Arc::new(task_output::TaskOutputTool { registry }),
     ]
 }
@@ -84,7 +86,9 @@ pub fn background_task_tools(registry: Arc<Mutex<TaskRegistry>>) -> Vec<Arc<dyn 
 /// (injected from main.rs to break the circular dep, same as AgentTool).
 pub fn swarm_tools(directory: Arc<Mutex<TeammateDirectory>>) -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(send_message::SendMessageTool { directory: directory.clone() }),
+        Arc::new(send_message::SendMessageTool {
+            directory: directory.clone(),
+        }),
         Arc::new(team_delete::TeamDeleteTool { directory }),
     ]
 }
@@ -113,6 +117,8 @@ pub fn all_tools() -> (
     tools.extend(task_tools(list.clone()));
     tools.extend(background_task_tools(registry.clone()));
     tools.extend(swarm_tools(directory.clone()));
-    tools.push(Arc::new(todo_write::TodoWriteTool { list: todo_write_list.clone() }));
+    tools.push(Arc::new(todo_write::TodoWriteTool {
+        list: todo_write_list.clone(),
+    }));
     (tools, list, todo_write_list, registry, directory)
 }

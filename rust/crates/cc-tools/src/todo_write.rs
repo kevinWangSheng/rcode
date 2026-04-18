@@ -145,7 +145,11 @@ impl Tool for TodoWriteTool {
                 .and_then(Value::as_str)
                 .map(parse_priority)
                 .unwrap_or(TodoItemPriority::Medium);
-            new_items.push(TodoItem { content, status, priority });
+            new_items.push(TodoItem {
+                content,
+                status,
+                priority,
+            });
         }
 
         // Snapshot old list before replacing

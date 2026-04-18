@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESULTS: usize = 250;
@@ -55,7 +55,8 @@ impl Tool for GrepTool {
                 }
             },
             "required": ["pattern"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn is_read_only(&self) -> bool {
@@ -86,7 +87,9 @@ impl Tool for GrepTool {
             });
 
         let glob_filter = input["glob"].as_str();
-        let output_mode = input["output_mode"].as_str().unwrap_or("files_with_matches");
+        let output_mode = input["output_mode"]
+            .as_str()
+            .unwrap_or("files_with_matches");
 
         let search_path = Path::new(&search_path);
 
@@ -111,7 +114,8 @@ impl Tool for GrepTool {
             if let Some(glob_pat) = glob_filter {
                 let file_name = path.file_name().unwrap_or_default().to_string_lossy();
                 let full_path = path.to_string_lossy();
-                let pat = glob::Pattern::new(glob_pat).unwrap_or_else(|_| glob::Pattern::new("*").unwrap());
+                let pat = glob::Pattern::new(glob_pat)
+                    .unwrap_or_else(|_| glob::Pattern::new("*").unwrap());
                 if !pat.matches(&file_name) && !pat.matches(&full_path) {
                     // Also try matching against just the path relative to search root
                     let rel = path.strip_prefix(search_path).unwrap_or(path);
@@ -214,10 +218,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let result = tool
-            .execute(
-                json!({"pattern": "zzz", "path": "."}),
-                &cancel,
-            )
+            .execute(json!({"pattern": "zzz", "path": "."}), &cancel)
             .await;
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
         assert!(result.unwrap_err().to_string().contains("cancelled"));

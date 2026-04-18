@@ -6,11 +6,7 @@ use tokio::io::AsyncWriteExt;
 ///
 /// Returns `Deny` on Ctrl+C (SIGINT) or in non-interactive mode. The engine
 /// is responsible for upgrading `AllowAlways` into a session permission rule.
-pub async fn stdin_prompt(
-    tool_name: &str,
-    input: &Value,
-    non_interactive: bool,
-) -> PromptDecision {
+pub async fn stdin_prompt(tool_name: &str, input: &Value, non_interactive: bool) -> PromptDecision {
     if non_interactive {
         return PromptDecision::Deny;
     }
@@ -19,10 +15,8 @@ pub async fn stdin_prompt(
     let mut stderr = tokio::io::stderr();
     let _ = stderr
         .write_all(
-            format!(
-                "\n[Permission] {tool_name} wants to run: {preview}\nAllow? [y/N/a(lways)] "
-            )
-            .as_bytes(),
+            format!("\n[Permission] {tool_name} wants to run: {preview}\nAllow? [y/N/a(lways)] ")
+                .as_bytes(),
         )
         .await;
     let _ = stderr.flush().await;
@@ -64,10 +58,7 @@ pub fn summarize_input(tool_name: &str, input: &Value) -> String {
             .chars()
             .take(80)
             .collect(),
-        "Write" | "Edit" => input["file_path"]
-            .as_str()
-            .unwrap_or("<file>")
-            .to_string(),
+        "Write" | "Edit" => input["file_path"].as_str().unwrap_or("<file>").to_string(),
         _ => input.to_string().chars().take(80).collect(),
     }
 }

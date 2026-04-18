@@ -272,7 +272,8 @@ impl CommandRegistry {
             ),
             Builtin::Permissions => CommandOutcome::Info(format_permissions(ctx)),
             Builtin::Plan => CommandOutcome::SubmitUserMessage(
-                "Enter plan mode. Use EnterPlanMode tool to begin designing the solution.".to_string(),
+                "Enter plan mode. Use EnterPlanMode tool to begin designing the solution."
+                    .to_string(),
             ),
             Builtin::Status => CommandOutcome::Info(format_status(ctx)),
             Builtin::Diff => CommandOutcome::SubmitUserMessage(
@@ -308,7 +309,9 @@ impl CommandRegistry {
                 out.push_str(&format!("  /{:<10} {}\n", s.name, desc));
             }
         }
-        out.push_str("\nType / to start a command. Press Esc to cancel. Ctrl+Q or /exit to quit.\n");
+        out.push_str(
+            "\nType / to start a command. Press Esc to cancel. Ctrl+Q or /exit to quit.\n",
+        );
         out
     }
 }
@@ -380,7 +383,10 @@ fn format_cost(ctx: &CommandContext) -> String {
         "  Output: {:>10} tokens\n",
         format_tokens(ctx.output_tokens)
     ));
-    s.push_str(&format!("\n  Estimated cost: ${:.4}", ctx.estimated_cost_usd));
+    s.push_str(&format!(
+        "\n  Estimated cost: ${:.4}",
+        ctx.estimated_cost_usd
+    ));
     s
 }
 
@@ -407,9 +413,7 @@ fn format_config(ctx: &CommandContext) -> String {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none)".to_string())
     ));
-    out.push_str(
-        "\nSee ~/.claude/settings.json and .claude/settings.json for editable config.\n",
-    );
+    out.push_str("\nSee ~/.claude/settings.json and .claude/settings.json for editable config.\n");
     out
 }
 
@@ -505,10 +509,7 @@ fn execute_init(ctx: &CommandContext) -> String {
     };
     let path = root.join("CLAUDE.md");
     if path.exists() {
-        return format!(
-            "{} already exists — leaving it alone.",
-            path.display()
-        );
+        return format!("{} already exists — leaving it alone.", path.display());
     }
     let template = init_template(root);
     match std::fs::write(&path, template) {

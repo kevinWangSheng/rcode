@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESPONSE_BYTES: usize = 1_000_000; // 1 MB
@@ -52,7 +52,8 @@ impl Tool for WebFetchTool {
                 }
             },
             "required": ["url"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn is_read_only(&self) -> bool {
@@ -281,7 +282,11 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(err.to_string().contains("cancelled"), "got: {err}");
         // Must have bailed well before the 30s reqwest timeout.
-        assert!(elapsed < std::time::Duration::from_secs(5), "took {:?}", elapsed);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -335,7 +340,11 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/");
         let result = tool.execute(json!({"url": url}), &cancel).await.unwrap();
         assert!(result.is_error, "loopback fetch must be refused");
-        assert!(result.content.contains("refused"), "got: {}", result.content);
+        assert!(
+            result.content.contains("refused"),
+            "got: {}",
+            result.content
+        );
         // Critical: no socket was opened. The counter must stay at 0.
         assert_eq!(
             accepts.load(std::sync::atomic::Ordering::Relaxed),

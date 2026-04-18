@@ -3,7 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolResult, ToolInputSchema};
+use crate::{Tool, ToolInputSchema, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 pub struct GlobTool;
@@ -33,7 +33,8 @@ impl Tool for GlobTool {
                 }
             },
             "required": ["pattern"]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn is_read_only(&self) -> bool {

@@ -50,9 +50,7 @@ impl Tool for ExitWorktreeTool {
             .await;
 
         let list_text = match list_output {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).to_string()
-            }
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
             _ => return Ok(ToolResult::error("failed to list git worktrees")),
         };
 
@@ -77,10 +75,8 @@ impl Tool for ExitWorktreeTool {
                     in_current = line.trim_start_matches("worktree ") == cwd_str;
                 }
                 if in_current && line.starts_with("branch ") {
-                    branch_to_delete = Some(
-                        line.trim_start_matches("branch refs/heads/")
-                            .to_string(),
-                    );
+                    branch_to_delete =
+                        Some(line.trim_start_matches("branch refs/heads/").to_string());
                     break;
                 }
             }

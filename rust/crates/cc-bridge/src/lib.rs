@@ -89,8 +89,7 @@ where
         registry.register(tool);
     }
 
-    let prompter: Arc<dyn PermissionPrompter> =
-        Arc::new(StdinPrompter::new(non_interactive));
+    let prompter: Arc<dyn PermissionPrompter> = Arc::new(StdinPrompter::new(non_interactive));
     let mut engine = QueryEngine::new(
         api,
         Arc::new(registry),
@@ -106,7 +105,12 @@ where
     let cancel = CancellationToken::new();
 
     let content = engine
-        .run_turn(user_text, |delta| on_text(delta), &mut initial_messages, &cancel)
+        .run_turn(
+            user_text,
+            |delta| on_text(delta),
+            &mut initial_messages,
+            &cancel,
+        )
         .await
         .map_err(|e| BridgeError::Engine(e.to_string()))?;
 

@@ -161,9 +161,7 @@ impl QueryEngine {
         loop {
             turns += 1;
             if turns > MAX_TURNS {
-                return Err(CcError::Other(format!(
-                    "exceeded max turns ({MAX_TURNS})"
-                )));
+                return Err(CcError::Other(format!("exceeded max turns ({MAX_TURNS})")));
             }
 
             debug!("query turn {turns}, messages={}", messages.len());
@@ -186,8 +184,9 @@ impl QueryEngine {
             let events_tx = self.events_tx.clone();
             let (message, usage) = self
                 .api
-                .complete_message(req, |delta| {
-                    match &delta {
+                .complete_message(
+                    req,
+                    |delta| match &delta {
                         StreamDelta::Text(ref text) => {
                             text_buf.push_str(text);
                             on_text(text);
@@ -210,17 +209,16 @@ impl QueryEngine {
                             }
                         }
                         StreamDelta::InputJsonDelta(_) => {}
-                    }
-                }, cancel)
+                    },
+                    cancel,
+                )
                 .await?;
 
             // §4 contract: if streaming was interrupted (cancel fired), save partial
             // text with interrupt marker before propagating cancellation.
             if cancel.is_cancelled() && !text_buf.is_empty() {
                 let mut interrupted_content = message.content.clone();
-                interrupted_content.push(ContentBlock::text(
-                    "\n[Interrupted by user]",
-                ));
+                interrupted_content.push(ContentBlock::text("\n[Interrupted by user]"));
                 let partial_msg = MessageParam {
                     role: Role::Assistant,
                     content: MessageContent::Blocks(interrupted_content),
@@ -258,9 +256,7 @@ impl QueryEngine {
             match stop_reason {
                 Some(StopReason::ToolUse) if !tool_use_blocks.is_empty() => {
                     // Execute tools and build tool_result user message
-                    let tool_results = self
-                        .execute_tools(&tool_use_blocks, cancel)
-                        .await?;
+                    let tool_results = self.execute_tools(&tool_use_blocks, cancel).await?;
 
                     let result_msg = MessageParam {
                         role: Role::User,
@@ -345,11 +341,9 @@ impl QueryEngine {
         cancel: &CancellationToken,
     ) -> CcResult<Vec<ToolResultBlock>> {
         // Partition into read-only and mutating
-        let (read_only, mutating): (Vec<_>, Vec<_>) = tool_use_blocks.iter().partition(|tu| {
-            self.tools
-                .get(&tu.name)
-                .is_some_and(|t| t.is_read_only())
-        });
+        let (read_only, mutating): (Vec<_>, Vec<_>) = tool_use_blocks
+            .iter()
+            .partition(|tu| self.tools.get(&tu.name).is_some_and(|t| t.is_read_only()));
 
         let mut results = Vec::with_capacity(tool_use_blocks.len());
 
@@ -379,17 +373,21 @@ impl QueryEngine {
                         async move {
                             // Emit ToolStart
                             if let Some(tx) = &events_tx {
-                                let _ = tx.send(AppEvent::ToolStart {
-                                    name: tu.name.clone(),
-                                    input: tu.input.clone(),
-                                }).await;
+                                let _ = tx
+                                    .send(AppEvent::ToolStart {
+                                        name: tu.name.clone(),
+                                        input: tu.input.clone(),
+                                    })
+                                    .await;
                             }
 
-                            let result: ToolResult =
-                                match tool.execute(tu.input.clone(), &cancel).await {
-                                    Ok(r) => r,
-                                    Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
-                                };
+                            let result: ToolResult = match tool
+                                .execute(tu.input.clone(), &cancel)
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
+                            };
 
                             let tool_result_block = ToolResultBlock {
                                 tool_use_id: tu.id.clone(),
@@ -399,16 +397,23 @@ impl QueryEngine {
 
                             // Emit ToolEnd
                             if let Some(tx) = &events_tx {
-                                let _ = tx.send(AppEvent::ToolEnd {
-                                    name: tu.name.clone(),
-                                    result: result.clone(),
-                                }).await;
+                                let _ = tx
+                                    .send(AppEvent::ToolEnd {
+                                        name: tu.name.clone(),
+                                        result: result.clone(),
+                                    })
+                                    .await;
                             }
 
                             // PostToolUse hook
                             run_post_tool_hook(
-                                &hooks, &session_id, &tu, &tool_result_block, &cancel,
-                            ).await;
+                                &hooks,
+                                &session_id,
+                                &tu,
+                                &tool_result_block,
+                                &cancel,
+                            )
+                            .await;
 
                             tool_result_block
                         }
@@ -495,13 +500,8 @@ impl QueryEngine {
                     // PermissionRequest hook runs before the interactive prompter.
                     // If any hook returns `decision: "block"`, we deny without
                     // bothering the user — matching TS executePermissionRequestHooks.
-                    let req_result = fire_permission_request(
-                        &self.hooks,
-                        &self.session.id,
-                        tu,
-                        cancel,
-                    )
-                    .await;
+                    let req_result =
+                        fire_permission_request(&self.hooks, &self.session.id, tu, cancel).await;
                     if req_result.blocked {
                         fire_permission_denied(
                             &self.hooks,
@@ -556,7 +556,11 @@ impl QueryEngine {
             .ok_or_else(|| tool_result_error(&tu.id, format!("Unknown tool: {tool_name}")))
     }
 
-    async fn execute_one_tool(&mut self, tu: &ToolUseBlock, cancel: &CancellationToken) -> ToolResultBlock {
+    async fn execute_one_tool(
+        &mut self,
+        tu: &ToolUseBlock,
+        cancel: &CancellationToken,
+    ) -> ToolResultBlock {
         debug!("tool_use: {}", tu.name);
 
         let tool = match self.check_tool_permissions(tu, cancel).await {
@@ -568,7 +572,8 @@ impl QueryEngine {
         self.emit(AppEvent::ToolStart {
             name: tu.name.clone(),
             input: tu.input.clone(),
-        }).await;
+        })
+        .await;
 
         let child_cancel = cancel.child_token();
         let result: ToolResult = match tool.execute(tu.input.clone(), &child_cancel).await {
@@ -586,10 +591,18 @@ impl QueryEngine {
         self.emit(AppEvent::ToolEnd {
             name: tu.name.clone(),
             result,
-        }).await;
+        })
+        .await;
 
         // PostToolUse (success) or PostToolUseFailure (error) — never both.
-        run_post_tool_hook(&self.hooks, &self.session.id, tu, &tool_result_block, cancel).await;
+        run_post_tool_hook(
+            &self.hooks,
+            &self.session.id,
+            tu,
+            &tool_result_block,
+            cancel,
+        )
+        .await;
 
         tool_result_block
     }
@@ -726,7 +739,10 @@ pub fn compact_messages(messages: &mut Vec<MessageParam>) {
         return;
     }
 
-    debug!("compacting {} messages → keeping last {KEEP_RECENT}", messages.len());
+    debug!(
+        "compacting {} messages → keeping last {KEEP_RECENT}",
+        messages.len()
+    );
 
     // Keep first message (initial user message) + last KEEP_RECENT
     let first = messages[0].clone();
@@ -769,7 +785,10 @@ fn strip_images(msg: &MessageParam) -> MessageParam {
             MessageContent::Blocks(filtered)
         }
     };
-    MessageParam { role: msg.role, content }
+    MessageParam {
+        role: msg.role,
+        content,
+    }
 }
 
 /// Remove image-type blocks from a tool_result content value.
@@ -805,7 +824,11 @@ mod tests {
     fn compact_messages_keeps_first_and_last_n() {
         let mut msgs: Vec<MessageParam> = (0..50)
             .map(|i| {
-                let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+                let role = if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
                 msg(role, &format!("m{i}"))
             })
             .collect();
@@ -830,10 +853,15 @@ mod tests {
 
     #[test]
     fn compact_messages_noop_when_short() {
-        let mut msgs: Vec<MessageParam> = (0..10).map(|i| msg(Role::User, &format!("m{i}"))).collect();
+        let mut msgs: Vec<MessageParam> =
+            (0..10).map(|i| msg(Role::User, &format!("m{i}"))).collect();
         let before = msgs.clone();
         compact_messages(&mut msgs);
-        assert_eq!(msgs.len(), before.len(), "no compaction when ≤ KEEP_RECENT + 1");
+        assert_eq!(
+            msgs.len(),
+            before.len(),
+            "no compaction when ≤ KEEP_RECENT + 1"
+        );
     }
 
     #[tokio::test]
@@ -984,7 +1012,16 @@ mod tests {
 
         // Build enough messages for compaction (> 21)
         let mut msgs: Vec<MessageParam> = (0..20)
-            .map(|i| msg(if i % 2 == 0 { Role::User } else { Role::Assistant }, &format!("m{i}")))
+            .map(|i| {
+                msg(
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    &format!("m{i}"),
+                )
+            })
             .collect();
 
         // Add a message with image + text blocks as the last one
@@ -1012,7 +1049,10 @@ mod tests {
         for m in &msgs {
             if let MessageContent::Blocks(blocks) = &m.content {
                 for b in blocks {
-                    assert!(!matches!(b, ContentBlock::Image(_)), "image block should be stripped");
+                    assert!(
+                        !matches!(b, ContentBlock::Image(_)),
+                        "image block should be stripped"
+                    );
                     if let ContentBlock::ToolResult(tr) = b {
                         if let Some(serde_json::Value::Array(items)) = &tr.content {
                             for item in items {

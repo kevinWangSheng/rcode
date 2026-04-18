@@ -65,13 +65,16 @@ pub async fn guard_url(url: &Url) -> Result<GuardOk, CcError> {
         Host::Domain(d) => (*d).to_string(),
     };
 
-    let opted_out = matches!(std::env::var(OPT_OUT_ENV), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"));
+    let opted_out =
+        matches!(std::env::var(OPT_OUT_ENV), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"));
 
     if let Some(ip) = literal_ip {
         if !opted_out && is_private_address(&ip) {
             return Err(reject(&host_display));
         }
-        return Ok(GuardOk { resolved: SocketAddr::new(ip, port) });
+        return Ok(GuardOk {
+            resolved: SocketAddr::new(ip, port),
+        });
     }
 
     // DNS: resolve all addresses and reject if ANY is private (an attacker
@@ -226,7 +229,11 @@ mod tests {
     async fn literal_rfc1918_rejected() {
         let _lock = ENV_LOCK.lock().await;
         std::env::remove_var(OPT_OUT_ENV);
-        for addr in &["http://10.0.0.1/", "http://192.168.1.1/", "http://172.16.0.1/"] {
+        for addr in &[
+            "http://10.0.0.1/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+        ] {
             let err = guard_url(&url(addr)).await.unwrap_err();
             assert!(err.to_string().contains("refused"), "addr={addr}");
         }
@@ -301,9 +308,9 @@ mod tests {
             "169.254.169.254",
             "100.100.0.1",
             "0.0.0.0",
-            "224.0.0.1",        // multicast
-            "255.255.255.255",  // broadcast
-            "192.0.2.1",        // doc
+            "224.0.0.1",       // multicast
+            "255.255.255.255", // broadcast
+            "192.0.2.1",       // doc
         ] {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_private_address(&ip), "{s}");

@@ -58,7 +58,9 @@ impl Keybindings {
     /// Load `~/.claude/keybindings.json`, falling back to defaults.
     /// Bad files are logged and ignored.
     pub fn load() -> Self {
-        let Some(path) = path() else { return Self::default() };
+        let Some(path) = path() else {
+            return Self::default();
+        };
         Self::load_from(&path)
     }
 

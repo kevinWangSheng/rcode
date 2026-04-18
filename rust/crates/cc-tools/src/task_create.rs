@@ -107,7 +107,10 @@ mod tests {
     async fn creates_task_and_returns_id() {
         let tool = make_tool();
         let result = tool
-            .execute(json!({"subject": "Fix bug", "description": "Fix the login bug"}), &cancel())
+            .execute(
+                json!({"subject": "Fix bug", "description": "Fix the login bug"}),
+                &cancel(),
+            )
             .await
             .unwrap();
         assert!(!result.is_error);

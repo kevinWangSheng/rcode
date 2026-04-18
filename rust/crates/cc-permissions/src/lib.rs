@@ -141,8 +141,8 @@ static WRITE_TOOLS: &[&str] = &["Write", "Edit", "Bash", "MultiEdit"];
 
 fn is_write_tool(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    WRITE_TOOLS.iter().any(|w| lower == w.to_ascii_lowercase())
-        || lower.starts_with("mcp__") // MCP tools are assumed mutating
+    WRITE_TOOLS.iter().any(|w| lower == w.to_ascii_lowercase()) || lower.starts_with("mcp__")
+    // MCP tools are assumed mutating
 }
 
 /// Engine that evaluates permission rules against tool invocations.
@@ -378,8 +378,7 @@ mod tests {
 
     #[test]
     fn mcp_tool_glob_pattern() {
-        let engine =
-            PermissionEngine::from_settings([json!("mcp__fs__*")], Vec::<Value>::new());
+        let engine = PermissionEngine::from_settings([json!("mcp__fs__*")], Vec::<Value>::new());
         assert_eq!(
             engine.check("mcp__fs__read_file", &json!({})).behavior,
             PermissionBehavior::Allow
@@ -406,8 +405,7 @@ mod tests {
 
     #[test]
     fn dont_ask_mode_deny_still_applies() {
-        let mut engine =
-            PermissionEngine::from_settings(Vec::<Value>::new(), [json!("Bash")]);
+        let mut engine = PermissionEngine::from_settings(Vec::<Value>::new(), [json!("Bash")]);
         engine.set_mode(PermissionMode::DontAsk);
         // Deny rules still win even in dontAsk mode
         let result = engine.check("Bash", &json!({}));
@@ -451,8 +449,7 @@ mod tests {
 
     #[test]
     fn plan_mode_deny_rule_still_applies_to_reads() {
-        let mut engine =
-            PermissionEngine::from_settings(Vec::<Value>::new(), [json!("Read")]);
+        let mut engine = PermissionEngine::from_settings(Vec::<Value>::new(), [json!("Read")]);
         engine.set_mode(PermissionMode::Plan);
         // Explicit deny overrides plan-mode allow for read tools
         assert_eq!(

@@ -43,8 +43,11 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         text.push_str(" | ");
         text.push_str(hint);
     }
-    let para = Paragraph::new(text)
-        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+    let para = Paragraph::new(text).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    );
     frame.render_widget(para, area);
 }
 
@@ -58,14 +61,18 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{TITLE_USER} "),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(first.to_string()),
                     ]));
                 } else {
                     lines.push(Line::from(Span::styled(
                         format!("{TITLE_USER} "),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
                     )));
                 }
                 for ln in text_lines {
@@ -76,18 +83,25 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             TranscriptItem::AssistantText(text) => {
                 lines.push(Line::from(Span::styled(
                     TITLE_CLAUDE,
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 )));
                 for ln in text.lines() {
                     lines.push(Line::from(Span::raw(ln.to_string())));
                 }
                 lines.push(Line::from(""));
             }
-            TranscriptItem::ToolCall { name, input_summary } => {
+            TranscriptItem::ToolCall {
+                name,
+                input_summary,
+            } => {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("[Tool: {name}] "),
-                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         input_summary.to_string(),
@@ -95,8 +109,16 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                 ]));
             }
-            TranscriptItem::ToolResult { name: _, output, is_error } => {
-                let color = if *is_error { Color::Red } else { Color::DarkGray };
+            TranscriptItem::ToolResult {
+                name: _,
+                output,
+                is_error,
+            } => {
+                let color = if *is_error {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                };
                 let prefix = if *is_error { "[Error] " } else { "[Result] " };
                 // Show first few lines of output.
                 let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
@@ -137,7 +159,9 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             TranscriptItem::CompactBoundary => {
                 lines.push(Line::from(Span::styled(
                     TITLE_BOUNDARY,
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
                 )));
                 lines.push(Line::from(""));
             }
@@ -147,7 +171,9 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     if !app.streaming_text.is_empty() || app.mode == AppMode::Streaming {
         lines.push(Line::from(Span::styled(
             TITLE_CLAUDE,
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         )));
         for ln in app.streaming_text.lines() {
             lines.push(Line::from(Span::raw(ln.to_string())));
@@ -155,7 +181,9 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         if app.mode == AppMode::Streaming {
             lines.push(Line::from(Span::styled(
                 "|",
-                Style::default().fg(Color::Green).add_modifier(Modifier::SLOW_BLINK),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::SLOW_BLINK),
             )));
         }
     }
@@ -168,8 +196,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         lines
             .iter()
             .map(|line| {
-                let char_count: usize =
-                    line.spans.iter().map(|s| s.content.chars().count()).sum();
+                let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
                 char_count.div_ceil(wrap_width).max(1)
             })
             .sum()
@@ -211,7 +238,9 @@ fn render_permission_modal(frame: &mut Frame, perm: &PendingPermission, area: Re
     let body = vec![
         Line::from(Span::styled(
             format!("Tool: {}", perm.tool_name),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(perm.summary.as_str()),
@@ -278,7 +307,10 @@ mod tests {
         term.draw(|f| render(f, &app)).unwrap();
         let buf = term.backend().buffer().clone();
         let s = buffer_to_string(&buf);
-        assert!(s.contains("abcdef12"), "title bar missing session id; got:\n{s}");
+        assert!(
+            s.contains("abcdef12"),
+            "title bar missing session id; got:\n{s}"
+        );
     }
 
     #[test]

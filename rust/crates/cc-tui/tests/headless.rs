@@ -17,8 +17,8 @@
 
 use cc_core::{AppEvent, Usage};
 use cc_tui::{
-    update, App, AppAction, AppMode, CommandContext, CommandRegistry, TranscriptItem, UpdateContext,
-    UpdateResult,
+    update, App, AppAction, AppMode, CommandContext, CommandRegistry, TranscriptItem,
+    UpdateContext, UpdateResult,
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -42,7 +42,10 @@ fn zero_usage() -> Usage {
 fn ac2_partial_text_preserved_after_abort() {
     let mut app = App::new("sess".into(), "test-model".into());
     let (reg, ctx) = test_ctx();
-    let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
 
     app.start_stream();
     app.on_token("The ");
@@ -52,12 +55,21 @@ fn ac2_partial_text_preserved_after_abort() {
     update(&mut app, AppAction::Abort, &uctx);
 
     assert_eq!(app.mode, AppMode::Input, "mode must be Input after abort");
-    assert!(app.streaming_text.is_empty(), "streaming_text must be cleared after abort");
+    assert!(
+        app.streaming_text.is_empty(),
+        "streaming_text must be cleared after abort"
+    );
 
     match app.transcript.last() {
         Some(TranscriptItem::AssistantText(t)) => {
-            assert!(t.contains("The quick brown"), "partial text must be preserved: got '{t}'");
-            assert!(t.contains("aborted"), "aborted marker must be present: got '{t}'");
+            assert!(
+                t.contains("The quick brown"),
+                "partial text must be preserved: got '{t}'"
+            );
+            assert!(
+                t.contains("aborted"),
+                "aborted marker must be present: got '{t}'"
+            );
         }
         other => panic!("expected AssistantText with aborted marker, got {other:?}"),
     }
@@ -69,12 +81,18 @@ fn ac2_partial_text_preserved_after_abort() {
 fn ac2_streaming_text_cleared_after_abort() {
     let mut app = App::new("s".into(), "m".into());
     let (reg, ctx) = test_ctx();
-    let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
 
     app.start_stream();
     app.on_token("hello ");
     app.on_token("world");
-    assert_eq!(app.streaming_text, "hello world", "pre-condition: text accumulated");
+    assert_eq!(
+        app.streaming_text, "hello world",
+        "pre-condition: text accumulated"
+    );
 
     update(&mut app, AppAction::Abort, &uctx);
     assert!(
@@ -93,7 +111,10 @@ fn ac2_abort_state_transition_is_fast() {
     for _ in 0..100 {
         let mut app = App::new("s".into(), "m".into());
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
         app.start_stream();
         for i in 0..10u32 {
             app.on_token(&format!("token{i} "));
@@ -116,7 +137,10 @@ fn ac2_abort_state_transition_is_fast() {
 fn ac3_submit_during_streaming_is_queued() {
     let mut app = App::new("s".into(), "m".into());
     let (reg, ctx) = test_ctx();
-    let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
 
     app.start_stream();
     assert_eq!(app.mode, AppMode::Streaming);
@@ -142,7 +166,10 @@ fn ac3_submit_during_streaming_is_queued() {
 fn ac3_empty_submit_ignored() {
     let mut app = App::new("s".into(), "m".into());
     let (reg, ctx) = test_ctx();
-    let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
 
     app.start_stream();
 
@@ -152,7 +179,11 @@ fn ac3_empty_submit_ignored() {
 
     app.input = "   ".into();
     update(&mut app, AppAction::Submit, &uctx);
-    assert_eq!(app.queued.len(), 0, "whitespace-only input must not be queued");
+    assert_eq!(
+        app.queued.len(),
+        0,
+        "whitespace-only input must not be queued"
+    );
 }
 
 /// AC-3c: Queued inputs survive stream completion and are drained by TurnComplete.
@@ -160,7 +191,10 @@ fn ac3_empty_submit_ignored() {
 fn ac3_queued_inputs_drained_on_turn_complete() {
     let mut app = App::new("s".into(), "m".into());
     let (reg, ctx) = test_ctx();
-    let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
 
     app.start_stream();
     app.on_token("response token ");
@@ -169,7 +203,13 @@ fn ac3_queued_inputs_drained_on_turn_complete() {
     update(&mut app, AppAction::Submit, &uctx);
     assert_eq!(app.queued.len(), 1, "message queued during stream");
 
-    let result = update(&mut app, AppAction::TurnComplete { usage: zero_usage() }, &uctx);
+    let result = update(
+        &mut app,
+        AppAction::TurnComplete {
+            usage: zero_usage(),
+        },
+        &uctx,
+    );
     assert!(
         matches!(result, UpdateResult::SubmitToEngine(ref t) if t == "queued while streaming"),
         "TurnComplete must drain queue and return SubmitToEngine, got {result:?}"
@@ -185,7 +225,10 @@ fn ac3_queued_inputs_drained_on_turn_complete() {
 fn ac4_100_turns_complete() {
     let mut app = App::new("s".into(), "m".into());
     let (reg, ctx) = test_ctx();
-    let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
     let tokens = ["The ", "quick ", "brown ", "fox ", "jumps "];
 
     for turn in 0..100u32 {
@@ -196,24 +239,45 @@ fn ac4_100_turns_complete() {
         update(
             &mut app,
             AppAction::TurnComplete {
-                usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
             },
             &uctx,
         );
 
-        assert_eq!(app.status.turn_count, turn + 1, "turn_count must increment each turn");
-        assert_eq!(app.mode, AppMode::Input, "mode must be Input after TurnComplete");
-        assert!(app.streaming_text.is_empty(), "streaming_text must be cleared after TurnComplete");
+        assert_eq!(
+            app.status.turn_count,
+            turn + 1,
+            "turn_count must increment each turn"
+        );
+        assert_eq!(
+            app.mode,
+            AppMode::Input,
+            "mode must be Input after TurnComplete"
+        );
+        assert!(
+            app.streaming_text.is_empty(),
+            "streaming_text must be cleared after TurnComplete"
+        );
     }
 
-    assert_eq!(app.status.turn_count, 100, "must complete exactly 100 turns");
+    assert_eq!(
+        app.status.turn_count, 100,
+        "must complete exactly 100 turns"
+    );
 
     let assistant_count = app
         .transcript
         .iter()
         .filter(|i| matches!(i, TranscriptItem::AssistantText(_)))
         .count();
-    assert_eq!(assistant_count, 100, "transcript must have exactly 100 AssistantText entries");
+    assert_eq!(
+        assistant_count, 100,
+        "transcript must have exactly 100 AssistantText entries"
+    );
 
     // Each AssistantText entry must be non-empty and not contain abort marker.
     for item in &app.transcript {
@@ -229,13 +293,22 @@ fn ac4_100_turns_complete() {
 fn ac4_streaming_text_cleared_between_turns() {
     let mut app = App::new("s".into(), "m".into());
     let (reg, ctx) = test_ctx();
-    let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
 
     for _ in 0..10 {
         app.start_stream();
         app.on_token("hello ");
         app.on_token("world");
-        update(&mut app, AppAction::TurnComplete { usage: zero_usage() }, &uctx);
+        update(
+            &mut app,
+            AppAction::TurnComplete {
+                usage: zero_usage(),
+            },
+            &uctx,
+        );
         assert!(
             app.streaming_text.is_empty(),
             "streaming_text must be empty after TurnComplete"
@@ -253,7 +326,10 @@ async fn ac5_no_deadlock_100_turns() {
         let (tx, mut rx) = mpsc::channel::<AppEvent>(256);
         let mut app = App::new("s".into(), "m".into());
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         for _ in 0..100u64 {
             let tx2 = tx.clone();
@@ -264,7 +340,11 @@ async fn ac5_no_deadlock_100_turns() {
                 }
                 let _ = tx2
                     .send(AppEvent::TurnComplete {
-                        usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 5,
+                            ..Default::default()
+                        },
                     })
                     .await;
             });
@@ -301,7 +381,10 @@ async fn ac5_abort_does_not_deadlock() {
         let (tx, mut rx) = mpsc::channel::<AppEvent>(64);
         let mut app = App::new("s".into(), "m".into());
         let (reg, ctx) = test_ctx();
-        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
 
         // Engine sends 40 deltas then TurnComplete (as if cancellation is slightly delayed).
         let tx2 = tx.clone();
@@ -311,7 +394,9 @@ async fn ac5_abort_does_not_deadlock() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             let _ = tx2
-                .send(AppEvent::TurnComplete { usage: Usage::default() })
+                .send(AppEvent::TurnComplete {
+                    usage: Usage::default(),
+                })
                 .await;
         });
 

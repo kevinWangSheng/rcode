@@ -93,12 +93,7 @@ pub fn load_claudemd_walk_up(cwd: &Path, root: &Path) -> Vec<MemoryFile> {
             if let Ok(content) = std::fs::read_to_string(&claude_md) {
                 let mem = parse_memory_file(&content, &claude_md, MemoryType::Project);
                 // Resolve @-includes
-                let included = resolve_includes(
-                    &content,
-                    dir,
-                    MemoryType::Project,
-                    &mut processed,
-                );
+                let included = resolve_includes(&content, dir, MemoryType::Project, &mut processed);
                 files.extend(included);
                 files.push(mem);
             }
@@ -426,7 +421,11 @@ mod tests {
 
     #[test]
     fn parse_memory_without_frontmatter_uses_filename() {
-        let mem = parse_memory_file("plain body", &PathBuf::from("/tmp/old.md"), MemoryType::User);
+        let mem = parse_memory_file(
+            "plain body",
+            &PathBuf::from("/tmp/old.md"),
+            MemoryType::User,
+        );
         assert_eq!(mem.name, "old");
         assert_eq!(mem.memory_type, MemoryType::User);
         assert_eq!(mem.content, "plain body");
@@ -470,8 +469,14 @@ mod tests {
     #[test]
     fn include_directive_parsing() {
         assert_eq!(parse_include_directive("@./local.md"), Some("./local.md"));
-        assert_eq!(parse_include_directive("@~/docs/rules.md"), Some("~/docs/rules.md"));
-        assert_eq!(parse_include_directive("@/abs/path.md"), Some("/abs/path.md"));
+        assert_eq!(
+            parse_include_directive("@~/docs/rules.md"),
+            Some("~/docs/rules.md")
+        );
+        assert_eq!(
+            parse_include_directive("@/abs/path.md"),
+            Some("/abs/path.md")
+        );
         assert_eq!(parse_include_directive("not an include"), None);
         assert_eq!(parse_include_directive("@"), None);
     }
@@ -487,10 +492,7 @@ mod tests {
 
     #[test]
     fn walk_up_from_nested() {
-        let dirs = walk_up_dirs(
-            Path::new("/repo/src/deep"),
-            Path::new("/repo"),
-        );
+        let dirs = walk_up_dirs(Path::new("/repo/src/deep"), Path::new("/repo"));
         assert_eq!(dirs.len(), 3);
         assert_eq!(dirs[0], Path::new("/repo/src/deep"));
         assert_eq!(dirs[1], Path::new("/repo/src"));
@@ -586,7 +588,11 @@ mod tests {
         let root = dir.path();
 
         // Create project CLAUDE.md
-        std::fs::write(root.join("CLAUDE.md"), "---\nname: proj\n---\nProject rules").unwrap();
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            "---\nname: proj\n---\nProject rules",
+        )
+        .unwrap();
 
         let sources = cc_config::SettingsSourcesEnabled {
             user: false, // don't touch real ~/.claude/memory/

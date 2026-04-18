@@ -90,15 +90,13 @@ mod tests {
         let task_id = {
             let mut reg = registry.lock().unwrap();
             let c = CancellationToken::new();
-            reg.spawn(
-                TaskKind::LocalBash,
-                "slow task".into(),
-                c,
-                async {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    Ok(TaskOutput { summary: "".into(), content: "".into() })
-                },
-            )
+            reg.spawn(TaskKind::LocalBash, "slow task".into(), c, async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(TaskOutput {
+                    summary: "".into(),
+                    content: "".into(),
+                })
+            })
             .unwrap()
         };
 

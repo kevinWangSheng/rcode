@@ -34,9 +34,9 @@ pub enum HookEvent {
 pub enum HookKind {
     #[default]
     Command, // shell command, JSON on stdin
-    Prompt,  // text injected into context
-    Http,    // POST JSON to URL
-    Agent,   // delegate to subagent
+    Prompt, // text injected into context
+    Http,   // POST JSON to URL
+    Agent,  // delegate to subagent
 }
 
 /// Matcher for filtering which tool invocations trigger a hook.
@@ -63,11 +63,7 @@ pub struct HookConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Prompt text for kind=prompt (also accepts "prompt" key from settings).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "prompt"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "prompt")]
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,

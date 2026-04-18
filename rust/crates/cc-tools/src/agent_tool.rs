@@ -91,7 +91,10 @@ mod tests {
     async fn returns_error_when_runner_not_wired() {
         let tool = AgentTool { runner: None };
         let r = tool
-            .execute(json!({"prompt": "do something", "description": "test"}), &cancel())
+            .execute(
+                json!({"prompt": "do something", "description": "test"}),
+                &cancel(),
+            )
             .await
             .unwrap();
         assert!(r.is_error);

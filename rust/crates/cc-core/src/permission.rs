@@ -15,13 +15,13 @@ pub enum PermissionBehavior {
 /// Source of a permission decision (for audit trail).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionSource {
-    SettingsAllow,  // matched an allow rule in settings
-    SettingsDeny,   // matched a deny rule in settings
-    SessionAllow,   // user chose "always allow" earlier this session
-    ModeDefault,    // default behavior for current permission mode
-    BypassFlag,     // --bypass-permissions CLI flag
-    UserPrompt,     // interactive user decision
-    Hook,           // hook blocked the action
+    SettingsAllow, // matched an allow rule in settings
+    SettingsDeny,  // matched a deny rule in settings
+    SessionAllow,  // user chose "always allow" earlier this session
+    ModeDefault,   // default behavior for current permission mode
+    BypassFlag,    // --bypass-permissions CLI flag
+    UserPrompt,    // interactive user decision
+    Hook,          // hook blocked the action
 }
 
 /// Result of evaluating permission rules for a tool invocation.

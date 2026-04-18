@@ -131,12 +131,7 @@ fn load_one(path: &Path, source: SkillSource, default_name: String) -> Option<Sk
     Some(parse_skill(&content, path, source, default_name))
 }
 
-fn parse_skill(
-    content: &str,
-    path: &Path,
-    _source: SkillSource,
-    default_name: String,
-) -> SkillDef {
+fn parse_skill(content: &str, path: &Path, _source: SkillSource, default_name: String) -> SkillDef {
     let (frontmatter, body) = split_frontmatter(content);
 
     let name = frontmatter
@@ -318,7 +313,12 @@ mod tests {
     #[test]
     fn parses_skill_without_frontmatter() {
         let md = "Just a body, no frontmatter.\n";
-        let skill = parse_skill(md, Path::new("/tmp/foo.md"), SkillSource::User, "foo".into());
+        let skill = parse_skill(
+            md,
+            Path::new("/tmp/foo.md"),
+            SkillSource::User,
+            "foo".into(),
+        );
         assert_eq!(skill.name, "foo");
         assert_eq!(skill.description, "");
         assert_eq!(skill.content, "Just a body, no frontmatter.");

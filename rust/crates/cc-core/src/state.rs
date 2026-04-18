@@ -16,8 +16,14 @@ pub enum AppEvent {
     StreamEnd(StopReason),
 
     // Tool execution
-    ToolStart { name: String, input: Value },
-    ToolEnd { name: String, result: ToolResult },
+    ToolStart {
+        name: String,
+        input: Value,
+    },
+    ToolEnd {
+        name: String,
+        result: ToolResult,
+    },
 
     // Permission — engine sends request with a oneshot channel;
     // TUI renders dialog and sends decision back through `response_tx`.
@@ -30,7 +36,9 @@ pub enum AppEvent {
 
     // Session
     CompactBoundary,
-    TurnComplete { usage: Usage },
+    TurnComplete {
+        usage: Usage,
+    },
 
     // Tasks
     TaskUpdate(TaskNotification),
