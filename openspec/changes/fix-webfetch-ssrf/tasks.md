@@ -1,36 +1,36 @@
 ## 1. SSRF Guard Module
 
-- [ ] 1.1 New file `cc-tools/src/web_fetch/ssrf.rs` exporting
+- [x] 1.1 New file `cc-tools/src/web_fetch/ssrf.rs` exporting
       `pub async fn guard_url(url: &Url) -> Result<IpAddr, CcError>`.
-- [ ] 1.2 Implement private-range checks for IPv4 and IPv6 using stable
+- [x] 1.2 Implement private-range checks for IPv4 and IPv6 using stable
       `Ipv4Addr::is_loopback` / `is_link_local` / `is_private` plus
       explicit bans on `169.254.169.254`, `100.64.0.0/10`,
       `fc00::/7`, `fe80::/10`.
-- [ ] 1.3 Respect `CC_WEBFETCH_ALLOW_PRIVATE=1` to bypass for local dev.
-- [ ] 1.4 Unit tests covering: public DNS name (pass), `localhost` (fail),
+- [x] 1.3 Respect `CC_WEBFETCH_ALLOW_PRIVATE=1` to bypass for local dev.
+- [x] 1.4 Unit tests covering: public DNS name (pass), `localhost` (fail),
       `127.0.0.1` (fail), `169.254.169.254` (fail), `10.0.0.1` (fail),
       `[::1]` (fail), opt-out env var (pass with warning).
 
 ## 2. Integrate Into web_fetch
 
-- [ ] 2.1 Call `guard_url` at the top of `WebFetchTool::execute` after
+- [x] 2.1 Call `guard_url` at the top of `WebFetchTool::execute` after
       `is_allowed_url`; on error return `ToolResult::error` with message:
       `"refused to fetch private/internal address <host>; set
       CC_WEBFETCH_ALLOW_PRIVATE=1 to override"`.
-- [ ] 2.2 Use the resolved IP to build the outbound request (`reqwest`
+- [x] 2.2 Use the resolved IP to build the outbound request (`reqwest`
       `.resolve(host, SocketAddr)`) so DNS rebinding between the check and
       the fetch cannot swap targets.
 
 ## 3. Apply To web_search
 
-- [ ] 3.1 When following an individual search result URL, same guard
+- [x] 3.1 When following an individual search result URL, same guard
       applies. Failing results are skipped (not fatal).
 
 ## 4. Regression Tests
 
-- [ ] 4.1 Integration test that boots a local HTTP server on a random
+- [x] 4.1 Integration test that boots a local HTTP server on a random
       loopback port and asserts WebFetch refuses it (unless opt-out).
-- [ ] 4.2 Integration test that asserts a request to
+- [x] 4.2 Integration test that asserts a request to
       `http://169.254.169.254/latest/meta-data/` is refused before any
       socket is opened (use a `reqwest` middleware / counter).
 
@@ -38,5 +38,5 @@
 
 - [ ] 5.1 Mention `CC_WEBFETCH_ALLOW_PRIVATE` in `RUST_REWRITE_PLAN.md`
       implementation-notes.
-- [ ] 5.2 `cargo test -p cc-tools` + `cargo clippy --workspace -- -D warnings`
+- [x] 5.2 `cargo test -p cc-tools` + `cargo clippy --workspace -- -D warnings`
       clean.
