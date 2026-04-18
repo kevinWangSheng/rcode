@@ -126,6 +126,12 @@ pub struct App {
     /// Transient status-line hint (e.g. "press Ctrl+C again to force quit").
     /// Cleared by the render layer once the force-quit window has lapsed.
     pub status_hint: Option<String>,
+    /// Snapshot of `mode` taken when a `ShowPermission` action fires. A
+    /// permission dialog can appear both during `Streaming` (tool call mid-
+    /// turn) and after it (final tool call arriving as the assistant block
+    /// lands, mode already `Input`). Restoring from this snapshot on any
+    /// decision keeps the TUI's input routing correct.
+    pub pre_permission_mode: Option<AppMode>,
 }
 
 impl App {
@@ -145,6 +151,7 @@ impl App {
             current_turn_cancel: None,
             last_abort_at: None,
             status_hint: None,
+            pre_permission_mode: None,
         }
     }
 

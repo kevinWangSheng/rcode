@@ -77,6 +77,20 @@ pub struct UpdateContext<'a> {
     pub command_ctx: &'a crate::commands::CommandContext,
 }
 
+/// Resolve the post-permission-dialog mode.
+///
+/// Prefer the snapshot captured when `ShowPermission` fired. If the snapshot
+/// turns out to be `PermissionPrompt` (shouldn't happen, but defensive
+/// against nested / stale states) or is missing entirely, fall back to
+/// `Input` — a stream that has already completed MUST not be re-entered.
+fn restore_after_permission(app: &mut App) -> AppMode {
+    let snap = app.pre_permission_mode.take();
+    match snap {
+        Some(AppMode::PermissionPrompt) | None => AppMode::Input,
+        Some(m) => m,
+    }
+}
+
 /// Apply an action to the app state.
 pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateResult {
     match action {
@@ -164,6 +178,11 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             app.push_tool_result(name, output, is_error);
         }
         AppAction::ShowPermission { tool_name, summary, reply } => {
+            // Snapshot the pre-dialog mode so decision arms can restore it
+            // rather than hard-coding Streaming (which is wrong when the
+            // dialog arrives after the final assistant block has landed and
+            // mode is already Input).
+            app.pre_permission_mode = Some(app.mode);
             app.permission = Some(PendingPermission {
                 tool_name,
                 summary,
@@ -176,21 +195,21 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 let _ = reply.send(PromptDecision::Allow);
             }
             app.permission = None;
-            app.mode = AppMode::Streaming;
+            app.mode = restore_after_permission(app);
         }
         AppAction::PermissionAllowAlways => {
             if let Some(reply) = app.pending_reply.take() {
                 let _ = reply.send(PromptDecision::AllowAlways);
             }
             app.permission = None;
-            app.mode = AppMode::Streaming;
+            app.mode = restore_after_permission(app);
         }
         AppAction::PermissionDeny => {
             if let Some(reply) = app.pending_reply.take() {
                 let _ = reply.send(PromptDecision::Deny);
             }
             app.permission = None;
-            app.mode = AppMode::Streaming;
+            app.mode = restore_after_permission(app);
         }
         AppAction::Abort => {
             // Stamp regardless of mode so `ForceQuit` escalation works even
@@ -483,5 +502,112 @@ mod tests {
 
         update(&mut app, AppAction::Tick, &uctx);
         assert!(app.status_hint.is_some(), "fresh hint must survive tick");
+    }
+
+    // ── Permission-dialog mode restoration ─────────────────────────────────
+
+    fn show_permission() -> (AppAction, oneshot::Receiver<PromptDecision>) {
+        let (tx, rx) = oneshot::channel::<PromptDecision>();
+        (
+            AppAction::ShowPermission {
+                tool_name: "Bash".into(),
+                summary: "ls".into(),
+                reply: tx,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn permission_deny_during_streaming_restores_streaming() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        assert_eq!(app.mode, AppMode::Streaming);
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        assert_eq!(app.mode, AppMode::PermissionPrompt);
+        assert_eq!(app.pre_permission_mode, Some(AppMode::Streaming));
+
+        update(&mut app, AppAction::PermissionDeny, &uctx);
+        assert_eq!(
+            app.mode,
+            AppMode::Streaming,
+            "dialog opened mid-stream must return to Streaming on Deny"
+        );
+        assert!(app.pre_permission_mode.is_none(), "snapshot must be consumed");
+    }
+
+    #[test]
+    fn permission_deny_after_stream_ended_restores_input_not_streaming() {
+        // This is the regression the fix targets: a tool call request arriving
+        // just as the final assistant block lands means the App is already in
+        // Input when ShowPermission fires. Hard-coding Streaming on Deny made
+        // the next keystroke land in the wrong handler.
+        let mut app = App::new("s".into(), "m".into());
+        assert_eq!(app.mode, AppMode::Input, "pre-condition: Input mode");
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        assert_eq!(app.mode, AppMode::PermissionPrompt);
+        assert_eq!(app.pre_permission_mode, Some(AppMode::Input));
+
+        update(&mut app, AppAction::PermissionDeny, &uctx);
+        assert_eq!(
+            app.mode,
+            AppMode::Input,
+            "dialog opened after stream ended must return to Input on Deny, \
+             not forced back into Streaming"
+        );
+    }
+
+    #[test]
+    fn permission_allow_restores_snapshot_mode() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        update(&mut app, AppAction::PermissionAllow, &uctx);
+        assert_eq!(app.mode, AppMode::Streaming);
+    }
+
+    #[test]
+    fn permission_allow_always_restores_snapshot_mode() {
+        let mut app = App::new("s".into(), "m".into());
+        // Mode is Input (stream already done).
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        update(&mut app, AppAction::PermissionAllowAlways, &uctx);
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[test]
+    fn permission_decision_without_snapshot_falls_back_to_input() {
+        // Defensive: if somehow the decision arm runs without a prior
+        // ShowPermission having captured a snapshot, restore to Input rather
+        // than leaving the app stuck in PermissionPrompt or fabricating
+        // Streaming.
+        let mut app = App::new("s".into(), "m".into());
+        app.mode = AppMode::PermissionPrompt;
+        app.pre_permission_mode = None;
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        update(&mut app, AppAction::PermissionDeny, &uctx);
+        assert_eq!(app.mode, AppMode::Input);
     }
 }
