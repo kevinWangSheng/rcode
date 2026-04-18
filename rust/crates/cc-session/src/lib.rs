@@ -51,8 +51,11 @@ impl Session {
     /// Create a new session with a freshly generated UUID.
     pub fn new() -> CcResult<Self> {
         let id = Uuid::new_v4().to_string();
-        let path = transcript_path(&id);
-        fs::create_dir_all(path.parent().unwrap())
+        let path = transcript_path(&id)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| CcError::io(format!("invalid transcript path: {}", path.display())))?;
+        fs::create_dir_all(parent)
             .map_err(|e| CcError::io(format!("failed to create session dir: {e}")))?;
         Ok(Session {
             id,
@@ -69,7 +72,7 @@ impl Session {
     /// layout path so subsequent appends create a fresh JSONL alongside the
     /// imported messages — we never write back into the TS file.
     pub fn resume(id: &str) -> CcResult<(Self, Vec<MessageParam>)> {
-        let path = transcript_path(id);
+        let path = transcript_path(id)?;
         if path.exists() {
             let messages = load_transcript(&path)?;
             return Ok((
@@ -100,11 +103,17 @@ impl Session {
 
         Err(CcError::NotFound(format!(
             "session not found: {id} (looked in {} and ~/.claude/projects/*/{id}.jsonl)",
-            transcript_path(id).display()
+            path.display()
         )))
     }
 
     /// Append a message to the JSONL transcript file.
+    ///
+    /// Each append is fsynced before returning so that a crash / SIGKILL /
+    /// power loss after `append` returns is guaranteed to preserve the
+    /// turn on disk. `RUST_REWRITE_PLAN.md` §3 promises per-turn
+    /// durability; without `sync_all` the libc-level and OS page cache
+    /// can silently drop the last write.
     pub fn append(&self, message: &MessageParam) -> CcResult<()> {
         self.append_entry(message, None, None)
     }
@@ -141,6 +150,16 @@ impl Session {
 
         writeln!(file, "{line}")
             .map_err(|e| CcError::io(format!("failed to write transcript: {e}")))?;
+
+        // Durability: flush libc buffers, then fsync so the write survives
+        // a SIGKILL / power loss. If the FS cannot durably persist (disk
+        // full, read-only remount, network FS outage), surface the error
+        // so the caller can decide — silently continuing would mislead
+        // resume logic into a false sense of persistence.
+        file.flush()
+            .map_err(|e| CcError::io(format!("failed to flush transcript: {e}")))?;
+        file.sync_all()
+            .map_err(|e| CcError::io(format!("failed to fsync transcript: {e}")))?;
 
         Ok(())
     }
@@ -184,19 +203,20 @@ impl Session {
     }
 }
 
-impl Default for Session {
-    fn default() -> Self {
-        Session::new().expect("failed to create default session")
+fn sessions_root() -> CcResult<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        CcError::io("could not determine home directory for session storage")
+    })?;
+    if home.as_os_str().is_empty() {
+        return Err(CcError::io(
+            "home directory is empty; cannot locate session storage",
+        ));
     }
+    Ok(home.join(".claude").join("sessions"))
 }
 
-fn transcript_path(id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-        .join("sessions")
-        .join(id)
-        .join("transcript.jsonl")
+fn transcript_path(id: &str) -> CcResult<PathBuf> {
+    Ok(sessions_root()?.join(id).join("transcript.jsonl"))
 }
 
 fn load_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
@@ -367,11 +387,18 @@ pub fn list_session_infos() -> Vec<SessionInfo> {
 }
 
 /// List all session IDs (directory names under `~/.claude/sessions/`).
+///
+/// Returns an empty vector when the home directory cannot be resolved or
+/// the sessions directory does not exist yet. A missing home is logged so
+/// misconfigured environments are noticed without crashing the CLI.
 pub fn list_sessions() -> Vec<String> {
-    let base = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-        .join("sessions");
+    let base = match sessions_root() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("cc-session: cannot list sessions: {e}");
+            return Vec::new();
+        }
+    };
 
     if !base.exists() {
         return Vec::new();
@@ -389,7 +416,114 @@ pub fn list_sessions() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    // Serialize tests that mutate process-wide env vars so they don't race.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII helper: override `HOME` (and `USERPROFILE` on Windows) for the
+    /// duration of the test, then restore the original value on drop.
+    struct HomeGuard {
+        prev_home: Option<std::ffi::OsString>,
+        #[cfg(windows)]
+        prev_userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(new_home: &std::path::Path) -> Self {
+            let prev_home = std::env::var_os("HOME");
+            #[cfg(windows)]
+            let prev_userprofile = std::env::var_os("USERPROFILE");
+            // SAFETY: tests holding ENV_LOCK are single-threaded w.r.t. each other.
+            unsafe {
+                std::env::set_var("HOME", new_home);
+                #[cfg(windows)]
+                std::env::set_var("USERPROFILE", new_home);
+            }
+            HomeGuard {
+                prev_home,
+                #[cfg(windows)]
+                prev_userprofile,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                #[cfg(windows)]
+                match &self.prev_userprofile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+            }
+        }
+    }
+
+    /// Session::new must surface an IO error (not panic) when HOME points
+    /// at a location where create_dir_all cannot succeed. This guards
+    /// against the former `path.parent().unwrap()` + `Default::expect`
+    /// panic paths described in the fix-session-startup-panic proposal.
+    #[test]
+    fn session_new_surfaces_io_error_for_unwritable_home() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // /dev/null exists but is not a directory, so create_dir_all underneath
+        // it fails with ENOTDIR (portable across macOS and Linux CI runners).
+        let bad_home = std::path::Path::new("/dev/null");
+        let _hg = HomeGuard::set(bad_home);
+
+        let result = std::panic::catch_unwind(Session::new);
+        let unwrapped = result.expect("Session::new must not panic on unusable HOME");
+        match unwrapped {
+            Err(CcError::Io(_)) => {}
+            other => panic!("expected CcError::Io, got {other:?}"),
+        }
+    }
+
+    /// Regression: make sure an empty HOME (some container images ship
+    /// with an empty string) does not slip past as "."
+    #[test]
+    fn session_new_rejects_empty_home() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _hg = HomeGuard::set(std::path::Path::new(""));
+
+        // dirs::home_dir() on some platforms falls back to getpwuid_r when
+        // HOME is empty, so we only assert the outcome is not a panic and
+        // that if a path *is* resolved successfully it is non-empty.
+        let result = std::panic::catch_unwind(Session::new);
+        let unwrapped = result.expect("Session::new must not panic on empty HOME");
+        if let Ok(session) = unwrapped {
+            assert!(
+                !session
+                    .transcript_path()
+                    .to_string_lossy()
+                    .starts_with("/.claude/sessions/"),
+                "transcript path must not be anchored at filesystem root via empty HOME: {}",
+                session.transcript_path().display()
+            );
+        }
+    }
+
+    /// Happy path: Session::new succeeds, append writes a line, and the
+    /// written line survives a re-open without any explicit .close().
+    #[test]
+    fn session_append_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let _hg = HomeGuard::set(tmp.path());
+
+        let session = Session::new().expect("Session::new should succeed in tempdir HOME");
+        let msg = MessageParam::user("hello");
+        session.append(&msg).expect("append should succeed");
+
+        let loaded = session.load_messages().expect("load_messages");
+        assert_eq!(loaded.len(), 1);
+    }
 
     #[test]
     fn ts_transcript_parses_string_content() {

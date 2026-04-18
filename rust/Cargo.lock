@@ -369,6 +369,7 @@ dependencies = [
  "cc-core",
  "chrono",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
