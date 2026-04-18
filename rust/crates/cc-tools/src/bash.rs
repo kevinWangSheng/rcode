@@ -45,7 +45,7 @@ impl Tool for BashTool {
         false
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
         let command = input["command"]
             .as_str()
             .ok_or_else(|| cc_core::CcError::tool("tool", "missing 'command' field"))?
@@ -54,27 +54,49 @@ impl Tool for BashTool {
         let timeout_ms = input["timeout"].as_u64().unwrap_or(120_000);
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
-        let output = tokio::time::timeout(
-            timeout,
-            Command::new("bash")
-                .arg("-c")
-                .arg(&command)
-                .output(),
-        )
-        .await
-        .map_err(|_| cc_core::CcError::tool("tool", format!("command timed out after {timeout_ms}ms")))?
-        .map_err(|e| cc_core::CcError::tool("tool", format!("failed to spawn bash: {e}")))?;
+        // Spawn the child so we can kill it on cancel. `Command::output()`
+        // doesn't give us a handle to do that — it buffers the entire run.
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(&command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| cc_core::CcError::tool("tool", format!("failed to spawn bash: {e}")))?;
+
+        let output = tokio::select! {
+            // Command finishes naturally (success, failure, or ENOENT).
+            result = tokio::time::timeout(timeout, child.wait_with_output()) => {
+                result.map_err(|_| cc_core::CcError::tool(
+                    "tool",
+                    format!("command timed out after {timeout_ms}ms"),
+                ))?.map_err(|e| cc_core::CcError::tool("tool", format!("bash i/o failed: {e}")))?
+            }
+            // Cancel token fires (Ctrl+C, permission denied mid-flight, etc.)
+            // — we don't have the child handle after the branch completes,
+            // but tokio's Child kills on Drop so returning early is enough.
+            _ = cancel.cancelled() => {
+                return Err(cc_core::CcError::tool("tool", "bash execution cancelled"));
+            }
+        };
 
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         // Behavior contract: Bash non-zero exit → include exit code in content, NO is_error flag.
+        // Both streams are always included when non-empty — successful commands
+        // that write progress to stderr (cargo, make, etc.) would otherwise
+        // silently lose that output.
         let content = if exit_code == 0 {
-            if stdout.is_empty() && !stderr.is_empty() {
+            if stdout.is_empty() && stderr.is_empty() {
+                String::new()
+            } else if stdout.is_empty() {
                 stderr
-            } else {
+            } else if stderr.is_empty() {
                 stdout
+            } else {
+                format!("{stdout}\nSTDERR:\n{stderr}")
             }
         } else {
             let mut parts = Vec::new();
@@ -139,5 +161,42 @@ mod tests {
     #[test]
     fn bash_is_not_read_only() {
         assert!(!BashTool.is_read_only());
+    }
+
+    #[tokio::test]
+    async fn bash_success_includes_both_stdout_and_stderr() {
+        // Regression: successful commands that write to both streams (cargo,
+        // make, etc.) used to drop stderr. Both must be surfaced now.
+        let tool = BashTool;
+        let cancel = CancellationToken::new();
+        let result = tool
+            .execute(
+                json!({"command": "echo out && echo err >&2"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(result.content.contains("out"), "stdout missing: {:?}", result.content);
+        assert!(result.content.contains("STDERR:"), "stderr marker missing: {:?}", result.content);
+        assert!(result.content.contains("err"), "stderr body missing: {:?}", result.content);
+    }
+
+    #[tokio::test]
+    async fn bash_honors_cancel_token() {
+        use std::time::Duration;
+        let tool = BashTool;
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        // Cancel after 100ms, while the command is still sleeping.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel2.cancel();
+        });
+        let result = tool
+            .execute(json!({"command": "sleep 5"}), &cancel)
+            .await;
+        // Cancelled before the 5s sleep finishes.
+        assert!(result.is_err(), "expected cancel error, got {:?}", result);
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
     }
 }
