@@ -3,6 +3,8 @@
 //! Terminal events and engine events are mapped to AppActions,
 //! which are then applied to the App state via `update()`.
 
+use std::time::Instant;
+
 use crate::app::{App, AppMode, PendingPermission};
 use crate::commands::{parse, CommandOutcome, CommandRegistry};
 use cc_core::Usage;
@@ -43,6 +45,11 @@ pub enum AppAction {
 
     // Control
     Abort,
+    /// Emergency escape hatch — a second Ctrl+C within
+    /// `app::FORCE_QUIT_WINDOW_MS` when a previous `Abort` has not yet
+    /// unblocked the UI. The main loop must restore the terminal and
+    /// `exit(130)` without waiting for in-flight tasks.
+    ForceQuit,
     Quit,
     CompactBoundary,
     /// Turn completed: update token usage, finish stream, drain queued input.
@@ -56,6 +63,9 @@ pub enum AppAction {
 pub enum UpdateResult {
     Continue,
     Quit,
+    /// Caller must restore the terminal immediately and `exit(130)` —
+    /// do not wait on the event loop's normal teardown path.
+    ForceQuit,
     /// User submitted a message that must be sent to the engine.
     /// `start_stream()` has already been called on the App.
     SubmitToEngine(String),
@@ -65,6 +75,20 @@ pub enum UpdateResult {
 pub struct UpdateContext<'a> {
     pub commands: &'a CommandRegistry,
     pub command_ctx: &'a crate::commands::CommandContext,
+}
+
+/// Resolve the post-permission-dialog mode.
+///
+/// Prefer the snapshot captured when `ShowPermission` fired. If the snapshot
+/// turns out to be `PermissionPrompt` (shouldn't happen, but defensive
+/// against nested / stale states) or is missing entirely, fall back to
+/// `Input` — a stream that has already completed MUST not be re-entered.
+fn restore_after_permission(app: &mut App) -> AppMode {
+    let snap = app.pre_permission_mode.take();
+    match snap {
+        Some(AppMode::PermissionPrompt) | None => AppMode::Input,
+        Some(m) => m,
+    }
 }
 
 /// Apply an action to the app state.
@@ -154,6 +178,11 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             app.push_tool_result(name, output, is_error);
         }
         AppAction::ShowPermission { tool_name, summary, reply } => {
+            // Snapshot the pre-dialog mode so decision arms can restore it
+            // rather than hard-coding Streaming (which is wrong when the
+            // dialog arrives after the final assistant block has landed and
+            // mode is already Input).
+            app.pre_permission_mode = Some(app.mode);
             app.permission = Some(PendingPermission {
                 tool_name,
                 summary,
@@ -166,23 +195,30 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 let _ = reply.send(PromptDecision::Allow);
             }
             app.permission = None;
-            app.mode = AppMode::Streaming;
+            app.mode = restore_after_permission(app);
         }
         AppAction::PermissionAllowAlways => {
             if let Some(reply) = app.pending_reply.take() {
                 let _ = reply.send(PromptDecision::AllowAlways);
             }
             app.permission = None;
-            app.mode = AppMode::Streaming;
+            app.mode = restore_after_permission(app);
         }
         AppAction::PermissionDeny => {
             if let Some(reply) = app.pending_reply.take() {
                 let _ = reply.send(PromptDecision::Deny);
             }
             app.permission = None;
-            app.mode = AppMode::Streaming;
+            app.mode = restore_after_permission(app);
         }
         AppAction::Abort => {
+            // Stamp regardless of mode so `ForceQuit` escalation works even
+            // if the first Ctrl+C happened outside an active stream (e.g. a
+            // stuck permission dialog cleanup).
+            app.last_abort_at = Some(Instant::now());
+            // Transient status-line hint — nudges the user toward the escape
+            // hatch without polluting the transcript.
+            app.status_hint = Some("press Ctrl+C again to force quit".into());
             if app.mode == AppMode::Streaming || app.mode == AppMode::PermissionPrompt {
                 // Cancel running turn before aborting UI state.
                 if let Some(cancel) = app.current_turn_cancel.take() {
@@ -195,6 +231,18 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 app.permission = None;
                 app.abort_stream();
             }
+        }
+        AppAction::ForceQuit => {
+            // Best-effort cancel any in-flight work; the caller is responsible
+            // for restoring the terminal and exiting immediately.
+            if let Some(cancel) = app.current_turn_cancel.take() {
+                cancel.cancel();
+            }
+            if let Some(reply) = app.pending_reply.take() {
+                let _ = reply.send(PromptDecision::Deny);
+            }
+            app.should_quit = true;
+            return UpdateResult::ForceQuit;
         }
         AppAction::Quit => {
             app.should_quit = true;
@@ -225,7 +273,12 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             }
         }
         AppAction::Tick => {
-            // No-op — spinner animation driven by Ratatui blink modifier.
+            // Clear the Ctrl+C status hint once the force-quit window lapses
+            // so stale hints don't linger in the status line.
+            if app.status_hint.is_some() && !app.within_force_quit_window(Instant::now()) {
+                app.status_hint = None;
+            }
+            // Spinner animation driven by Ratatui blink modifier.
         }
         AppAction::SlashCommand(_) => {
             // Handled via Submit path.
@@ -361,5 +414,200 @@ mod tests {
             }
             _ => panic!("expected aborted assistant text"),
         }
+    }
+
+    // ── Ctrl+C force-quit escalation ──────────────────────────────────────
+
+    #[test]
+    fn abort_stamps_last_abort_at_and_shows_hint() {
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        assert!(app.last_abort_at.is_none());
+        assert!(app.status_hint.is_none());
+
+        update(&mut app, AppAction::Abort, &uctx);
+
+        assert!(app.last_abort_at.is_some(), "first Abort must stamp last_abort_at");
+        assert!(
+            app.status_hint
+                .as_deref()
+                .is_some_and(|h| h.contains("force quit")),
+            "status hint must mention force quit; got {:?}",
+            app.status_hint
+        );
+    }
+
+    #[test]
+    fn two_ctrl_c_within_window_yields_force_quit() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        // First Ctrl+C → graceful Abort.
+        let r1 = update(&mut app, AppAction::Abort, &uctx);
+        assert!(matches!(r1, UpdateResult::Continue));
+
+        // Within the 2s window — force quit.
+        assert!(app.within_force_quit_window(Instant::now()));
+        let r2 = update(&mut app, AppAction::ForceQuit, &uctx);
+        assert!(matches!(r2, UpdateResult::ForceQuit), "got {r2:?}");
+        assert!(app.should_quit, "ForceQuit must flag should_quit");
+    }
+
+    #[test]
+    fn single_ctrl_c_after_window_still_aborts() {
+        use std::time::Duration;
+
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        // Prime a stale abort 3s ago.
+        app.last_abort_at = Instant::now().checked_sub(Duration::from_secs(3));
+        assert!(!app.within_force_quit_window(Instant::now()));
+
+        // A fresh Abort should behave like a first-press graceful abort.
+        let r = update(&mut app, AppAction::Abort, &uctx);
+        assert!(matches!(r, UpdateResult::Continue));
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[test]
+    fn tick_clears_stale_status_hint() {
+        use std::time::Duration;
+
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        app.status_hint = Some("press Ctrl+C again to force quit".into());
+        app.last_abort_at = Instant::now().checked_sub(Duration::from_secs(3));
+
+        update(&mut app, AppAction::Tick, &uctx);
+        assert!(app.status_hint.is_none(), "stale hint must be cleared on tick");
+    }
+
+    #[test]
+    fn tick_preserves_fresh_status_hint() {
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        app.status_hint = Some("press Ctrl+C again to force quit".into());
+        app.last_abort_at = Some(Instant::now());
+
+        update(&mut app, AppAction::Tick, &uctx);
+        assert!(app.status_hint.is_some(), "fresh hint must survive tick");
+    }
+
+    // ── Permission-dialog mode restoration ─────────────────────────────────
+
+    fn show_permission() -> (AppAction, oneshot::Receiver<PromptDecision>) {
+        let (tx, rx) = oneshot::channel::<PromptDecision>();
+        (
+            AppAction::ShowPermission {
+                tool_name: "Bash".into(),
+                summary: "ls".into(),
+                reply: tx,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn permission_deny_during_streaming_restores_streaming() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        assert_eq!(app.mode, AppMode::Streaming);
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        assert_eq!(app.mode, AppMode::PermissionPrompt);
+        assert_eq!(app.pre_permission_mode, Some(AppMode::Streaming));
+
+        update(&mut app, AppAction::PermissionDeny, &uctx);
+        assert_eq!(
+            app.mode,
+            AppMode::Streaming,
+            "dialog opened mid-stream must return to Streaming on Deny"
+        );
+        assert!(app.pre_permission_mode.is_none(), "snapshot must be consumed");
+    }
+
+    #[test]
+    fn permission_deny_after_stream_ended_restores_input_not_streaming() {
+        // This is the regression the fix targets: a tool call request arriving
+        // just as the final assistant block lands means the App is already in
+        // Input when ShowPermission fires. Hard-coding Streaming on Deny made
+        // the next keystroke land in the wrong handler.
+        let mut app = App::new("s".into(), "m".into());
+        assert_eq!(app.mode, AppMode::Input, "pre-condition: Input mode");
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        assert_eq!(app.mode, AppMode::PermissionPrompt);
+        assert_eq!(app.pre_permission_mode, Some(AppMode::Input));
+
+        update(&mut app, AppAction::PermissionDeny, &uctx);
+        assert_eq!(
+            app.mode,
+            AppMode::Input,
+            "dialog opened after stream ended must return to Input on Deny, \
+             not forced back into Streaming"
+        );
+    }
+
+    #[test]
+    fn permission_allow_restores_snapshot_mode() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        update(&mut app, AppAction::PermissionAllow, &uctx);
+        assert_eq!(app.mode, AppMode::Streaming);
+    }
+
+    #[test]
+    fn permission_allow_always_restores_snapshot_mode() {
+        let mut app = App::new("s".into(), "m".into());
+        // Mode is Input (stream already done).
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        let (show, _rx) = show_permission();
+        update(&mut app, show, &uctx);
+        update(&mut app, AppAction::PermissionAllowAlways, &uctx);
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    #[test]
+    fn permission_decision_without_snapshot_falls_back_to_input() {
+        // Defensive: if somehow the decision arm runs without a prior
+        // ShowPermission having captured a snapshot, restore to Input rather
+        // than leaving the app stuck in PermissionPrompt or fabricating
+        // Streaming.
+        let mut app = App::new("s".into(), "m".into());
+        app.mode = AppMode::PermissionPrompt;
+        app.pre_permission_mode = None;
+
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext { commands: &reg, command_ctx: &ctx };
+
+        update(&mut app, AppAction::PermissionDeny, &uctx);
+        assert_eq!(app.mode, AppMode::Input);
     }
 }

@@ -1,8 +1,8 @@
 ## 1. Startup Cache
 
-- [ ] 1.1 Call `Keybindings::load` once at `run_tui` init, store on
+- [x] 1.1 Call `Keybindings::load` once at `run_tui` init, store on
       `App` (or a shared `Arc<Keybindings>`).
-- [ ] 1.2 Remove the `Keybindings::load` call from the key-event branch
+- [x] 1.2 Remove the `Keybindings::load` call from the key-event branch
       in `lib.rs`.
 
 ## 2. Reload Command
@@ -19,11 +19,11 @@
 
 ## 4. Tests
 
-- [ ] 4.1 Unit test that `handle_key_event` uses the cached bindings
+- [x] 4.1 Unit test that `handle_key_event` uses the cached bindings
       after the first load.
 - [ ] 4.2 Test that `/reload-keybindings` with a modified file swaps
       the active map.
 
 ## 5. Sign-off
 
-- [ ] 5.1 `cargo test -p cc-tui -p cc-commands` + clippy clean.
+- [x] 5.1 `cargo test -p cc-tui -p cc-commands` + clippy clean.
