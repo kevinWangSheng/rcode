@@ -208,7 +208,7 @@ impl QueryEngine {
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
 
             let rx = self.api.stream_message(req, cancel).await?;
-            let (message, usage) = drain_stream(
+            let (message, usage, bad_tool_inputs) = drain_stream(
                 rx,
                 &mut on_text,
                 &mut text_buf,
@@ -258,8 +258,33 @@ impl QueryEngine {
             // 5. Handle stop reason
             match stop_reason {
                 Some(StopReason::ToolUse) if !tool_use_blocks.is_empty() => {
-                    // Execute tools and build tool_result user message
-                    let tool_results = self.execute_tools(&tool_use_blocks, cancel).await?;
+                    // Split tool_use blocks into those with valid JSON input
+                    // (execute normally) and those whose streamed JSON
+                    // arguments failed to parse (synthesize an `is_error:
+                    // true` tool_result so the model can retry). This is
+                    // the engine-side piece of H1 — openspec
+                    // `fix-api-stream-toolinput-fallback` §2.1 / §2.2.
+                    // The placeholder ToolUse blocks with `input = {}` are
+                    // already in the assistant message (see
+                    // `StreamAccumulator::into_content_recovering`) so id
+                    // pairing is preserved.
+                    use std::collections::HashSet;
+                    let bad_ids: HashSet<&str> = bad_tool_inputs
+                        .iter()
+                        .map(|(id, _, _)| id.as_str())
+                        .collect();
+                    let valid_blocks: Vec<ToolUseBlock> = tool_use_blocks
+                        .iter()
+                        .filter(|b| !bad_ids.contains(b.id.as_str()))
+                        .cloned()
+                        .collect();
+                    let valid_results = if valid_blocks.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.execute_tools(&valid_blocks, cancel).await?
+                    };
+                    let tool_results =
+                        merge_tool_results(&tool_use_blocks, valid_results, &bad_tool_inputs);
 
                     let result_msg = MessageParam {
                         role: Role::User,
@@ -647,13 +672,23 @@ fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResul
 /// If the TUI receiver is dropped mid-turn we call `cancel.cancel()` so the
 /// upstream HTTP stream is torn down quickly and the caller observes
 /// `CcError::Cancelled` at the §4 partial-save site.
+/// Consume the streaming `rx` into a completed `(Message, Usage, bad_tool_inputs)`
+/// tuple, forwarding user-visible deltas onto `events_tx` along the way.
+///
+/// The third component carries `(id, name, raw_fragment)` for every
+/// `tool_use` block whose JSON buffer failed to parse at end-of-stream.
+/// `run_turn` pairs each of these with a synthetic `is_error: true`
+/// `tool_result` block so the model can retry with well-formed
+/// arguments (openspec `fix-api-stream-toolinput-fallback` §2).
+/// The `Message.content` still carries the placeholder `ToolUseBlock`
+/// with `input = {}` so the id-pairing invariant is preserved.
 pub(crate) async fn drain_stream<F>(
     mut rx: mpsc::Receiver<CcResult<StreamEvent>>,
     on_text: &mut F,
     text_buf: &mut String,
     events_tx: Option<&mpsc::Sender<AppEvent>>,
     cancel: &CancellationToken,
-) -> CcResult<(Message, Usage)>
+) -> CcResult<(Message, Usage, Vec<(String, String, String)>)>
 where
     F: FnMut(&str),
 {
@@ -708,8 +743,52 @@ where
         acc.apply(&event);
     }
 
-    acc.into_message_and_usage()
-        .map_err(|e| CcError::api(format!("stream accumulator: {e}")))
+    Ok(acc.into_message_and_usage_recovering())
+}
+
+/// Build the synthetic `tool_result` block a model sees when one of its
+/// `tool_use` blocks failed to deliver valid JSON arguments. Carries a
+/// clear retry instruction + the raw fragment (already truncated to
+/// `TOOL_INPUT_RAW_MAX` by the accumulator) so the model has enough
+/// context to self-correct. Shared by `merge_tool_results` and the
+/// integration-level tests.
+pub(crate) fn synthesize_bad_tool_input_result(id: &str, name: &str, raw: &str) -> ToolResultBlock {
+    ToolResultBlock {
+        tool_use_id: id.to_string(),
+        content: Some(Value::String(format!(
+            "tool input for '{name}' was not valid JSON and was discarded. \
+             Retry this tool call with a well-formed JSON argument object. \
+             Raw fragment (truncated): {raw}"
+        ))),
+        is_error: Some(true),
+    }
+}
+
+/// Merge `valid_results` (the output of `execute_tools`) with synthetic
+/// error results for every `bad_tool_inputs` entry, then reorder to
+/// match the original `tool_use_blocks` sequence. The Anthropic API
+/// requires 1:1 ordered pairing between `tool_use` and `tool_result`
+/// blocks within a turn; callers MUST feed the returned Vec directly
+/// into a single user-message without further reordering.
+///
+/// openspec `fix-api-stream-toolinput-fallback` §2.1 / §2.2.
+pub(crate) fn merge_tool_results(
+    tool_use_blocks: &[ToolUseBlock],
+    valid_results: Vec<ToolResultBlock>,
+    bad_tool_inputs: &[(String, String, String)],
+) -> Vec<ToolResultBlock> {
+    use std::collections::HashMap;
+    let mut by_id: HashMap<String, ToolResultBlock> = valid_results
+        .into_iter()
+        .map(|r| (r.tool_use_id.clone(), r))
+        .collect();
+    for (id, name, raw) in bad_tool_inputs {
+        by_id.insert(id.clone(), synthesize_bad_tool_input_result(id, name, raw));
+    }
+    tool_use_blocks
+        .iter()
+        .filter_map(|tu| by_id.remove(&tu.id))
+        .collect()
 }
 
 /// Auto-compact threshold (§4.5).
@@ -1150,7 +1229,11 @@ mod tests {
         }
 
         producer.await.unwrap();
-        let (message, _usage) = drain.await.unwrap().expect("drain ok");
+        let (message, _usage, bad) = drain.await.unwrap().expect("drain ok");
+        assert!(
+            bad.is_empty(),
+            "well-formed stream must not flag any bad tool_use"
+        );
         assert_eq!(received.len(), 1000, "no drops under backpressure");
         for (i, s) in received.iter().enumerate() {
             assert_eq!(s, &format!("{i}"), "out-of-order at index {i}");
@@ -1205,5 +1288,233 @@ mod tests {
             cancel.is_cancelled(),
             "cancel token must fire when TUI drops"
         );
+    }
+
+    // ── openspec fix-api-stream-toolinput-fallback §2 / §3.2 ──────────────
+    //
+    // These tests cover the engine-side catch that was claimed [x] in
+    // tasks.md as of commit 01beab2 but was in fact never ported to
+    // `cc-query` — `drain_stream` used to map every `StreamError` to a
+    // flat `CcError::api(...)`, which aborted the whole turn instead of
+    // letting the model retry with corrective feedback. The fix (this
+    // commit) uses `StreamAccumulator::into_message_and_usage_recovering`
+    // so a malformed tool_use JSON tail yields:
+    //   (a) an assistant message with a placeholder `ToolUseBlock` so
+    //       id pairing survives,
+    //   (b) a non-empty `bad_tool_inputs` list that `run_turn` converts
+    //       into a synthetic `is_error: true` tool_result block.
+
+    fn content_block_start_tool_use(index: u32, id: &str, name: &str) -> StreamEvent {
+        StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockStartData::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::Value::Object(Default::default()),
+            },
+        }
+    }
+
+    fn input_json_delta_event(index: u32, partial: &str) -> StreamEvent {
+        StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: partial.to_string(),
+            },
+        }
+    }
+
+    /// End-of-stream with a half-finished tool_use JSON buffer. The old
+    /// code errored out of `drain_stream`. The fixed code returns Ok
+    /// with a placeholder `ToolUse` block in the message and the bad
+    /// fragment in the third component.
+    #[tokio::test]
+    async fn drain_stream_recovers_malformed_tool_use_into_bad_list() {
+        let (in_tx, in_rx) = mpsc::channel::<CcResult<StreamEvent>>(8);
+        let cancel = CancellationToken::new();
+
+        in_tx.send(Ok(message_start_event("msg_x"))).await.unwrap();
+        in_tx
+            .send(Ok(content_block_start_tool_use(0, "tool_9", "Write")))
+            .await
+            .unwrap();
+        in_tx
+            .send(Ok(input_json_delta_event(
+                0,
+                r#"{"file_path":"/tmp/x","content"#,
+            )))
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        let mut on_text = |_: &str| {};
+        let mut text_buf = String::new();
+        let (message, _usage, bad) =
+            drain_stream(in_rx, &mut on_text, &mut text_buf, None, &cancel)
+                .await
+                .expect("drain_stream must now recover, not error");
+
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].0, "tool_9");
+        assert_eq!(bad[0].1, "Write");
+        assert!(bad[0].2.contains("/tmp/x"));
+
+        // The assistant message still carries a placeholder tool_use
+        // block so the id pairing the API demands is intact.
+        let has_placeholder = message.content.iter().any(|b| match b {
+            ContentBlock::ToolUse(tu) => {
+                tu.id == "tool_9"
+                    && tu.name == "Write"
+                    && tu.input == serde_json::Value::Object(Default::default())
+            }
+            _ => false,
+        });
+        assert!(has_placeholder, "placeholder ToolUse block must survive");
+    }
+
+    /// `merge_tool_results` is the pure-function half of the §2 fix. It
+    /// must: (a) reorder results to match the original tool_use_blocks
+    /// sequence; (b) synthesize an `is_error: true` result for every id
+    /// in `bad_tool_inputs`; (c) preserve `valid_results` for ids that
+    /// aren't in the bad list.
+    #[test]
+    fn merge_tool_results_preserves_order_and_synthesises_errors() {
+        let tu_good_1 = ToolUseBlock {
+            id: "id_good_1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command":"echo hi"}),
+        };
+        let tu_bad = ToolUseBlock {
+            id: "id_bad".into(),
+            name: "Edit".into(),
+            input: serde_json::Value::Object(Default::default()),
+        };
+        let tu_good_2 = ToolUseBlock {
+            id: "id_good_2".into(),
+            name: "Read".into(),
+            input: serde_json::json!({"file_path":"/x"}),
+        };
+        let original = vec![tu_good_1.clone(), tu_bad.clone(), tu_good_2.clone()];
+
+        let valid_results = vec![
+            ToolResultBlock {
+                tool_use_id: "id_good_2".into(),
+                content: Some(serde_json::Value::String("read ok".into())),
+                is_error: Some(false),
+            },
+            ToolResultBlock {
+                tool_use_id: "id_good_1".into(),
+                content: Some(serde_json::Value::String("hi".into())),
+                is_error: Some(false),
+            },
+        ];
+        let bad = vec![(
+            "id_bad".to_string(),
+            "Edit".to_string(),
+            r#"{"file_path":"/a","old_stri"#.to_string(),
+        )];
+
+        let merged = merge_tool_results(&original, valid_results, &bad);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].tool_use_id, "id_good_1");
+        assert_eq!(merged[0].is_error, Some(false));
+        assert_eq!(merged[1].tool_use_id, "id_bad");
+        assert_eq!(
+            merged[1].is_error,
+            Some(true),
+            "bad id must be flagged is_error:true"
+        );
+        let body = merged[1]
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            body.contains("'Edit'"),
+            "payload must name the tool: {body}"
+        );
+        assert!(
+            body.contains("Retry"),
+            "payload must tell the model to retry: {body}"
+        );
+        assert!(
+            body.contains("old_stri"),
+            "payload must include the raw fragment: {body}"
+        );
+        assert_eq!(merged[2].tool_use_id, "id_good_2");
+        assert_eq!(merged[2].is_error, Some(false));
+    }
+
+    /// Integration-level proof that the whole §2 path produces the
+    /// on-wire shape Anthropic expects: after a turn whose only
+    /// tool_use had bad JSON, the next user message that `run_turn`
+    /// would send contains a single `ContentBlock::ToolResult` with
+    /// `is_error:true` and `tool_use_id` matching the placeholder. We
+    /// assemble the user-message building blocks the same way
+    /// `run_turn` does — but without needing a live ApiClient or
+    /// network — by driving `drain_stream` and then `merge_tool_results`
+    /// directly.
+    #[tokio::test]
+    async fn full_h1_path_builds_is_error_user_message_with_matching_id() {
+        let (in_tx, in_rx) = mpsc::channel::<CcResult<StreamEvent>>(8);
+        let cancel = CancellationToken::new();
+
+        in_tx.send(Ok(message_start_event("msg_h1"))).await.unwrap();
+        in_tx
+            .send(Ok(content_block_start_tool_use(0, "tu_broken", "Bash")))
+            .await
+            .unwrap();
+        in_tx
+            .send(Ok(input_json_delta_event(0, r#"{"command":"ec"#)))
+            .await
+            .unwrap();
+        drop(in_tx);
+
+        let mut on_text = |_: &str| {};
+        let mut text_buf = String::new();
+        let (message, _usage, bad) =
+            drain_stream(in_rx, &mut on_text, &mut text_buf, None, &cancel)
+                .await
+                .expect("drain ok");
+
+        // Collect the tool_use blocks exactly like run_turn does.
+        let tool_use_blocks: Vec<ToolUseBlock> = message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse(tu) => Some(tu.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_use_blocks.len(), 1);
+        assert_eq!(tool_use_blocks[0].id, "tu_broken");
+
+        // No valid_results — the only tool_use was bad.
+        let tool_results = merge_tool_results(&tool_use_blocks, Vec::new(), &bad);
+        assert_eq!(tool_results.len(), 1);
+        let r = &tool_results[0];
+        assert_eq!(r.tool_use_id, "tu_broken");
+        assert_eq!(r.is_error, Some(true));
+
+        // Shape the user-message the same way run_turn would, then
+        // serialize it and verify the wire payload has the pair Claude
+        // needs: `role:user` + `type:tool_result` + `is_error:true` +
+        // matching `tool_use_id`.
+        let user_msg = MessageParam {
+            role: Role::User,
+            content: MessageContent::Blocks(
+                tool_results
+                    .into_iter()
+                    .map(ContentBlock::ToolResult)
+                    .collect(),
+            ),
+        };
+        let json = serde_json::to_value(&user_msg).unwrap();
+        assert_eq!(json["role"], "user");
+        let blocks = json["content"].as_array().expect("blocks array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "tu_broken");
+        assert_eq!(blocks[0]["is_error"], true);
     }
 }

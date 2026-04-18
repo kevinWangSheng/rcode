@@ -312,6 +312,95 @@ impl StreamAccumulator {
         Ok((message, usage))
     }
 
+    /// Recovering variant of `into_content` used by the engine's streaming
+    /// tool loop. Where `into_content` short-circuits the whole message on
+    /// the first bad tool_use JSON buffer, this version:
+    ///
+    ///   1. emits a placeholder `ToolUseBlock { input: {} }` so the
+    ///      assistant message still carries a valid id-bearing block (the
+    ///      Anthropic API requires every `tool_use` in the assistant turn
+    ///      to have a matching `tool_result` in the next user turn, keyed
+    ///      by id — dropping the block would desync pairing);
+    ///   2. records `(id, name, raw_fragment)` in the returned `bad`
+    ///      vector so the caller (`cc-query::engine::run_turn`) can
+    ///      synthesize an `is_error: true` tool_result that prompts the
+    ///      model to retry with well-formed JSON arguments.
+    ///
+    /// Text / thinking / well-formed tool_use blocks are passed through
+    /// unchanged and in original order. See openspec change
+    /// `fix-api-stream-toolinput-fallback` §2.
+    pub fn into_content_recovering(self) -> (Vec<ContentBlock>, Vec<(String, String, String)>) {
+        let mut out = Vec::with_capacity(self.blocks.len());
+        let mut bad = Vec::new();
+        for b in self.blocks {
+            match b {
+                BlockState::Text { text } if !text.is_empty() => {
+                    out.push(ContentBlock::text(text));
+                }
+                BlockState::Text { .. } => {}
+                BlockState::Thinking {
+                    thinking,
+                    signature,
+                } if !thinking.is_empty() => {
+                    out.push(ContentBlock::Thinking(cc_core::ThinkingBlock {
+                        thinking,
+                        signature,
+                    }));
+                }
+                BlockState::Thinking { .. } => {}
+                BlockState::ToolUse { id, name, json } => {
+                    match serde_json::from_str::<Value>(&json) {
+                        Ok(input) => {
+                            out.push(ContentBlock::ToolUse(cc_core::ToolUseBlock {
+                                id,
+                                name,
+                                input,
+                            }));
+                        }
+                        Err(_) => {
+                            bad.push((id.clone(), name.clone(), truncate_raw(&json)));
+                            out.push(ContentBlock::ToolUse(cc_core::ToolUseBlock {
+                                id,
+                                name,
+                                input: Value::Object(Default::default()),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        (out, bad)
+    }
+
+    /// Recovering variant of `into_message_and_usage`. Never errors; any
+    /// malformed tool_use JSON is returned in the third component for the
+    /// caller to synthesize retry tool_results. See `into_content_recovering`.
+    pub fn into_message_and_usage_recovering(
+        self,
+    ) -> (Message, Usage, Vec<(String, String, String)>) {
+        let usage = Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+        };
+        let id = self.message_id.clone();
+        let model = self.model.clone();
+        let stop_reason = self.stop_reason;
+        let (content, bad) = self.into_content_recovering();
+        let message = Message {
+            id,
+            kind: "message".into(),
+            role: Role::Assistant,
+            content,
+            model,
+            stop_reason,
+            stop_sequence: None,
+            usage: usage.clone(),
+        };
+        (message, usage, bad)
+    }
+
     /// Return the accumulated text (joining all text blocks).
     pub fn text(&self) -> String {
         self.blocks
@@ -591,6 +680,89 @@ mod tests {
         assert!(out.ends_with("...(truncated)"));
         // Must still be valid UTF-8 and no split scalar.
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    /// openspec fix-api-stream-toolinput-fallback §2 recovery path. The
+    /// engine uses `into_content_recovering`, not `into_content`, so a
+    /// malformed tool_use JSON tail MUST (a) still surface a
+    /// placeholder `ToolUseBlock` with `input = {}` so the assistant
+    /// message keeps its id-bearing block, and (b) report the raw
+    /// fragment in the `bad` vector so the caller can synthesize a
+    /// retry tool_result.
+    #[test]
+    fn recovering_path_emits_placeholder_and_records_bad_fragment() {
+        let mut acc = StreamAccumulator::default();
+        drive_events(
+            &mut acc,
+            &[
+                tool_use_start(0, "tool_abc", "Write"),
+                input_json_delta(0, r#"{"file_path":"/tmp/x","content"#),
+            ],
+        );
+
+        let (blocks, bad) = acc.into_content_recovering();
+        assert_eq!(blocks.len(), 1, "placeholder ToolUse block must be emitted");
+        match &blocks[0] {
+            ContentBlock::ToolUse(tu) => {
+                assert_eq!(tu.id, "tool_abc");
+                assert_eq!(tu.name, "Write");
+                assert_eq!(
+                    tu.input,
+                    Value::Object(Default::default()),
+                    "placeholder must carry empty object input"
+                );
+            }
+            _ => panic!("expected placeholder ToolUse"),
+        }
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].0, "tool_abc");
+        assert_eq!(bad[0].1, "Write");
+        assert!(bad[0].2.contains("/tmp/x"));
+    }
+
+    #[test]
+    fn recovering_path_well_formed_has_empty_bad_list() {
+        let mut acc = StreamAccumulator::default();
+        drive_events(
+            &mut acc,
+            &[
+                tool_use_start(0, "tool_1", "Bash"),
+                input_json_delta(0, r#"{"command":"ls"}"#),
+            ],
+        );
+        let (blocks, bad) = acc.into_content_recovering();
+        assert!(bad.is_empty(), "well-formed JSON must not be flagged");
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn recovering_path_mixed_valid_and_bad_preserves_order() {
+        // Two tool_use blocks — first well-formed, second malformed. Both
+        // must appear in `blocks` (so id pairing survives), and only the
+        // second is in `bad`.
+        let mut acc = StreamAccumulator::default();
+        drive_events(
+            &mut acc,
+            &[
+                tool_use_start(0, "tool_good", "Bash"),
+                input_json_delta(0, r#"{"command":"echo hi"}"#),
+                tool_use_start(1, "tool_bad", "Edit"),
+                input_json_delta(1, r#"{"file_path":"/a","old_stri"#),
+            ],
+        );
+        let (blocks, bad) = acc.into_content_recovering();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].0, "tool_bad");
+        match (&blocks[0], &blocks[1]) {
+            (ContentBlock::ToolUse(good), ContentBlock::ToolUse(bad_block)) => {
+                assert_eq!(good.id, "tool_good");
+                assert_eq!(good.input["command"], "echo hi");
+                assert_eq!(bad_block.id, "tool_bad");
+                assert_eq!(bad_block.input, Value::Object(Default::default()));
+            }
+            _ => panic!("expected two ToolUse blocks in original order"),
+        }
     }
 
     #[test]
