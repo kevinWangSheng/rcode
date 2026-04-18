@@ -6,18 +6,23 @@
       `Ipv4Addr::is_loopback` / `is_link_local` / `is_private` plus
       explicit bans on `169.254.169.254`, `100.64.0.0/10`,
       `fc00::/7`, `fe80::/10`.
-- [ ] 1.3 Respect `CC_WEBFETCH_ALLOW_PRIVATE=1` to bypass for local dev
+- [x] 1.3 Respect `CC_WEBFETCH_ALLOW_PRIVATE=1` to bypass for local dev
       **and emit `tracing::warn!` naming the bypassed host** so the
       transparency the spec requires is observable in logs.
       (QA 2026-04-18: env-var handling landed in `ssrf.rs:68-77`, but no
       `warn!` is emitted; spec Scenario "Developer opt-out" explicitly
       requires the log. Reverting to [ ].)
-- [ ] 1.4 Unit tests covering: public DNS name (pass), `localhost` (fail),
+      Fixed 2026-04-18: `tracing::warn!` now fires on both the literal-IP
+      and DNS opt-out paths, naming host + resolved IP.
+- [x] 1.4 Unit tests covering: public DNS name (pass), `localhost` (fail),
       `127.0.0.1` (fail), `169.254.169.254` (fail), `10.0.0.1` (fail),
       `[::1]` (fail), opt-out env var (pass **and assert the warn! was
       logged**, e.g. via `tracing_test::traced_test`).
       (QA 2026-04-18: IP/DNS tests pass; warn-log assertion depends on 1.3
       and is not present. Reverting to [ ].)
+      Fixed 2026-04-18: added `opt_out_emits_warn_log` +
+      `public_host_does_not_emit_bypass_warn` using
+      `#[tracing_test::traced_test]` / `logs_contain`.
 
 ## 2. Integrate Into web_fetch
 

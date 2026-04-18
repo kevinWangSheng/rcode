@@ -69,8 +69,16 @@ pub async fn guard_url(url: &Url) -> Result<GuardOk, CcError> {
         matches!(std::env::var(OPT_OUT_ENV), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"));
 
     if let Some(ip) = literal_ip {
-        if !opted_out && is_private_address(&ip) {
-            return Err(reject(&host_display));
+        let is_private = is_private_address(&ip);
+        if is_private {
+            if !opted_out {
+                return Err(reject(&host_display));
+            }
+            tracing::warn!(
+                host = %host_display,
+                ip = %ip,
+                "CC_WEBFETCH_ALLOW_PRIVATE=1 — SSRF guard bypassed for host={host_display} ip={ip}"
+            );
         }
         return Ok(GuardOk {
             resolved: SocketAddr::new(ip, port),
@@ -102,12 +110,17 @@ pub async fn guard_url(url: &Url) -> Result<GuardOk, CcError> {
         ));
     }
 
-    if !opted_out {
-        for addr in &addrs {
-            if is_private_address(&addr.ip()) {
-                return Err(reject(domain));
-            }
+    let private_hit = addrs.iter().find(|a| is_private_address(&a.ip()));
+    if let Some(private_addr) = private_hit {
+        if !opted_out {
+            return Err(reject(domain));
         }
+        let ip = private_addr.ip();
+        tracing::warn!(
+            host = %domain,
+            ip = %ip,
+            "CC_WEBFETCH_ALLOW_PRIVATE=1 — SSRF guard bypassed for host={domain} ip={ip}"
+        );
     }
 
     // Pin to the first returned address. reqwest's `resolve` API lets us
@@ -296,6 +309,42 @@ mod tests {
         std::env::remove_var(OPT_OUT_ENV);
         assert!(ok.is_ok(), "opt-out should allow loopback");
         assert_eq!(ok.unwrap().resolved.ip().to_string(), "127.0.0.1");
+    }
+
+    // Dedicated traced test: confirms the warn! fires ONLY on the opt-out
+    // bypass path. Spec Scenario "Developer opt-out" requires the log so
+    // the bypass is observable in process logs.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn opt_out_emits_warn_log() {
+        let _lock = ENV_LOCK.lock().await;
+        std::env::set_var(OPT_OUT_ENV, "1");
+        let ok = guard_url(&url("http://127.0.0.1/")).await;
+        std::env::remove_var(OPT_OUT_ENV);
+        assert!(ok.is_ok(), "opt-out should allow loopback");
+        assert!(
+            logs_contain("SSRF guard bypassed"),
+            "expected warn! log when CC_WEBFETCH_ALLOW_PRIVATE=1 bypasses a private address"
+        );
+        assert!(
+            logs_contain("127.0.0.1"),
+            "warn! log must name the bypassed host/ip"
+        );
+    }
+
+    // Public-host path must NOT log the bypass warning (we only warn when we
+    // actually had a private address to bypass).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn public_host_does_not_emit_bypass_warn() {
+        let _lock = ENV_LOCK.lock().await;
+        std::env::set_var(OPT_OUT_ENV, "1");
+        let _ = guard_url(&url("http://8.8.8.8/")).await;
+        std::env::remove_var(OPT_OUT_ENV);
+        assert!(
+            !logs_contain("SSRF guard bypassed"),
+            "public address must not trigger the bypass warn"
+        );
     }
 
     #[test]
