@@ -353,4 +353,32 @@ mod tests {
         ));
         assert!(!is_error_payload("not json"));
     }
+
+    #[tokio::test]
+    async fn pre_cancelled_token_short_circuits_before_network() {
+        // Pre-cancel the token; stream_message should return Cancelled without
+        // attempting to hit the network. The `biased;` in send_with_retry
+        // guarantees the cancel branch fires before the .send() future even
+        // starts driving. We point base_url at a hostname that will take
+        // seconds to fail DNS lookup, so if cancel were ignored the test
+        // would either time out or fail after a real delay.
+        let http = reqwest::Client::new();
+        let client = ApiClient {
+            http,
+            auth: AuthCredential::ApiKey("sk-test".into()),
+            base_url: "http://nonexistent.invalid.claudecode.test:1".into(),
+            retry: RetryPolicy::default(),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let req = CreateMessageRequest::new("claude-opus-4-7", vec![]);
+
+        let start = std::time::Instant::now();
+        let result = client.stream_message(req, &cancel).await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, Err(CcError::Cancelled)), "got {:?}", result.err());
+        assert!(elapsed < std::time::Duration::from_secs(1), "took {:?}", elapsed);
+    }
 }
