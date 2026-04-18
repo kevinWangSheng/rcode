@@ -53,7 +53,11 @@
 
 ## 5. Docs + Sign-off
 
-- [ ] 5.1 Mention `CC_WEBFETCH_ALLOW_PRIVATE` in `RUST_REWRITE_PLAN.md`
+- [x] 5.1 Mention `CC_WEBFETCH_ALLOW_PRIVATE` in `RUST_REWRITE_PLAN.md`
       implementation-notes.
+      Fixed 2026-04-18: added a "WebFetch SSRF guard" row to §4
+      "Intentionally Changing" table describing the blocklist semantics,
+      the `CC_WEBFETCH_ALLOW_PRIVATE=1` opt-out, and the `tracing::warn!`
+      side effect. Points readers at this proposal for the full spec.
 - [x] 5.2 `cargo test -p cc-tools` + `cargo clippy --workspace -- -D warnings`
       clean.
