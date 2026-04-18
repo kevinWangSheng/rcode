@@ -125,6 +125,15 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
             let result = update(&mut app, action, &update_ctx);
             match result {
                 UpdateResult::Quit => break,
+                UpdateResult::ForceQuit => {
+                    // Emergency exit: restore terminal state (disable raw
+                    // mode, leave alternate screen), cancel root token so
+                    // any outstanding child tasks observe cancellation, and
+                    // exit with SIGINT-style status.
+                    root_cancel.cancel();
+                    ratatui::restore();
+                    std::process::exit(130);
+                }
                 UpdateResult::SubmitToEngine(text) => {
                     // Spawn a background task for this engine turn.
                     let es = engine_state.clone();
@@ -173,7 +182,15 @@ fn map_key_event(
     if let Some(action) = kb.match_action(key) {
         return match action {
             Action::Quit => Some(AppAction::Quit),
-            Action::Abort => Some(AppAction::Abort),
+            Action::Abort => {
+                // Second Ctrl+C within 2s → escalate to force quit so the user
+                // always has a recovery path when the first abort is stalled.
+                if app.within_force_quit_window(std::time::Instant::now()) {
+                    Some(AppAction::ForceQuit)
+                } else {
+                    Some(AppAction::Abort)
+                }
+            }
             Action::Submit => Some(AppAction::Submit),
         };
     }
@@ -296,5 +313,63 @@ fn truncate_output(s: &str) -> String {
         format!("{preview}\n… (truncated)")
     } else {
         joined
+    }
+}
+
+#[cfg(test)]
+mod keymap_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::{Duration, Instant};
+
+    /// Second Ctrl+C within the 2s force-quit window must escalate to
+    /// `AppAction::ForceQuit`, so users have an escape hatch when the first
+    /// abort is still in flight.
+    #[test]
+    fn second_ctrl_c_within_window_escalates_to_force_quit() {
+        let kb = Keybindings::default();
+        let mut app = App::new("s".into(), "m".into());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        // First press: ordinary Abort.
+        let first = map_key_event(&ctrl_c, &kb, &app);
+        assert!(matches!(first, Some(AppAction::Abort)), "first Ctrl+C: {first:?}");
+
+        // Stamp as the real update() handler would — within the window.
+        app.last_abort_at = Some(Instant::now());
+
+        let second = map_key_event(&ctrl_c, &kb, &app);
+        assert!(
+            matches!(second, Some(AppAction::ForceQuit)),
+            "second Ctrl+C within window: {second:?}"
+        );
+    }
+
+    /// A single Ctrl+C after the window has elapsed (>2s since the last abort
+    /// stamp) MUST still map to a graceful `Abort`, not `ForceQuit`.
+    #[test]
+    fn single_ctrl_c_outside_window_still_aborts() {
+        let kb = Keybindings::default();
+        let mut app = App::new("s".into(), "m".into());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        // Simulate a stale abort 3 seconds ago — past the 2s window.
+        app.last_abort_at = Instant::now().checked_sub(Duration::from_secs(3));
+
+        let action = map_key_event(&ctrl_c, &kb, &app);
+        assert!(
+            matches!(action, Some(AppAction::Abort)),
+            "stale abort stamp must not promote to ForceQuit: {action:?}"
+        );
+    }
+
+    /// First-ever Ctrl+C (no prior stamp) must be `Abort`, not `ForceQuit`.
+    #[test]
+    fn first_ctrl_c_with_no_prior_abort_is_graceful() {
+        let kb = Keybindings::default();
+        let app = App::new("s".into(), "m".into());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let action = map_key_event(&ctrl_c, &kb, &app);
+        assert!(matches!(action, Some(AppAction::Abort)), "got {action:?}");
     }
 }

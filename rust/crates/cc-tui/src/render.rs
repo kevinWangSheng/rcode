@@ -38,7 +38,11 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = app.status.format();
+    let mut text = app.status.format();
+    if let Some(hint) = &app.status_hint {
+        text.push_str(" | ");
+        text.push_str(hint);
+    }
     let para = Paragraph::new(text)
         .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
     frame.render_widget(para, area);

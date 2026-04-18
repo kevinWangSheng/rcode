@@ -2,10 +2,15 @@
 //! be unit-tested headlessly.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use cc_core::PromptDecision;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+
+/// Window (in milliseconds) during which a second Ctrl+C escalates from
+/// graceful `Abort` to `ForceQuit`.
+pub const FORCE_QUIT_WINDOW_MS: u64 = 2_000;
 
 /// One transcript entry. Tool calls and assistant text are flattened into a flat
 /// list so we can render them in order without recovering structure from the
@@ -113,6 +118,14 @@ pub struct App {
     /// Cancellation token for the currently-running engine turn (if any).
     /// Set on Submit; cancelled on Abort; cleared on TurnComplete.
     pub current_turn_cancel: Option<CancellationToken>,
+    /// Timestamp of the most recent Ctrl+C (graceful abort) request.
+    /// A second Ctrl+C within `FORCE_QUIT_WINDOW_MS` escalates to `ForceQuit`
+    /// so the user always has an escape hatch even when the first abort is
+    /// stuck (e.g. engine in a slow syscall).
+    pub last_abort_at: Option<Instant>,
+    /// Transient status-line hint (e.g. "press Ctrl+C again to force quit").
+    /// Cleared by the render layer once the force-quit window has lapsed.
+    pub status_hint: Option<String>,
 }
 
 impl App {
@@ -130,6 +143,20 @@ impl App {
             session_id,
             pending_reply: None,
             current_turn_cancel: None,
+            last_abort_at: None,
+            status_hint: None,
+        }
+    }
+
+    /// Has the user pressed Ctrl+C recently enough that a second press
+    /// should force-quit rather than start a new graceful abort?
+    pub fn within_force_quit_window(&self, now: Instant) -> bool {
+        match self.last_abort_at {
+            Some(stamp) => now
+                .duration_since(stamp)
+                .as_millis()
+                < FORCE_QUIT_WINDOW_MS as u128,
+            None => false,
         }
     }
 
