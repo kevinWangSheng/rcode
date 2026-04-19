@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use crate::app::{App, AppMode, PendingPermission, TranscriptItem};
+use crate::diff::render_unified_diff;
 use crate::markdown::{minimal_mode_enabled, render_markdown};
 
 const TITLE_USER: &str = ">";
@@ -126,45 +127,108 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             TranscriptItem::ToolCall {
                 name,
                 input_summary,
+                raw_input,
             } => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("[Tool: {name}] "),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        input_summary.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]));
+                if minimal_mode_enabled() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("[Tool: {name}] "),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            input_summary.to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                } else {
+                    lines.push(render_tool_header(name, input_summary));
+                    // Edit: show a unified diff of old_string → new_string if
+                    // the raw input has both fields.
+                    if name == "Edit" {
+                        if let (Some(old), Some(new)) = (
+                            raw_input
+                                .get("old_string")
+                                .and_then(|v| v.as_str()),
+                            raw_input
+                                .get("new_string")
+                                .and_then(|v| v.as_str()),
+                        ) {
+                            for dline in render_unified_diff(old, new) {
+                                let mut spans: Vec<Span<'static>> =
+                                    vec![Span::raw("  ".to_string())];
+                                spans.extend(dline.spans);
+                                lines.push(Line::from(spans));
+                            }
+                        }
+                    }
+                }
             }
             TranscriptItem::ToolResult {
-                name: _,
+                name,
                 output,
                 is_error,
             } => {
-                let color = if *is_error {
-                    Color::Red
-                } else {
-                    Color::DarkGray
-                };
-                let prefix = if *is_error { "[Error] " } else { "[Result] " };
-                // Show first few lines of output.
-                let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
-                let truncated = output.lines().count() > 5;
-                lines.push(Line::from(Span::styled(
-                    format!("{prefix}{preview}"),
-                    Style::default().fg(color),
-                )));
-                if truncated {
+                if minimal_mode_enabled() {
+                    let color = if *is_error {
+                        Color::Red
+                    } else {
+                        Color::DarkGray
+                    };
+                    let prefix = if *is_error { "[Error] " } else { "[Result] " };
+                    let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
+                    let truncated = output.lines().count() > 5;
                     lines.push(Line::from(Span::styled(
-                        "  ... (truncated)",
-                        Style::default().fg(Color::DarkGray),
+                        format!("{prefix}{preview}"),
+                        Style::default().fg(color),
                     )));
+                    if truncated {
+                        lines.push(Line::from(Span::styled(
+                            "  ... (truncated)",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+                } else {
+                    let mark = if *is_error { "✗" } else { "✓" };
+                    let mark_color = if *is_error { Color::Red } else { Color::Green };
+                    // First result line carries the tick; subsequent lines are
+                    // indented so the card reads as a block even when the
+                    // output is multi-line.
+                    let mut iter = output.lines().take(5);
+                    if let Some(first) = iter.next() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("  {mark} "),
+                                Style::default()
+                                    .fg(mark_color)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(first.to_string(), tool_output_style(name, *is_error)),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {mark} (empty)"),
+                            Style::default()
+                                .fg(mark_color)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    for ln in iter {
+                        lines.push(Line::from(vec![
+                            Span::raw("    ".to_string()),
+                            Span::styled(ln.to_string(), tool_output_style(name, *is_error)),
+                        ]));
+                    }
+                    if output.lines().count() > 5 {
+                        lines.push(Line::from(Span::styled(
+                            "    … (truncated)".to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    lines.push(Line::from(""));
                 }
-                lines.push(Line::from(""));
             }
             TranscriptItem::SystemNotice(text) => {
                 let mut text_lines = text.lines();
@@ -316,6 +380,50 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Color assigned to a tool card based on the tool name. Matches M5 scope:
+/// Bash=green, Edit=yellow, Read=blue, Grep/Glob=cyan, Web*=magenta, MCP=
+/// dim-white (DarkGray), fallback=magenta to stay visible.
+fn tool_color(name: &str) -> Color {
+    match name {
+        "Bash" => Color::Green,
+        "Edit" | "Write" => Color::Yellow,
+        "Read" => Color::Blue,
+        "Grep" | "Glob" => Color::Cyan,
+        "WebFetch" | "WebSearch" => Color::Magenta,
+        n if n.contains("::") => Color::Gray, // MCP server::tool
+        _ => Color::Magenta,
+    }
+}
+
+fn tool_output_style(name: &str, is_error: bool) -> Style {
+    if is_error {
+        Style::default().fg(Color::Red)
+    } else {
+        // Neutral text for the body; the header carries the tool color.
+        let _ = tool_color(name);
+        Style::default().fg(Color::White)
+    }
+}
+
+fn render_tool_header(name: &str, preview: &str) -> Line<'static> {
+    // `⏺ ToolName(preview_args)` per M5 Phase B.
+    let color = tool_color(name);
+    let preview = preview.lines().next().unwrap_or("").to_string();
+    Line::from(vec![
+        Span::styled(
+            "⏺ ".to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("(".to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(preview, Style::default().fg(Color::White)),
+        Span::styled(")".to_string(), Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn short_session(id: &str) -> &str {

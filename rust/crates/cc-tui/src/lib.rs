@@ -7,6 +7,7 @@
 pub mod action;
 pub mod app;
 pub mod commands;
+pub mod diff;
 pub mod event;
 pub mod keybindings;
 pub mod markdown;
@@ -236,6 +237,7 @@ fn map_engine_event(event: CoreEvent) -> Option<AppAction> {
             Some(AppAction::ToolStart {
                 name,
                 input_summary,
+                raw_input: input,
             })
         }
         CoreEvent::ToolEnd { name, result } => {

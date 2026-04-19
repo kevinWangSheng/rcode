@@ -25,6 +25,10 @@ pub enum TranscriptItem {
     ToolCall {
         name: String,
         input_summary: String,
+        /// Raw JSON input. Kept so the renderer can special-case Edit
+        /// (unified diff from `old_string` / `new_string`) and future
+        /// tool-specific cards without re-plumbing the engine.
+        raw_input: serde_json::Value,
     },
     ToolResult {
         name: String,
@@ -247,9 +251,19 @@ impl App {
     }
 
     pub fn push_tool_call(&mut self, name: String, input_summary: String) {
+        self.push_tool_call_with_input(name, input_summary, serde_json::Value::Null);
+    }
+
+    pub fn push_tool_call_with_input(
+        &mut self,
+        name: String,
+        input_summary: String,
+        raw_input: serde_json::Value,
+    ) {
         self.transcript.push(TranscriptItem::ToolCall {
             name,
             input_summary,
+            raw_input,
         });
         self.scroll = 0;
     }

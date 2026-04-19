@@ -698,6 +698,164 @@ fn acv2_spinner_clears_within_100ms_of_turn_end() {
     );
 }
 
+// ── M5 AC-V3: Tool-use card ──────────────────────────────────────────────────
+
+/// AC-V3: a `Bash(ls /tmp)` call renders as a single-line card with green
+/// tool color and the result indented beneath. Raw JSON must never appear.
+#[test]
+fn acv3_tool_use_card_renders_with_color_and_no_raw_json() {
+    use cc_tui::render;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let _g = env_lock();
+    std::env::remove_var("CC_TUI_MINIMAL");
+
+    let mut app = App::new("sess".into(), "test-model".into());
+    app.push_tool_call_with_input(
+        "Bash".into(),
+        "ls /tmp".into(),
+        serde_json::json!({ "command": "ls /tmp" }),
+    );
+    app.push_tool_result("Bash".into(), "a\nb\nc".into(), false);
+
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render::render(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut s = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+
+    // Header rendered in the new card format.
+    assert!(s.contains("⏺ Bash"), "card header missing: {s}");
+    assert!(s.contains("(ls /tmp)"), "command preview missing: {s}");
+    // Result carries the success tick.
+    assert!(s.contains("✓"), "success tick missing: {s}");
+    // Raw JSON must never leak onto the screen.
+    assert!(
+        !s.contains("\"command\""),
+        "raw JSON key leaked onto screen: {s}"
+    );
+
+    // Walk the ratatui back-buffer to confirm the "B" in "Bash" is green.
+    let mut found_green_bash = false;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width.saturating_sub(1) {
+            if buf[(x, y)].symbol() == "B" && buf[(x + 1, y)].symbol() == "a" {
+                if buf[(x, y)].fg == ratatui::style::Color::Green {
+                    found_green_bash = true;
+                }
+                break;
+            }
+        }
+    }
+    assert!(found_green_bash, "Bash header is not rendered in green");
+}
+
+// ── M5 AC-V4: Edit diff ──────────────────────────────────────────────────────
+
+/// AC-V4: a successful `Edit` call renders a red/green unified diff with
+/// ≥2 context lines on each side.
+#[test]
+fn acv4_edit_renders_unified_diff() {
+    use cc_tui::render;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let _g = env_lock();
+    std::env::remove_var("CC_TUI_MINIMAL");
+
+    let mut app = App::new("sess".into(), "test-model".into());
+    let old = "l1\nl2\nl3\nl4\nOLD\nl6\nl7\nl8\nl9";
+    let new = "l1\nl2\nl3\nl4\nNEW\nl6\nl7\nl8\nl9";
+    app.push_tool_call_with_input(
+        "Edit".into(),
+        "/tmp/foo.rs".into(),
+        serde_json::json!({
+            "file_path": "/tmp/foo.rs",
+            "old_string": old,
+            "new_string": new,
+        }),
+    );
+    app.push_tool_result("Edit".into(), "Edit applied.".into(), false);
+
+    let backend = TestBackend::new(120, 40);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render::render(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut s = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+
+    // Header + diff rows.
+    assert!(s.contains("⏺ Edit"), "edit card header missing: {s}");
+    assert!(s.contains("- OLD"), "deleted line missing: {s}");
+    assert!(s.contains("+ NEW"), "added line missing: {s}");
+
+    // Walk rows to verify colour + context count.
+    let rows: Vec<String> = s.lines().map(|l| l.trim_end().to_string()).collect();
+    let minus_row = rows
+        .iter()
+        .position(|r| r.contains("- OLD"))
+        .expect("minus row missing");
+    let plus_row = rows
+        .iter()
+        .position(|r| r.contains("+ NEW"))
+        .expect("plus row missing");
+    // 2+ context rows before minus
+    let mut before_ctx = 0;
+    for r in rows[..minus_row].iter().rev() {
+        if r.contains("l4") || r.contains("l3") || r.contains("l2") {
+            before_ctx += 1;
+            if before_ctx >= 2 {
+                break;
+            }
+        } else if r.contains("⏺") || r.trim().is_empty() {
+            break;
+        }
+    }
+    assert!(before_ctx >= 2, "expected ≥2 context rows before minus");
+    // 2+ context rows after plus
+    let mut after_ctx = 0;
+    for r in rows[plus_row + 1..].iter() {
+        if r.contains("l6") || r.contains("l7") || r.contains("l8") {
+            after_ctx += 1;
+            if after_ctx >= 2 {
+                break;
+            }
+        } else if r.contains("✓") || r.trim().is_empty() {
+            break;
+        }
+    }
+    assert!(after_ctx >= 2, "expected ≥2 context rows after plus");
+
+    // Color verification: walk the buffer and find a cell whose glyph is 'O'
+    // inside "- OLD" — it must carry red, and 'N' in "+ NEW" must carry green.
+    let mut found_red_old = false;
+    let mut found_green_new = false;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            let c = cell.symbol();
+            if c == "O" && cell.fg == ratatui::style::Color::Red {
+                found_red_old = true;
+            }
+            if c == "N" && cell.fg == ratatui::style::Color::Green {
+                found_green_new = true;
+            }
+        }
+    }
+    assert!(found_red_old, "- OLD not rendered in red");
+    assert!(found_green_new, "+ NEW not rendered in green");
+}
+
 // ── M5 AC-V6: CC_TUI_MINIMAL opt-out ─────────────────────────────────────────
 
 /// AC-V6: with CC_TUI_MINIMAL=1 set, an assistant message containing markdown

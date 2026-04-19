@@ -30,6 +30,9 @@ pub enum AppAction {
     ToolStart {
         name: String,
         input_summary: String,
+        /// Full JSON input — retained so the renderer can build a diff view
+        /// for Edit or show a Bash command preview without re-parsing.
+        raw_input: serde_json::Value,
     },
     ToolEnd {
         name: String,
@@ -195,8 +198,9 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
         AppAction::ToolStart {
             name,
             input_summary,
+            raw_input,
         } => {
-            app.push_tool_call(name, input_summary);
+            app.push_tool_call_with_input(name, input_summary, raw_input);
         }
         AppAction::ToolEnd {
             name,
