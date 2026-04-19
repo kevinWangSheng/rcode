@@ -558,3 +558,184 @@ async fn ac5_abort_does_not_deadlock() {
         Err(_) => panic!("AC-5b FAIL: abort caused deadlock — timed out after 5s"),
     }
 }
+
+// ── M5 AC-V1 / AC-V6: Env-var-sensitive tests must serialise ────────────────
+//
+// AC-V1 asserts the markdown path IS used; AC-V6 asserts it is NOT (under
+// CC_TUI_MINIMAL=1). `cargo test` runs tests in parallel by default, so one
+// touching `CC_TUI_MINIMAL` can poison the other. Gate both on the same
+// mutex.
+static ENV_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_MUTEX
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+// ── M5 AC-V1: Markdown round-trip ────────────────────────────────────────────
+
+/// AC-V1: an assistant reply containing all six markdown primitives renders
+/// into the ratatui back-buffer with each element visually distinct.
+#[test]
+fn acv1_markdown_round_trip_all_six_elements() {
+    use cc_tui::render;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let _g = env_lock();
+    // Defensive: a prior run may have left CC_TUI_MINIMAL set if a test
+    // panicked mid-body. Clear it before we render.
+    std::env::remove_var("CC_TUI_MINIMAL");
+
+    let mut app = App::new("sess".into(), "test-model".into());
+    app.transcript
+        .push(TranscriptItem::AssistantText(String::from(
+            "\
+### heading three
+- first bullet
+- with **bold**, *italic*, and `code`
+
+```rust
+fn main() {}
+```
+",
+        )));
+
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render::render(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut s = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+
+    assert!(s.contains("▎ heading three"), "heading missing: {s}");
+    assert!(s.contains("• first bullet"), "bullet missing: {s}");
+    assert!(s.contains("bold"), "bold text missing: {s}");
+    assert!(s.contains("italic"), "italic text missing: {s}");
+    assert!(s.contains("code"), "inline code missing: {s}");
+    assert!(s.contains("fn main() {}"), "fenced code body missing: {s}");
+    assert!(s.contains("rust"), "fenced code language label missing: {s}");
+}
+
+// ── M5 AC-V2: Spinner timing ─────────────────────────────────────────────────
+
+/// AC-V2 (first clause): the spinner is visible within 100 ms of `Submit`.
+/// We measure the state flip, not the render — the ratatui redraw is on the
+/// critical path of `update()` and has no deferred work.
+#[test]
+fn acv2_spinner_visible_within_100ms_of_submit() {
+    let mut app = App::new("sess".into(), "test-model".into());
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+
+    app.input = "hello".into();
+    let t0 = Instant::now();
+    let result = update(&mut app, AppAction::Submit, &uctx);
+    let elapsed = t0.elapsed();
+
+    assert!(
+        matches!(result, UpdateResult::SubmitToEngine(_)),
+        "Submit must trigger engine submission"
+    );
+    assert!(
+        app.stream_started_at.is_some(),
+        "stream_started_at must be set by Submit"
+    );
+    assert!(
+        !app.spinner_glyph().is_empty(),
+        "spinner glyph must be non-empty during streaming"
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "Submit → spinner-visible took {elapsed:?}, must be < 100ms"
+    );
+}
+
+/// AC-V2 (second clause): the spinner clears within 100 ms of TurnComplete.
+#[test]
+fn acv2_spinner_clears_within_100ms_of_turn_end() {
+    let mut app = App::new("sess".into(), "test-model".into());
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+
+    app.input = "hi".into();
+    update(&mut app, AppAction::Submit, &uctx);
+    assert!(app.stream_started_at.is_some());
+    assert!(!app.spinner_glyph().is_empty());
+
+    let t0 = Instant::now();
+    update(
+        &mut app,
+        AppAction::TurnComplete {
+            usage: zero_usage(),
+        },
+        &uctx,
+    );
+    let elapsed = t0.elapsed();
+
+    assert!(
+        app.stream_started_at.is_none(),
+        "stream_started_at must be cleared by TurnComplete"
+    );
+    assert!(
+        app.spinner_glyph().is_empty(),
+        "spinner glyph must be empty after TurnComplete"
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "TurnComplete → spinner-cleared took {elapsed:?}"
+    );
+}
+
+// ── M5 AC-V6: CC_TUI_MINIMAL opt-out ─────────────────────────────────────────
+
+/// AC-V6: with CC_TUI_MINIMAL=1 set, an assistant message containing markdown
+/// characters renders without the M5 transforms (no bullet glyph, no heading
+/// prefix block, no fence borders). The output must therefore *not* contain
+/// the characters that only the M5 path emits.
+#[test]
+fn acv6_minimal_opt_out_skips_markdown_transforms() {
+    use cc_tui::render;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let _g = env_lock();
+    std::env::set_var("CC_TUI_MINIMAL", "1");
+
+    let mut app = App::new("sess".into(), "test-model".into());
+    app.transcript
+        .push(TranscriptItem::AssistantText(String::from(
+            "### heading\n- bullet\n`code`",
+        )));
+
+    let backend = TestBackend::new(80, 10);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render::render(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut s = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.push('\n');
+    }
+
+    std::env::remove_var("CC_TUI_MINIMAL");
+
+    // The raw markdown must appear verbatim.
+    assert!(s.contains("### heading"), "raw heading missing: {s}");
+    assert!(s.contains("- bullet"), "raw bullet missing: {s}");
+    // The M5-only glyphs must *not* appear in minimal mode.
+    assert!(!s.contains("▎"), "M5 heading glyph leaked in minimal mode");
+    assert!(!s.contains("• "), "M5 bullet glyph leaked in minimal mode");
+}

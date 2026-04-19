@@ -307,7 +307,12 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             if app.status_hint.is_some() && !app.within_force_quit_window(Instant::now()) {
                 app.status_hint = None;
             }
-            // Spinner animation driven by Ratatui blink modifier.
+            // Advance spinner animation only while a stream is live. A wrapping
+            // add is fine even across the 2^64 boundary — we only take the
+            // low-order modulo in `spinner_glyph`.
+            if app.stream_started_at.is_some() {
+                app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            }
         }
         AppAction::SlashCommand(_) => {
             // Handled via Submit path.

@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use crate::app::{App, AppMode, PendingPermission, TranscriptItem};
+use crate::markdown::{minimal_mode_enabled, render_markdown};
 
 const TITLE_USER: &str = ">";
 const TITLE_CLAUDE: &str = "Claude:";
@@ -38,16 +39,42 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let mut text = app.status.format();
-    if let Some(hint) = &app.status_hint {
-        text.push_str(" | ");
-        text.push_str(hint);
+    // Build the status bar as a sequence of spans so the spinner glyph can
+    // carry its own color (green while streaming) without re-styling the
+    // whole line. The baseline line reads:
+    //   ⠋ model: ... | tokens: in/out | $cost | turns: N [| (+N queued)] [| hint]
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let glyph = app.spinner_glyph();
+    if !glyph.is_empty() {
+        spans.push(Span::styled(
+            format!("{glyph} "),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
-    let para = Paragraph::new(text).style(
+    spans.push(Span::styled(
+        app.status.format(),
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
-    );
+    ));
+    let queued = app.queued_count();
+    if queued > 0 {
+        spans.push(Span::styled(
+            format!(" | (+{queued} queued)"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if let Some(hint) = &app.status_hint {
+        spans.push(Span::styled(
+            format!(" | {hint}"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let para = Paragraph::new(Line::from(spans));
     frame.render_widget(para, area);
 }
 
@@ -87,8 +114,12 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 )));
-                for ln in text.lines() {
-                    lines.push(Line::from(Span::raw(ln.to_string())));
+                if minimal_mode_enabled() {
+                    for ln in text.lines() {
+                        lines.push(Line::from(Span::raw(ln.to_string())));
+                    }
+                } else {
+                    lines.extend(render_markdown(text));
                 }
                 lines.push(Line::from(""));
             }
@@ -175,8 +206,12 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )));
-        for ln in app.streaming_text.lines() {
-            lines.push(Line::from(Span::raw(ln.to_string())));
+        if minimal_mode_enabled() {
+            for ln in app.streaming_text.lines() {
+                lines.push(Line::from(Span::raw(ln.to_string())));
+            }
+        } else {
+            lines.extend(render_markdown(&app.streaming_text));
         }
         if app.mode == AppMode::Streaming {
             lines.push(Line::from(Span::styled(

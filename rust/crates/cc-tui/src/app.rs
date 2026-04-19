@@ -146,6 +146,15 @@ pub struct App {
     /// App so `map_key_event` and the reload action share a single source of
     /// truth without threading an `Arc<Mutex>` through the main loop.
     pub keybindings: Keybindings,
+    /// When the current stream started — used by the status bar to render
+    /// `elapsed` + by `spinner_glyph` for rotation. `None` means "no active
+    /// stream" and the spinner must be hidden (AC-V2 second clause: cleared
+    /// within 100 ms of turn end).
+    pub stream_started_at: Option<Instant>,
+    /// Animation frame, advanced once per `AppAction::Tick` while streaming.
+    /// Ratatui redraws on every action so the spinner glyph refreshes at the
+    /// tick cadence (100 ms) without any external timer.
+    pub spinner_frame: u64,
 }
 
 impl App {
@@ -167,7 +176,24 @@ impl App {
             status_hint: None,
             pre_permission_mode: None,
             keybindings: Keybindings::default(),
+            stream_started_at: None,
+            spinner_frame: 0,
         }
+    }
+
+    /// Current spinner glyph. Returns an empty string when no stream is
+    /// active so the status bar is clean between turns.
+    pub fn spinner_glyph(&self) -> &'static str {
+        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        if self.stream_started_at.is_none() {
+            return "";
+        }
+        FRAMES[(self.spinner_frame as usize) % FRAMES.len()]
+    }
+
+    /// Number of user messages queued while a stream is running.
+    pub fn queued_count(&self) -> usize {
+        self.queued.len()
     }
 
     /// Reload the keybinding map via the provided loader.
@@ -245,6 +271,8 @@ impl App {
     pub fn start_stream(&mut self) {
         self.mode = AppMode::Streaming;
         self.streaming_text.clear();
+        self.stream_started_at = Some(Instant::now());
+        self.spinner_frame = 0;
     }
 
     pub fn on_token(&mut self, delta: &str) {
@@ -259,6 +287,7 @@ impl App {
             self.transcript.push(TranscriptItem::AssistantText(text));
         }
         self.mode = AppMode::Input;
+        self.stream_started_at = None;
     }
 
     /// Mark the stream as aborted, preserving any partial text already received.
@@ -269,6 +298,7 @@ impl App {
             self.transcript.push(TranscriptItem::AssistantText(text));
         }
         self.mode = AppMode::Input;
+        self.stream_started_at = None;
     }
 }
 

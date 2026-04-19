@@ -9,6 +9,7 @@ pub mod app;
 pub mod commands;
 pub mod event;
 pub mod keybindings;
+pub mod markdown;
 pub mod prompter;
 pub mod render;
 
