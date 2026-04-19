@@ -856,6 +856,112 @@ fn acv4_edit_renders_unified_diff() {
     assert!(found_green_new, "+ NEW not rendered in green");
 }
 
+// ── M5 AC-V5: Slash-command picker ───────────────────────────────────────────
+
+/// AC-V5: typing `/` with an empty buffer opens the palette; the match list
+/// includes at least /help, /memory, /clear, and every discovered user skill;
+/// Tab completes + appends trailing space; Esc dismisses without mutating
+/// the buffer.
+#[test]
+fn acv5_palette_lists_builtins_and_skills_and_tab_completes() {
+    use cc_tui::commands::CommandRegistry;
+
+    // Build a registry with a synthetic skill so we can assert "every skill"
+    // appears.
+    let reg = CommandRegistry::from_skills(vec![cc_memory::SkillDef {
+        name: "demo-skill".into(),
+        description: "demo".into(),
+        model: None,
+        content: "body".into(),
+        user_invocable: true,
+        path: std::path::PathBuf::from("/tmp/demo-skill.md"),
+    }]);
+    let ctx = CommandContext::new("0.1.0", "test-model");
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+
+    let mut app = App::new("sess".into(), "test-model".into());
+
+    // Open the palette. Input must become "/".
+    update(&mut app, AppAction::PaletteOpen, &uctx);
+    assert_eq!(app.mode, AppMode::CommandPalette);
+    assert!(app.input.starts_with('/'), "palette must seed input with /");
+
+    // Match list must include the documented builtins + the skill.
+    for required in &["help", "memory", "clear", "demo-skill"] {
+        assert!(
+            app.palette_matches
+                .iter()
+                .any(|n| n.as_str() == *required),
+            "palette missing required entry /{required}: {:?}",
+            app.palette_matches
+        );
+    }
+
+    // Narrow via filter: typing "me" keeps /memory (and possibly /mcp, /model).
+    update(&mut app, AppAction::InsertChar('m'), &uctx);
+    update(&mut app, AppAction::InsertChar('e'), &uctx);
+    assert!(
+        app.palette_matches.iter().any(|n| n.as_str() == "memory"),
+        "filter `me` must retain /memory"
+    );
+    assert!(
+        app.palette_matches
+            .iter()
+            .all(|n| n.to_ascii_lowercase().starts_with("me")),
+        "filter `me` must drop non-matching commands: {:?}",
+        app.palette_matches
+    );
+
+    // Tab accepts: input becomes "/<name> " with trailing space.
+    update(&mut app, AppAction::PaletteAccept, &uctx);
+    assert_eq!(app.mode, AppMode::Input);
+    assert!(
+        app.input.ends_with(' '),
+        "accept must append trailing space; got {:?}",
+        app.input
+    );
+    assert!(
+        app.input.starts_with("/memory"),
+        "accept must replace buffer with the picked command, got {:?}",
+        app.input
+    );
+    assert!(
+        app.palette_matches.is_empty(),
+        "accept must drop the match list"
+    );
+}
+
+#[test]
+fn acv5_palette_esc_restores_original_buffer() {
+    let reg = CommandRegistry::empty();
+    let ctx = CommandContext::new("0.1.0", "test-model");
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+
+    let mut app = App::new("sess".into(), "test-model".into());
+    // User had typed some prose before hitting `/`.
+    app.input = "hello, world".into();
+    let before = app.input.clone();
+
+    update(&mut app, AppAction::PaletteOpen, &uctx);
+    // Type some filter chars.
+    update(&mut app, AppAction::InsertChar('h'), &uctx);
+    update(&mut app, AppAction::InsertChar('e'), &uctx);
+
+    // Esc.
+    update(&mut app, AppAction::PaletteCancel, &uctx);
+    assert_eq!(app.mode, AppMode::Input);
+    assert_eq!(
+        app.input, before,
+        "PaletteCancel must restore the original input byte-for-byte"
+    );
+}
+
 // ── M5 AC-V6: CC_TUI_MINIMAL opt-out ─────────────────────────────────────────
 
 /// AC-V6: with CC_TUI_MINIMAL=1 set, an assistant message containing markdown

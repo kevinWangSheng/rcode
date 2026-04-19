@@ -159,6 +159,16 @@ pub struct App {
     /// Ratatui redraws on every action so the spinner glyph refreshes at the
     /// tick cadence (100 ms) without any external timer.
     pub spinner_frame: u64,
+    /// Cached command-palette matches for the current input filter. Computed
+    /// each time the filter changes; rendered by `render_command_palette`.
+    pub palette_matches: Vec<String>,
+    /// Highlighted row index inside `palette_matches`. Clamped into range by
+    /// the arrow-key handler.
+    pub palette_selected: usize,
+    /// Snapshot of `input` captured when the palette opened — allows Esc to
+    /// restore the buffer byte-for-byte without exposing the partial `/`
+    /// filter to a reader.
+    pub palette_original: Option<String>,
 }
 
 impl App {
@@ -182,6 +192,9 @@ impl App {
             keybindings: Keybindings::default(),
             stream_started_at: None,
             spinner_frame: 0,
+            palette_matches: Vec::new(),
+            palette_selected: 0,
+            palette_original: None,
         }
     }
 

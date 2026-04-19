@@ -56,6 +56,17 @@ pub enum AppAction {
     /// Triggered by the `/reload-keybindings` slash command.
     ReloadKeybindings,
 
+    // Slash-command palette (M5 Phase C / AC-V5)
+    /// Enter palette mode. Snapshots the current buffer so Esc can restore it.
+    PaletteOpen,
+    /// Adjust the highlighted row. Positive = down, negative = up.
+    PaletteMove(i32),
+    /// Replace the input with the highlighted command + trailing space and
+    /// return to normal input mode. Equivalent to Tab / Enter.
+    PaletteAccept,
+    /// Dismiss the palette and restore the snapshotted buffer byte-for-byte.
+    PaletteCancel,
+
     // Control
     Abort,
     /// Emergency escape hatch — a second Ctrl+C within
@@ -92,6 +103,30 @@ pub struct UpdateContext<'a> {
     pub command_ctx: &'a crate::commands::CommandContext,
 }
 
+/// Recompute `palette_matches` + clamp `palette_selected` based on the
+/// current `input` buffer and the available commands. A no-op when the
+/// app is not in palette mode.
+pub fn refresh_palette(app: &mut App, commands: &CommandRegistry) {
+    if app.mode != AppMode::CommandPalette {
+        return;
+    }
+    let filter = palette_filter(&app.input).to_ascii_lowercase();
+    let mut names = commands.names();
+    names.sort();
+    names.dedup();
+    app.palette_matches = names
+        .into_iter()
+        .filter(|n| n.to_ascii_lowercase().starts_with(&filter))
+        .collect();
+    if app.palette_selected >= app.palette_matches.len() {
+        app.palette_selected = app.palette_matches.len().saturating_sub(1);
+    }
+}
+
+fn palette_filter(input: &str) -> &str {
+    input.trim_start().strip_prefix('/').unwrap_or("")
+}
+
 /// Resolve the post-permission-dialog mode.
 ///
 /// Prefer the snapshot captured when `ShowPermission` fired. If the snapshot
@@ -112,11 +147,26 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
         AppAction::InsertChar(c) => {
             if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
                 app.input.push(c);
+                if app.mode == AppMode::CommandPalette {
+                    refresh_palette(app, ctx.commands);
+                }
             }
         }
         AppAction::Backspace => {
             if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
                 app.input.pop();
+                if app.mode == AppMode::CommandPalette {
+                    // Backspacing the leading `/` cancels the palette so the
+                    // user isn't stuck picking from stale results.
+                    if !app.input.trim_start().starts_with('/') {
+                        app.palette_original = None;
+                        app.mode = AppMode::Input;
+                        app.palette_matches.clear();
+                        app.palette_selected = 0;
+                    } else {
+                        refresh_palette(app, ctx.commands);
+                    }
+                }
             }
         }
         AppAction::Submit => {
@@ -303,6 +353,55 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             app.current_turn_cancel = None;
             if app.mode == AppMode::Streaming {
                 app.finish_stream();
+            }
+        }
+        AppAction::PaletteOpen => {
+            if app.mode == AppMode::Input {
+                app.palette_original = Some(app.input.clone());
+                app.mode = AppMode::CommandPalette;
+                app.palette_selected = 0;
+                // Insert the leading `/` that triggered the palette so the
+                // filter starts at "/" (user sees the char they typed).
+                // Tests that call PaletteOpen directly on a non-empty buffer
+                // preserve whatever is already there.
+                if !app.input.starts_with('/') {
+                    app.input.push('/');
+                }
+                refresh_palette(app, ctx.commands);
+            }
+        }
+        AppAction::PaletteMove(delta) => {
+            if app.mode != AppMode::CommandPalette {
+                return UpdateResult::Continue;
+            }
+            let n = app.palette_matches.len();
+            if n == 0 {
+                return UpdateResult::Continue;
+            }
+            let cur = app.palette_selected as i32;
+            let next = (cur + delta).rem_euclid(n as i32);
+            app.palette_selected = next as usize;
+        }
+        AppAction::PaletteAccept => {
+            if app.mode != AppMode::CommandPalette {
+                return UpdateResult::Continue;
+            }
+            if let Some(name) = app.palette_matches.get(app.palette_selected).cloned() {
+                app.input = format!("/{name} ");
+            }
+            app.mode = AppMode::Input;
+            app.palette_original = None;
+            app.palette_matches.clear();
+            app.palette_selected = 0;
+        }
+        AppAction::PaletteCancel => {
+            if app.mode == AppMode::CommandPalette {
+                if let Some(orig) = app.palette_original.take() {
+                    app.input = orig;
+                }
+                app.mode = AppMode::Input;
+                app.palette_matches.clear();
+                app.palette_selected = 0;
             }
         }
         AppAction::Tick => {

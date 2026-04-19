@@ -34,9 +34,53 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_transcript(frame, app, chunks[1]);
     render_input(frame, app, chunks[2]);
 
+    if app.mode == AppMode::CommandPalette {
+        render_command_palette(frame, app, chunks[2]);
+    }
+
     if let Some(perm) = &app.permission {
         render_permission_modal(frame, perm, frame.area());
     }
+}
+
+fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect) {
+    let n = app.palette_matches.len().min(8) as u16;
+    if n == 0 {
+        return;
+    }
+    let popup_height = n + 2; // +2 for the border.
+    // Float the popup directly above the input box.
+    let width = input_area.width.clamp(20, 50);
+    let x = input_area.x;
+    let y = input_area.y.saturating_sub(popup_height);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height: popup_height,
+    };
+    frame.render_widget(Clear, area);
+
+    let mut rows: Vec<Line<'static>> = Vec::with_capacity(n as usize);
+    for (i, name) in app.palette_matches.iter().take(8).enumerate() {
+        let style = if i == app.palette_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        rows.push(Line::from(Span::styled(format!(" /{name} "), style)));
+    }
+
+    let para = Paragraph::new(rows).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Commands ")
+            .style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(para, area);
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {

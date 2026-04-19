@@ -197,7 +197,21 @@ fn map_key_event(
 
     // Mode-specific handling
     match app.mode {
-        AppMode::Input | AppMode::CommandPalette => match key.code {
+        AppMode::CommandPalette => match key.code {
+            KeyCode::Esc => Some(AppAction::PaletteCancel),
+            KeyCode::Tab | KeyCode::Enter => Some(AppAction::PaletteAccept),
+            KeyCode::Up => Some(AppAction::PaletteMove(-1)),
+            KeyCode::Down => Some(AppAction::PaletteMove(1)),
+            KeyCode::Char(c) => Some(AppAction::InsertChar(c)),
+            KeyCode::Backspace => Some(AppAction::Backspace),
+            _ => None,
+        },
+        AppMode::Input => match key.code {
+            // Empty-buffer `/` opens the palette *and* inserts the char so
+            // the filter starts at `/`. If the buffer is non-empty, treat
+            // `/` as a regular character (matches M5 scope: picker triggers
+            // "when buffer starts with `/`").
+            KeyCode::Char('/') if app.input.is_empty() => Some(AppAction::PaletteOpen),
             KeyCode::Char(c) => Some(AppAction::InsertChar(c)),
             KeyCode::Backspace => Some(AppAction::Backspace),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {

@@ -19,5 +19,12 @@ serde_json.workspace = true
 tracing.workspace = true
 dirs.workspace = true
 
+[features]
+# Default-off: enable syntax-highlighted fenced code blocks via `syntect`.
+# Carries ~2 MiB of grammar data in the release binary, so it is gated
+# behind an explicit opt-in per M5 AC-V7. The feature is scaffolded now;
+# the `syntect` dependency is not pulled in until the integration lands.
+tui-syntect = []
+
 [dev-dependencies]
 tempfile.workspace = true
