@@ -19,8 +19,10 @@ use ratatui::{
 
 use crate::theme;
 
-/// Number of unchanged context lines shown around each hunk.
-pub const CONTEXT_LINES: usize = 2;
+/// Number of unchanged context lines shown around each hunk. Matches the
+/// default used by the TS original's `diff.structuredPatch` (3), so an Edit
+/// tool card reads the same on both binaries.
+pub const CONTEXT_LINES: usize = 3;
 
 /// Render `old` and `new` as a unified diff.
 ///

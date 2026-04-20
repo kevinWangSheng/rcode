@@ -26,6 +26,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AppMode, PendingPermission, TranscriptItem};
 use crate::diff::render_unified_diff;
@@ -33,10 +34,23 @@ use crate::markdown::{minimal_mode_enabled, render_markdown};
 use crate::theme::{self, Theme};
 use crate::welcome;
 
-/// Reserved input-tokens budget used as the denominator for the "context
-/// used" percentage in the status bar. Mirrors the auto-compact threshold
-/// the engine uses so the value the user sees here matches the trigger.
-const CONTEXT_TOKEN_BUDGET: u64 = 180_000;
+/// Tool-card bullet glyph. On macOS we use `⏺` (U+23FA) — the same glyph
+/// `figures.ts` picks for Darwin. On Linux / Windows many default monospace
+/// fonts render U+23FA as a tofu box, so we fall back to `●` (U+25CF),
+/// which ships with every reasonable console font. Matches the original
+/// `figures.BLACK_CIRCLE` per-platform table in `src/constants/figures.ts`.
+#[cfg(target_os = "macos")]
+const TOOL_BULLET: &str = "⏺";
+#[cfg(not(target_os = "macos"))]
+const TOOL_BULLET: &str = "●";
+
+/// Total context-window size used as the denominator for the "context used"
+/// percentage in the status bar. Aligned with `cc_core::model::DEFAULT_CONTEXT_WINDOW`
+/// (200K, which matches the TS original's `MODEL_CONTEXT_WINDOW_DEFAULT` and
+/// every other 200K reference in the workspace). The auto-compact threshold
+/// (~180K) is enforced separately in `cc-query/src/engine.rs`, so the
+/// percentage shown here reflects the true window, not the trigger.
+const CONTEXT_TOKEN_BUDGET: u64 = cc_core::model::models::DEFAULT_CONTEXT_WINDOW as u64;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let theme = theme::current();
@@ -137,12 +151,23 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 
     // Pin viewport to the bottom of the transcript by default.
+    //
+    // Count *terminal cells*, not Unicode code points. CJK ideographs and
+    // emoji take two cells while `chars().count()` returns one, so using
+    // the raw char count made the pin-to-bottom drift upward by up to half
+    // the visible rows on Chinese-heavy transcripts (BUG-2 / BUG-3).
+    // `unicode-width` gives the same width Ratatui's internal word-wrap
+    // uses, so the row count stays consistent with what actually renders.
     let wrap_width = area.width.max(1) as usize;
     let total_rows: usize = lines
         .iter()
         .map(|line| {
-            let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-            char_count.div_ceil(wrap_width.max(1)).max(1)
+            let cells: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            cells.div_ceil(wrap_width.max(1)).max(1)
         })
         .sum();
     let viewport_rows = area.height as usize;
@@ -325,22 +350,29 @@ fn push_system_notice(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme)
 }
 
 fn push_compact_boundary(lines: &mut Vec<Line<'static>>, width: u16, theme: &Theme) {
-    // Center "── compacted ──" within the viewport width using ─ runs that
-    // give the divider a visible "rule" feel.
-    let label = " compacted ";
-    let total = width.max(label.len() as u16 + 4) as usize;
-    let dashes = (total - label.len()) / 2;
-    let bar = format!(
-        "{l}{label}{r}",
-        l = "─".repeat(dashes),
-        r = "─".repeat(total - label.len() - dashes),
-    );
-    lines.push(Line::from(Span::styled(
-        bar,
-        Style::default()
-            .fg(theme.subtle)
-            .add_modifier(Modifier::ITALIC),
-    )));
+    // Match the TS original (`CompactBoundaryMessage.tsx`): a left-aligned
+    // `✻` sparkle followed by the plain label plus a shortcut hint, all
+    // dim. No centering, no rule run — a screen-width rule is noisy when
+    // the transcript is already heavy with tool cards.
+    let _ = width;
+    lines.push(Line::from(vec![
+        Span::styled(
+            "✻ ".to_string(),
+            Style::default()
+                .fg(theme.claude_orange)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Conversation compacted ".to_string(),
+            Style::default().fg(theme.dim),
+        ),
+        Span::styled(
+            "(ctrl+o for history)".to_string(),
+            Style::default()
+                .fg(theme.subtle)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
     lines.push(Line::from(""));
 }
 
@@ -354,11 +386,12 @@ fn tool_output_style(theme: &Theme, is_error: bool) -> Style {
 
 fn render_tool_header(name: &str, preview: &str, theme: &Theme) -> Line<'static> {
     // `⏺ ToolName(preview_args)` per M5 Phase B + theme colours per D1.
+    // Bullet glyph is platform-aware (see `TOOL_BULLET`).
     let color = theme.tool_color(name);
     let preview = preview.lines().next().unwrap_or("").to_string();
     Line::from(vec![
         Span::styled(
-            "⏺ ".to_string(),
+            format!("{TOOL_BULLET} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -779,7 +812,10 @@ mod tests {
             "assistant header must be gone:\n{s}"
         );
         assert!(s.contains("> first"), "user gutter missing:\n{s}");
-        assert!(s.contains("⏺"), "tool bullet missing:\n{s}");
+        assert!(
+            s.contains(TOOL_BULLET),
+            "tool bullet ({TOOL_BULLET}) missing:\n{s}"
+        );
         assert!(s.contains("✓"), "success tick missing:\n{s}");
         assert!(s.contains("✗"), "error tick missing:\n{s}");
         assert!(s.contains("compacted"), "compact divider missing:\n{s}");
@@ -815,6 +851,47 @@ mod tests {
             !any_verb,
             "spinner row must be blank after stream: {:?}",
             r[18]
+        );
+    }
+
+    /// BUG-1 regression — the context-% denominator must match the real
+    /// window size (200 K tokens, same as `cc_core::DEFAULT_CONTEXT_WINDOW`
+    /// and the TS original's `MODEL_CONTEXT_WINDOW_DEFAULT`). A previous
+    /// version used 180K, which is the auto-compact threshold — that
+    /// inflated the percentage by ~10% and let the status bar show 100%
+    /// while the engine still had 20K of room.
+    #[test]
+    fn context_budget_matches_core_default_context_window() {
+        assert_eq!(
+            CONTEXT_TOKEN_BUDGET,
+            cc_core::model::models::DEFAULT_CONTEXT_WINDOW as u64
+        );
+        // Extra sanity: at 180K input the status bar must show < 100%.
+        let mut app = App::new("sid".into(), "claude-sonnet-4-6".into());
+        app.status.input_tokens = 180_000;
+        let s = render_to_string(&app, 100, 24);
+        let last = rows(&s)[23];
+        assert!(
+            last.contains("90% context"),
+            "expected 90% at 180K/200K, got: {last:?}"
+        );
+    }
+
+    /// Compact boundary regression — renders as the TS-style
+    /// `✻ Conversation compacted (ctrl+o for history)` left-aligned, not
+    /// the older centred `── compacted ──` rule.
+    #[test]
+    fn compact_boundary_matches_original_format() {
+        let mut app = App::new("s".into(), "m".into());
+        app.push_compact_boundary();
+        let s = render_to_string(&app, 80, 24);
+        assert!(
+            s.contains("✻ Conversation compacted"),
+            "missing ✻ + label:\n{s}"
+        );
+        assert!(
+            s.contains("(ctrl+o for history)"),
+            "missing shortcut hint:\n{s}"
         );
     }
 

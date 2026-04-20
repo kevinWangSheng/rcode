@@ -188,7 +188,19 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 let outcome = ctx.commands.execute(&cmd, &cmd_ctx);
                 match outcome {
                     CommandOutcome::Info(msg) => app.push_system(msg),
-                    CommandOutcome::Exit => return UpdateResult::Quit,
+                    CommandOutcome::Exit => {
+                        // If a stream is running when the user types /exit,
+                        // cancel the engine turn and preserve any partial
+                        // assistant text under an "[aborted]" marker so the
+                        // transcript replay on resume still makes sense.
+                        if app.mode == AppMode::Streaming {
+                            if let Some(tok) = app.current_turn_cancel.take() {
+                                tok.cancel();
+                            }
+                            app.abort_stream();
+                        }
+                        return UpdateResult::Quit;
+                    }
                     CommandOutcome::Clear => {
                         app.transcript.clear();
                         app.push_system("Transcript cleared.".into());
@@ -510,6 +522,39 @@ mod tests {
         };
         let result = update(&mut app, AppAction::Submit, &uctx);
         assert!(matches!(result, UpdateResult::Quit));
+    }
+
+    /// BUG-4 regression: `/exit` while a stream is running must cancel the
+    /// turn and commit partial assistant text under the `[aborted]` marker
+    /// rather than silently dropping it. If this test regresses, users who
+    /// type `/exit` mid-stream will lose anything the model had emitted so
+    /// far — session replay would then jump from the user prompt straight
+    /// to the next turn with no record of what the model had started.
+    #[test]
+    fn slash_exit_during_stream_aborts_and_preserves_partial_text() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        app.on_token("so far the model said");
+        // Install a cancel token so we can observe it being fired.
+        let tok = tokio_util::sync::CancellationToken::new();
+        app.current_turn_cancel = Some(tok.clone());
+
+        app.input = "/exit".into();
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+        let result = update(&mut app, AppAction::Submit, &uctx);
+        assert!(matches!(result, UpdateResult::Quit));
+        assert!(tok.is_cancelled(), "engine turn must be cancelled");
+        match app.transcript.last() {
+            Some(crate::app::TranscriptItem::AssistantText(t)) => {
+                assert!(t.contains("so far the model said"));
+                assert!(t.contains("aborted"));
+            }
+            other => panic!("expected aborted assistant text, got {other:?}"),
+        }
     }
 
     #[test]
