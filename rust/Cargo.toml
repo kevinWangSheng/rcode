@@ -73,6 +73,15 @@ regex = "1"
 unicode-normalization = "0.1"
 unicode-width = "0.2"
 
+# TUI testing: drive the real binary under a virtual terminal + parse the
+# rendered VT stream back into a grid we can assert on. Used by cc-tui's
+# pty-based regression tests; not pulled into release binaries.
+portable-pty = "0.9"
+# Pin to 0.15 because 0.16 requires unicode-width 0.2.1+ while ratatui 0.29
+# pins `= 0.2.0`. See `scrollback()` in tests/pty.rs for the 0.15-specific
+# underflow workaround we apply in exchange.
+vt100 = "0.15"
+
 # Keychain (macOS Keychain, Linux SecretService, Windows Credential Manager)
 keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
 

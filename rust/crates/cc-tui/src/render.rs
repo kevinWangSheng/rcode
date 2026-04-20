@@ -98,35 +98,14 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         ));
     }
 
-    for item in &app.transcript {
-        match item {
-            TranscriptItem::UserMessage(text) => {
-                push_user_message(&mut lines, text, theme);
-            }
-            TranscriptItem::AssistantText(text) => {
-                push_assistant_text(&mut lines, text);
-            }
-            TranscriptItem::ToolCall {
-                name,
-                input_summary,
-                raw_input,
-            } => {
-                push_tool_call(&mut lines, name, input_summary, raw_input, theme);
-            }
-            TranscriptItem::ToolResult {
-                name,
-                output,
-                is_error,
-            } => {
-                push_tool_result(&mut lines, name, output, *is_error, theme);
-            }
-            TranscriptItem::SystemNotice(text) => {
-                push_system_notice(&mut lines, text, theme);
-            }
-            TranscriptItem::CompactBoundary => {
-                push_compact_boundary(&mut lines, area.width, theme);
-            }
-        }
+    // Skip items already flushed to terminal scrollback via `insert_before`.
+    // `run_tui` keeps `emitted_to_scrollback` monotonically increasing; this
+    // slice is "finalized but not-yet-flushed" items landed between two
+    // frames, which still need to be drawn this frame until the post-draw
+    // flush catches up.
+    let start = app.emitted_to_scrollback.min(app.transcript.len());
+    for item in &app.transcript[start..] {
+        push_transcript_item(&mut lines, item, area.width, theme);
     }
 
     if !app.streaming_text.is_empty() || app.mode == AppMode::Streaming {
@@ -178,6 +157,45 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         .wrap(Wrap { trim: false })
         .scroll((y_scroll, 0));
     frame.render_widget(para, area);
+}
+
+/// Render a single transcript item into its row lines. Used both by the
+/// in-viewport render path (for items not yet flushed) and by
+/// `run_tui`'s `insert_before` path (for items being pushed into the
+/// terminal scrollback so the user can scroll through history with
+/// their normal terminal controls).
+pub fn render_item_lines(
+    item: &TranscriptItem,
+    viewport_width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    push_transcript_item(&mut lines, item, viewport_width, theme);
+    lines
+}
+
+fn push_transcript_item(
+    lines: &mut Vec<Line<'static>>,
+    item: &TranscriptItem,
+    width: u16,
+    theme: &Theme,
+) {
+    match item {
+        TranscriptItem::UserMessage(text) => push_user_message(lines, text, theme),
+        TranscriptItem::AssistantText(text) => push_assistant_text(lines, text),
+        TranscriptItem::ToolCall {
+            name,
+            input_summary,
+            raw_input,
+        } => push_tool_call(lines, name, input_summary, raw_input, theme),
+        TranscriptItem::ToolResult {
+            name,
+            output,
+            is_error,
+        } => push_tool_result(lines, name, output, *is_error, theme),
+        TranscriptItem::SystemNotice(text) => push_system_notice(lines, text, theme),
+        TranscriptItem::CompactBoundary => push_compact_boundary(lines, width, theme),
+    }
 }
 
 // Phase D5 gutter conventions:

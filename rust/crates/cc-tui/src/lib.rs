@@ -40,7 +40,14 @@ pub struct TuiConfig {
     pub model: String,
     pub session_id: String,
     /// Fully-constructed engine (built by main with all tools, hooks, session).
-    pub engine: QueryEngine,
+    ///
+    /// `None` means "demo / PTY-harness mode" — `Submit` from the user is
+    /// swallowed with a system notice instead of spawning an engine turn, and
+    /// all incoming events are assumed to originate from whoever holds
+    /// `events_tx` (typically a scripted task). This is what lets us drive
+    /// the full `run_tui` event loop from integration tests without a real
+    /// `ApiClient` / API key.
+    pub engine: Option<QueryEngine>,
     /// Conversation history (may contain resumed messages).
     pub messages: Vec<MessageParam>,
     /// Root cancellation token (user-level Ctrl+C, not per-turn).
@@ -80,13 +87,16 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     let events_tx = config.events_tx;
     let mut events_rx = config.events_rx;
 
-    // Wire the events channel into the engine for streaming deltas / tool events.
-    let engine = config.engine.with_events(events_tx.clone());
-
-    // Wrap engine + message history in a shared mutex so the spawned turn
-    // task can take exclusive access while the main loop owns the terminal.
-    let engine_state: Arc<Mutex<(QueryEngine, Vec<MessageParam>)>> =
-        Arc::new(Mutex::new((engine, config.messages)));
+    // Wire the events channel into the engine for streaming deltas / tool
+    // events. `None` puts us in demo / PTY-harness mode: the event loop runs
+    // normally but Submit never triggers a real engine turn.
+    type EngineState = Arc<Mutex<(QueryEngine, Vec<MessageParam>)>>;
+    let engine_state: Option<EngineState> = config.engine.map(|engine| {
+        Arc::new(Mutex::new((
+            engine.with_events(events_tx.clone()),
+            config.messages,
+        )))
+    });
 
     let root_cancel = config.cancel;
 
@@ -122,6 +132,14 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // least stderr is readable by the parent shell. It's installed exactly
     // once per process via `OnceLock`.
     install_panic_hook();
+
+    // ── Route tracing to a file if requested ─────────────────────────────
+    //
+    // Under raw mode we can't print tracing to stderr without corrupting
+    // the screen. If the caller set `CC_TUI_LOG_FILE=/path/to/log`, route
+    // all `tracing` events to that file instead. Harness tests pipe this
+    // to a temp file they then read + assert on. Idempotent per process.
+    install_file_log();
 
     // ── Initialize terminal (inline viewport) ─────────────────────────────
     //
@@ -164,7 +182,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
     // Initial render.
-    draw_with_resize(&mut terminal, &app, &mut vp)?;
+    draw_with_resize(&mut terminal, &mut app, &mut vp)?;
 
     loop {
         let action: Option<AppAction> = tokio::select! {
@@ -203,22 +221,43 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
                     std::process::exit(130);
                 }
                 UpdateResult::SubmitToEngine(text) => {
-                    // Spawn a background task for this engine turn.
-                    let es = engine_state.clone();
-                    let child_cancel = root_cancel.child_token();
-                    app.current_turn_cancel = Some(child_cancel.clone());
-                    let tx = events_tx.clone();
-                    tokio::spawn(async move {
-                        let mut guard = es.lock().await;
-                        let (engine, messages) = &mut *guard;
-                        if let Err(e) = engine.run_turn(text, |_| {}, messages, &child_cancel).await
-                        {
-                            // Send the error to the TUI (TurnComplete was not
-                            // sent by the engine in this error path).
-                            let _ = tx.send(CoreEvent::Error(e.to_string())).await;
-                        }
-                        // On success the engine already sent TurnComplete.
-                    });
+                    // Spawn a background task for this engine turn — but only
+                    // if we have a real engine. In demo / PTY-harness mode
+                    // (`engine_state.is_none()`) we drop the submit on the
+                    // floor and let the scripted event source drive the TUI
+                    // instead, so the rest of the event loop keeps exercising
+                    // every code path except the real network turn.
+                    if let Some(es) = engine_state.as_ref() {
+                        let es = es.clone();
+                        let child_cancel = root_cancel.child_token();
+                        app.current_turn_cancel = Some(child_cancel.clone());
+                        let tx = events_tx.clone();
+                        tokio::spawn(async move {
+                            let mut guard = es.lock().await;
+                            let (engine, messages) = &mut *guard;
+                            if let Err(e) =
+                                engine.run_turn(text, |_| {}, messages, &child_cancel).await
+                            {
+                                // Send the error to the TUI (TurnComplete was not
+                                // sent by the engine in this error path).
+                                let _ = tx.send(CoreEvent::Error(e.to_string())).await;
+                            }
+                            // On success the engine already sent TurnComplete.
+                        });
+                    } else {
+                        // Demo mode — synthesize a quick TurnComplete so the
+                        // mode returns to Input without freezing on
+                        // `AppMode::Streaming`.
+                        let tx = events_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx
+                                .send(CoreEvent::TurnComplete {
+                                    usage: cc_core::Usage::default(),
+                                })
+                                .await;
+                            drop(text);
+                        });
+                    }
                 }
                 UpdateResult::Continue => {}
             }
@@ -226,7 +265,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
 
         // Redraw after every event, resizing the inline viewport only if
         // the terminal itself resized or content genuinely needs more rows.
-        draw_with_resize(&mut terminal, &app, &mut vp)?;
+        draw_with_resize(&mut terminal, &mut app, &mut vp)?;
     }
 
     // Restore terminal: drop raw mode but leave the rendered inline content
@@ -243,6 +282,44 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
 fn clamp_viewport(desired: u16, term_height: u16) -> u16 {
     let max = term_height.saturating_sub(1).max(4);
     desired.clamp(4, max)
+}
+
+/// Route `tracing` events to `$CC_TUI_LOG_FILE` when that env var is set.
+/// No-op when the env var is missing (avoids spamming a stray file during
+/// normal use) and no-op after the first successful install.
+///
+/// This is the canonical way to get structured logs out of a raw-mode TUI:
+/// stderr is unusable because it would corrupt the screen, and a file sink
+/// is easy to `tail -f` from another terminal or assert-on from PTY tests.
+fn install_file_log() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    let path = match std::env::var("CC_TUI_LOG_FILE") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    INSTALLED.get_or_init(|| {
+        // `tracing-subscriber` is already a workspace dep; we only need the
+        // file layer here. Use `RUST_LOG` if the user set it, otherwise
+        // default to info for cc-* crates + warn for everything else to keep
+        // the log signal/noise sane.
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let filter = std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "cc_tui=debug,cc_query=info,warn".to_string());
+            // Build a minimal subscriber; ignore errors if something else
+            // already set a global one.
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+                .with_writer(std::sync::Mutex::new(f))
+                .with_ansi(false)
+                .with_target(true)
+                .try_init();
+        }
+    });
 }
 
 /// Install a global panic hook that restores the terminal before letting the
@@ -323,7 +400,7 @@ struct ViewportState {
 /// stay correct — only growing is.
 fn draw_with_resize<B>(
     terminal: &mut Terminal<B>,
-    app: &App,
+    app: &mut App,
     vp: &mut ViewportState,
 ) -> cc_core::CcResult<()>
 where
@@ -331,6 +408,12 @@ where
 {
     let term_size = crossterm::terminal::size()
         .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
+
+    // Step 1: flush finalized transcript items to terminal scrollback before
+    // we draw. After this returns, the viewport has *no* transcript items
+    // to render — just live state (streaming text, spinner, input, chrome).
+    flush_to_scrollback(terminal, app, term_size.0)?;
+
     let desired = app.estimate_viewport_rows(term_size.0);
     let capped = clamp_viewport(desired, term_size.1);
 
@@ -355,6 +438,57 @@ where
     terminal
         .draw(|frame| render::render(frame, app))
         .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
+    Ok(())
+}
+
+/// Push any transcript items newer than `app.emitted_to_scrollback` into
+/// the terminal scrollback via `Terminal::insert_before`.
+///
+/// This is what makes the TUI behave like a normal inline CLI: completed
+/// messages flow into the user's terminal scrollback (so they can scroll
+/// up with the terminal's own mouse wheel / Shift+PageUp / search) while
+/// the inline viewport only holds the currently-active state. Before this
+/// change, anything past `viewport_rows - chrome` fell off the top of
+/// `Paragraph.scroll` and was gone forever.
+///
+/// Silently drops insert_before errors — in inline mode they mean the
+/// terminal is too small to accept the prepend. The item stays in
+/// `transcript[emitted..]` and we'll retry next draw, which is the right
+/// behaviour: content isn't lost, just deferred until there's room.
+fn flush_to_scrollback<B>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    width: u16,
+) -> cc_core::CcResult<()>
+where
+    B: ratatui::backend::Backend,
+{
+    if app.emitted_to_scrollback >= app.transcript.len() {
+        return Ok(());
+    }
+    let theme = crate::theme::current();
+    let start = app.emitted_to_scrollback;
+    for idx in start..app.transcript.len() {
+        let item = &app.transcript[idx];
+        let lines = crate::render::render_item_lines(item, width, &theme);
+        let row_count = lines.len() as u16;
+        if row_count == 0 {
+            app.emitted_to_scrollback = idx + 1;
+            continue;
+        }
+        let insert_result = terminal.insert_before(row_count, |buf| {
+            let paragraph = ratatui::widgets::Paragraph::new(lines.clone())
+                .wrap(ratatui::widgets::Wrap { trim: false });
+            ratatui::widgets::Widget::render(paragraph, buf.area, buf);
+        });
+        if insert_result.is_err() {
+            // Terminal too small right now; try again next draw. Leave the
+            // index un-advanced so we don't skip this item.
+            tracing::debug!("insert_before failed at item {idx}; deferring to next draw");
+            return Ok(());
+        }
+        app.emitted_to_scrollback = idx + 1;
+    }
     Ok(())
 }
 

@@ -217,6 +217,23 @@ pub struct App {
     /// welcome-tip rotation under D3, so the same tip stays on screen for
     /// 30 s windows without depending on a live timer.
     pub session_started: Instant,
+    /// Number of prefix items in `transcript` that have already been
+    /// flushed to terminal scrollback via `Terminal::insert_before`.
+    ///
+    /// Invariant: `transcript[..emitted_to_scrollback]` have been rendered
+    /// and pushed above the inline viewport; the view layer MUST NOT
+    /// render them again. Items in `transcript[emitted_to_scrollback..]`
+    /// are "finalized but not yet flushed" — they were pushed after the
+    /// last redraw and will be flushed during the next draw cycle.
+    ///
+    /// Why this matters: without this index the inline viewport renders
+    /// every transcript item every frame, so once there are more items
+    /// than visible rows Ratatui's paragraph scroll eats the top and the
+    /// user's terminal scrollback stays empty — no way to see history.
+    /// By contrast, `insert_before` hands old rows to the terminal's
+    /// native scrollback, which the user can scroll back through with
+    /// their terminal's own mouse-wheel / Shift+PageUp bindings.
+    pub emitted_to_scrollback: usize,
 }
 
 impl App {
@@ -247,6 +264,7 @@ impl App {
             cwd: default_cwd_display(),
             git_branch: None,
             session_started: Instant::now(),
+            emitted_to_scrollback: 0,
         }
     }
 
@@ -355,7 +373,11 @@ impl App {
             };
         }
 
-        for item in &self.transcript {
+        // Only account for items still *in the viewport* — items already
+        // flushed to terminal scrollback are no longer rendered, so they
+        // don't claim any viewport rows.
+        let start = self.emitted_to_scrollback.min(self.transcript.len());
+        for item in &self.transcript[start..] {
             transcript = transcript.saturating_add(match item {
                 TranscriptItem::UserMessage(t) => count_wrapped(t).saturating_add(1),
                 TranscriptItem::AssistantText(t) => count_wrapped(t).saturating_add(1),

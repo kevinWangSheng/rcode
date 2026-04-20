@@ -438,7 +438,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let cfg = TuiConfig {
             model: model.clone(),
             session_id: tui_session_id.clone(),
-            engine: tui_engine,
+            engine: Some(tui_engine),
             messages,
             cancel: tui_cancel,
             commands,
