@@ -47,6 +47,10 @@ pub struct LaunchOpts {
     pub script: String,
     /// Optional path for the tracing log. Creates a NamedTempFile if None.
     pub log_path: Option<PathBuf>,
+    /// Extra env vars to forward to the child. Used by the streaming-flush
+    /// regression test to pass `CC_TUI_DEMO_AUTO_STREAM=1` without needing
+    /// to simulate a user submit first.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl Default for LaunchOpts {
@@ -56,6 +60,7 @@ impl Default for LaunchOpts {
             rows: 24,
             script: "[]".to_string(),
             log_path: None,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -84,6 +89,9 @@ impl TuiPty {
         if let Some(log_path) = &opts.log_path {
             cmd.env("CC_TUI_LOG_FILE", log_path);
             cmd.env("RUST_LOG", "cc_tui=debug");
+        }
+        for (k, v) in &opts.extra_env {
+            cmd.env(k, v);
         }
         // Inherit cwd — the welcome banner's `cwd:` line uses it.
         cmd.cwd(std::env::current_dir()?);
@@ -281,6 +289,7 @@ fn smoke_demo_launches_and_renders_prompt() {
         rows: 24,
         script: r#"[{"stream_delta": "hello from script"}, {"turn_complete": {}}]"#.to_string(),
         log_path: None,
+        extra_env: Vec::new(),
     };
     let tui = TuiPty::launch(opts).unwrap();
 
@@ -333,6 +342,7 @@ fn scrollback_preserves_old_turns() {
         rows: 80,
         script,
         log_path: None,
+        extra_env: Vec::new(),
     };
     let tui = TuiPty::launch(opts).unwrap();
 
@@ -364,4 +374,150 @@ fn scrollback_preserves_old_turns() {
         peek.len(),
         peek
     );
+}
+
+/// Regression for the "streaming content scrolls off the top of the
+/// viewport and is lost" bug caught via user screenshots (2026-04-20).
+///
+/// Before the fix, a long streaming assistant response rendered entirely
+/// inside `streaming_text` → `Paragraph.scroll` pin-to-bottom. As the
+/// text grew past the viewport height, the earliest paragraphs scrolled
+/// off the top of the paragraph and were unrecoverable until
+/// `TurnComplete` fired (at which point the whole blob flushed at once).
+///
+/// After the fix, `flush_to_scrollback` detects stable `\n\n` boundaries
+/// in `streaming_text` that are outside any open fenced code block and
+/// emits each stable prefix to terminal scrollback via `insert_before`,
+/// keeping only the unstable tail in the inline viewport.
+///
+/// This test scripts a multi-paragraph stream (~150 rows) and asserts
+/// early paragraphs land in scrollback *before* the stream completes.
+#[test]
+fn streaming_flushes_stable_paragraphs_to_scrollback() {
+    build_demo_once().unwrap();
+
+    // 20 paragraphs, each followed by a blank line. Each paragraph is
+    // tagged PARA## so we can probe the peek for earlier content.
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+    for i in 0..20 {
+        steps.push(serde_json::json!({
+            "stream_delta": format!("PARA{:02} line one.\nPARA{:02} line two.\n\n", i, i)
+        }));
+        // Sleep just enough that the draw loop drains each delta in a
+        // separate tick — 80 ms is two redraws per paragraph.
+        steps.push(serde_json::json!({ "sleep_ms": 80 }));
+    }
+    steps.push(serde_json::json!({ "turn_complete": {} }));
+    let script = serde_json::to_string(&steps).unwrap();
+
+    // rows=40 tall enough for vt100 peek + the inline viewport to grow
+    // well past the first few paragraphs, but short enough that overflow
+    // hits well before the 20th paragraph.
+    // Use a known path so we can inspect it after a failed test without
+    // waiting on a tempfile cleanup.
+    let log_path = std::path::PathBuf::from("/tmp/cc-tui-probe/streaming-test.log");
+    let _ = std::fs::remove_file(&log_path);
+    let _ = std::fs::create_dir_all("/tmp/cc-tui-probe");
+    let opts = LaunchOpts {
+        cols: 100,
+        rows: 40,
+        script,
+        log_path: Some(log_path.clone()),
+        extra_env: vec![("CC_TUI_DEMO_AUTO_STREAM".to_string(), "1".to_string())],
+    };
+    let tui = TuiPty::launch(opts).unwrap();
+
+    // Wait for the last paragraph to show up anywhere — visible viewport
+    // OR flushed scrollback. With the fix, most paragraphs land in
+    // scrollback within ~100ms of arrival, not in the visible viewport.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut done = false;
+    while std::time::Instant::now() < deadline {
+        if tui.screen().contains("PARA19") || tui.scrollback().contains("PARA19") {
+            done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !done {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let last_log = log.lines().rev().take(20).collect::<Vec<_>>().join("\n");
+        let screen = tui.screen();
+        let back = tui.scrollback();
+        panic!(
+            "stream never finished — demo may have frozen.\n\
+             --- last 20 log lines ---\n{last_log}\n\
+             --- screen tail ---\n{}\n\
+             --- scrollback tail ---\n{}",
+            &screen[screen.len().saturating_sub(500)..],
+            &back[back.len().saturating_sub(500)..],
+        );
+    }
+
+    // After the stream completes, early paragraphs must be reachable via
+    // terminal scrollback. Pre-fix, they scrolled off the top of
+    // Paragraph.scroll and the scrollback saw only the single big post-
+    // turn_complete flush of the final AssistantText — missing all
+    // intermediate paragraphs that had been painted and then overwritten.
+    let peek = tui.scrollback();
+    let has_early = (0..6).any(|i| peek.contains(&format!("PARA{:02}", i)));
+    assert!(
+        has_early,
+        "no early paragraph (PARA00..05) reached scrollback — \
+         streaming_text is still eating overflow instead of flushing \
+         stable prefixes via insert_before. (peek len = {} bytes)\n\
+         --- peek tail ---\n{}",
+        peek.len(),
+        &peek[peek.len().saturating_sub(2000)..]
+    );
+
+    // Let pending tracing writes drain to disk before reading the log.
+    // `tracing_subscriber::fmt` writes unbuffered to our File handle, but
+    // the OS file cache and our Mutex-wrapped writer can still trail by
+    // a few ms behind the in-memory events.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Also sanity-check via the trace log: at least one "flush" event
+    // should have fired during the stream (i.e. streaming_len went
+    // *down* as a prefix got absorbed into scrollback, without a
+    // TurnComplete between them).
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    // Drop the final "turn_complete" transition to 0; count transitions
+    // where streaming_len decreased while mode=Streaming.
+    let mut prev: Option<u64> = None;
+    let mut mid_stream_flushes = 0usize;
+    for line in log_contents
+        .lines()
+        .filter(|l| l.contains("mode=Streaming"))
+    {
+        if let Some(idx) = line.find("streaming_len=") {
+            let rest = &line[idx + "streaming_len=".len()..];
+            if let Some(n) = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                if let Some(p) = prev {
+                    if n < p {
+                        mid_stream_flushes += 1;
+                    }
+                }
+                prev = Some(n);
+            }
+        }
+    }
+    // Alternative check: direct evidence of flush firing. Older parse
+    // logic may have raced the buffered writer; also accept explicit
+    // "streaming flush succeeded" log lines as proof the code path ran.
+    let explicit_flush = log_contents.contains("streaming flush succeeded");
+    assert!(
+        mid_stream_flushes > 0 || explicit_flush,
+        "no mid-stream flush evidence in trace log — \
+         flush_to_scrollback's streaming-prefix branch never fired. \
+         (mid_stream_flushes = {mid_stream_flushes})\n\
+         --- log tail ---\n{}",
+        &log_contents[log_contents.len().saturating_sub(4000)..]
+    );
+
+    drop(tui);
 }

@@ -184,13 +184,27 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // scrolls inside the app via PageUp). We log a one-line warning to
     // both the tracing log and the crash log so the user can opt to
     // re-run on a faster terminal if they want full inline behaviour.
-    let backend = CrosstermBackend::new(io::stdout());
-    let inline_attempt = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(initial_height),
-        },
-    );
+    // Escape hatch for users who know their terminal is slow to answer DSR
+    // (nested tmux, screen, some ssh setups, npcterm) and don't want to
+    // wait the 2 s crossterm cursor-query timeout on every launch. Setting
+    // `CC_TUI_FORCE_FULLSCREEN=1` skips the Inline attempt entirely. They
+    // lose `insert_before`-to-scrollback (same loss as the automatic
+    // fallback), gain a near-instant startup.
+    let force_fullscreen = std::env::var_os("CC_TUI_FORCE_FULLSCREEN").is_some();
+
+    let inline_attempt = if force_fullscreen {
+        Err(std::io::Error::other(
+            "CC_TUI_FORCE_FULLSCREEN=1 set; skipping Inline",
+        ))
+    } else {
+        let backend = CrosstermBackend::new(io::stdout());
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(initial_height),
+            },
+        )
+    };
     let (mut terminal, viewport_kind) = match inline_attempt {
         Ok(t) => (t, ViewportKind::Inline),
         Err(e) => {
@@ -508,6 +522,12 @@ where
     // "render everything" case correctly because `app.emitted_to_scrollback`
     // stays at 0 (we never advance it in Fullscreen mode).
     if vp.kind == ViewportKind::Fullscreen {
+        tracing::debug!(
+            mode = ?app.mode,
+            streaming_len = app.streaming_text.len(),
+            transcript_items = app.transcript.len(),
+            "draw (Fullscreen)"
+        );
         terminal
             .draw(|frame| render::render(frame, app))
             .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
@@ -543,6 +563,13 @@ where
         vp.term_size = term_size;
     }
 
+    tracing::debug!(
+        mode = ?app.mode,
+        streaming_len = app.streaming_text.len(),
+        transcript_items = app.transcript.len(),
+        viewport_h = vp.height,
+        "draw (Inline)"
+    );
     terminal
         .draw(|frame| render::render(frame, app))
         .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
@@ -571,9 +598,12 @@ fn flush_to_scrollback<B>(
 where
     B: ratatui::backend::Backend,
 {
-    if app.emitted_to_scrollback >= app.transcript.len() {
-        return Ok(());
-    }
+    // NOTE: do NOT early-return when all transcript items are already
+    // flushed. During streaming, `transcript` may be empty (no finalised
+    // assistant item yet) but `streaming_text` has content that still
+    // needs stable-prefix flushing. The early-return bug caused the 2026-
+    // 04-20 "long stream scrolls off viewport" report: nothing ever
+    // flushed until `turn_complete` fired.
     let theme = crate::theme::current();
     let start = app.emitted_to_scrollback;
     for idx in start..app.transcript.len() {
@@ -597,7 +627,101 @@ where
         }
         app.emitted_to_scrollback = idx + 1;
     }
+
+    // Also flush "stable" portion of the in-flight streaming text.
+    //
+    // Without this, when an assistant response is longer than the viewport
+    // height, earlier paragraphs scroll off the top of `Paragraph.scroll`'s
+    // pinned-to-bottom view and are unrecoverable — they never made it into
+    // terminal scrollback because no `insert_before` was ever called for
+    // them (only finalized transcript items went through flush).
+    //
+    // User-visible symptom (2026-04-20 screenshots): during a long stream
+    // the viewport showed paragraphs N, N+1, N+2 at 10 s, then N+3, N+4,
+    // N+5 at 20 s (earlier ones gone). At turn_complete the full text
+    // flushed at once — leaving visible only the tail and whatever the
+    // terminal's own scrollback happened to pick up during the
+    // replacement.
+    //
+    // Fix: find the newest "safe flush point" in `streaming_text` — the
+    // last blank-line boundary (`\n\n`) that is NOT inside an open fenced
+    // code block. Everything up to that point is guaranteed stable
+    // (line-scoped markdown blocks are complete; no open fence spanning
+    // the boundary) and can be emitted to scrollback. The unstable tail
+    // stays in `streaming_text` for the viewport renderer.
+    if !app.streaming_text.is_empty() {
+        let stream_len_before = app.streaming_text.len();
+        let end_opt = stable_streaming_prefix_end(&app.streaming_text);
+        tracing::debug!(
+            stream_len_before,
+            flush_end = ?end_opt,
+            "streaming flush pass"
+        );
+        if let Some(end) = end_opt {
+            if end > 0 {
+                let stable = app.streaming_text[..end].to_string();
+                let tail = app.streaming_text[end..].to_string();
+                let lines = crate::markdown::render_markdown(&stable);
+                let row_count = lines.len() as u16;
+                tracing::debug!(
+                    stable_bytes = stable.len(),
+                    row_count,
+                    tail_bytes = tail.len(),
+                    "streaming flush insert_before"
+                );
+                if row_count > 0 {
+                    let insert_result = terminal.insert_before(row_count, |buf| {
+                        let para = ratatui::widgets::Paragraph::new(lines.clone())
+                            .wrap(ratatui::widgets::Wrap { trim: false });
+                        ratatui::widgets::Widget::render(para, buf.area, buf);
+                    });
+                    match insert_result {
+                        Ok(()) => {
+                            app.streaming_text = tail;
+                            tracing::debug!("streaming flush succeeded");
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "streaming flush failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Scan `text` and return the byte offset of the newest "safe to flush"
+/// boundary, or `None` if no such boundary exists yet.
+///
+/// A boundary is a blank line (`\n\n`) that is NOT inside a fenced code
+/// block. Content before the boundary cannot change with future appends
+/// (all line-scoped blocks are complete), so it's safe to push to
+/// terminal scrollback incrementally while the stream continues.
+///
+/// If the parser is inside an open fence at the boundary candidate, we
+/// skip it — the code block will finalise later and we'd rather render
+/// it complete than split across an `insert_before` call (which would
+/// leave an orphan "…streaming" marker frozen in scrollback).
+fn stable_streaming_prefix_end(text: &str) -> Option<usize> {
+    let mut in_fence = false;
+    let mut last_safe_end: Option<usize> = None;
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+        }
+        // A blank line (just `\n` or CRLF) outside a fence is the stable
+        // marker. Everything up to and including this blank line will not
+        // be rewritten by future tokens.
+        if !in_fence && line.trim().is_empty() && line.ends_with('\n') {
+            last_safe_end = Some(pos + line.len());
+        }
+        pos += line.len();
+    }
+    last_safe_end
 }
 
 /// Map a crossterm key event to an AppAction based on keybindings and mode.
@@ -983,6 +1107,66 @@ mod utf8_safety_tests {
             summarize_input(&json!({ "prompt": "summarise this file", "max_tokens": 200 })),
             "summarise this file"
         );
+    }
+}
+
+#[cfg(test)]
+mod streaming_flush_tests {
+    //! Anchor the "flush stable prefix to scrollback during streaming"
+    //! invariant. User reported via screenshots (2026-04-20) that during
+    //! a long assistant stream the earlier paragraphs vanished from view
+    //! — they were scrolled off `Paragraph.scroll`'s pinned-to-bottom
+    //! window without ever being handed to `terminal.insert_before`.
+    //! These tests guarantee `stable_streaming_prefix_end` identifies
+    //! flushable boundaries.
+    use super::*;
+
+    #[test]
+    fn no_blank_line_yet_no_flush() {
+        assert_eq!(stable_streaming_prefix_end("hello world"), None);
+        assert_eq!(stable_streaming_prefix_end("one\ntwo\nthree"), None);
+    }
+
+    #[test]
+    fn single_blank_line_marks_flush_point() {
+        let s = "para one\n\npara two in progress";
+        let end = stable_streaming_prefix_end(s).expect("expected flush point");
+        // Everything up to and including the blank line is stable.
+        assert_eq!(&s[..end], "para one\n\n");
+        assert_eq!(&s[end..], "para two in progress");
+    }
+
+    #[test]
+    fn latest_blank_line_wins_across_multiple_paragraphs() {
+        let s = "p1\n\np2\n\np3 still streaming";
+        let end = stable_streaming_prefix_end(s).unwrap();
+        assert_eq!(&s[..end], "p1\n\np2\n\n");
+    }
+
+    #[test]
+    fn blank_line_inside_open_fence_is_not_a_flush_point() {
+        // Blank line between `code line 1` and `code line 2` is *inside*
+        // an open fence — flushing here would split the block and render
+        // a broken "…streaming" marker.
+        let s = "para\n\n```rust\nline1\n\nline2\n";
+        let end = stable_streaming_prefix_end(s).unwrap();
+        // Only the blank before the fence qualifies.
+        assert_eq!(&s[..end], "para\n\n");
+    }
+
+    #[test]
+    fn closed_fence_releases_later_blank_line() {
+        let s = "para1\n\n```rust\nlet x = 1;\n```\n\nmore";
+        let end = stable_streaming_prefix_end(s).unwrap();
+        // The blank AFTER the closed fence is the newer safe point.
+        assert_eq!(&s[..end], "para1\n\n```rust\nlet x = 1;\n```\n\n");
+    }
+
+    #[test]
+    fn blank_at_end_only_still_counts() {
+        let s = "hello\n\n";
+        let end = stable_streaming_prefix_end(s).unwrap();
+        assert_eq!(end, s.len());
     }
 }
 
