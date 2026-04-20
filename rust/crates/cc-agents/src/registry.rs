@@ -398,24 +398,19 @@ mod tests {
         {
             let mut registry = TaskRegistry::new(10);
             registry
-                .spawn(
-                    TaskKind::LocalBash,
-                    "sleeper".into(),
-                    token,
-                    async move {
-                        // If we ever get past this sleep, flip the sentinel.
-                        tokio::select! {
-                            _ = inner.cancelled() => {}
-                            _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                                sentinel_inner.store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
+                .spawn(TaskKind::LocalBash, "sleeper".into(), token, async move {
+                    // If we ever get past this sleep, flip the sentinel.
+                    tokio::select! {
+                        _ = inner.cancelled() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                            sentinel_inner.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
-                        Ok(TaskOutput {
-                            summary: "".into(),
-                            content: "".into(),
-                        })
-                    },
-                )
+                    }
+                    Ok(TaskOutput {
+                        summary: "".into(),
+                        content: "".into(),
+                    })
+                })
                 .unwrap();
             // `registry` goes out of scope here — Drop runs, the handle is
             // aborted, and the cancel token is fired.

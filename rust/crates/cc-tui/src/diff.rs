@@ -13,9 +13,11 @@
 //! change, per M5 scope.
 
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
+
+use crate::theme;
 
 /// Number of unchanged context lines shown around each hunk.
 pub const CONTEXT_LINES: usize = 2;
@@ -31,17 +33,18 @@ pub fn render_unified_diff(old: &str, new: &str) -> Vec<Line<'static>> {
     let ops = lcs_diff(&old_lines, &new_lines);
     let hunks = group_hunks(&ops, CONTEXT_LINES);
 
+    let theme = theme::current();
     let mut out: Vec<Line<'static>> = Vec::new();
     for (hi, hunk) in hunks.iter().enumerate() {
         if hi > 0 {
             // Visual separator between non-contiguous hunks.
             out.push(Line::from(Span::styled(
                 "...".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.subtle),
             )));
         }
         for op in hunk {
-            out.push(render_op(op));
+            out.push(render_op(op, &theme));
         }
     }
     out
@@ -54,19 +57,19 @@ enum Op {
     Add(String),
 }
 
-fn render_op(op: &Op) -> Line<'static> {
+fn render_op(op: &Op, theme: &theme::Theme) -> Line<'static> {
     match op {
         Op::Keep(s) => Line::from(vec![
-            Span::styled("  ".to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled("  ".to_string(), Style::default().fg(theme.subtle)),
             Span::raw(s.clone()),
         ]),
         Op::Del(s) => Line::from(vec![
-            Span::styled("- ".to_string(), Style::default().fg(Color::Red)),
-            Span::styled(s.clone(), Style::default().fg(Color::Red)),
+            Span::styled("- ".to_string(), Style::default().fg(theme.error)),
+            Span::styled(s.clone(), Style::default().fg(theme.error)),
         ]),
         Op::Add(s) => Line::from(vec![
-            Span::styled("+ ".to_string(), Style::default().fg(Color::Green)),
-            Span::styled(s.clone(), Style::default().fg(Color::Green)),
+            Span::styled("+ ".to_string(), Style::default().fg(theme.success)),
+            Span::styled(s.clone(), Style::default().fg(theme.success)),
         ]),
     }
 }
@@ -161,7 +164,7 @@ fn group_hunks(ops: &[Op], context: usize) -> Vec<Vec<Op>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
 
     fn line_to_plain(l: &Line<'_>) -> String {
         l.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -217,7 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn diff_colors_are_red_and_green() {
+    fn diff_colors_are_theme_error_and_success() {
+        // Anchor the colours to the active theme rather than a literal, so a
+        // palette swap (D1 → D6 light variant) does not silently break the
+        // diff renderer.
+        let theme = theme::current();
         let out = render_unified_diff("a", "b");
         let minus = out
             .iter()
@@ -227,10 +234,11 @@ mod tests {
             .iter()
             .find(|l| line_to_plain(l) == "+ b")
             .expect("plus row missing");
-        assert_eq!(minus.spans[0].style.fg, Some(Color::Red));
-        assert_eq!(plus.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(minus.spans[0].style.fg, Some(theme.error));
+        assert_eq!(plus.spans[0].style.fg, Some(theme.success));
         // The test also proves we didn't accidentally add BOLD everywhere.
         let _ = Modifier::BOLD;
+        let _ = Color::Red; // silence unused-import paranoia
     }
 
     #[test]

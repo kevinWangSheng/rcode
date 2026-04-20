@@ -412,6 +412,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         let tui_cancel = tokio_util::sync::CancellationToken::new();
         let tui_session_id = tui_engine.session().id.clone();
+
+        // Phase D welcome banner + status bar metadata. We re-collect git
+        // context here (cheap; same `git rev-parse --abbrev-ref HEAD` call
+        // build_system_blocks already runs) so the TUI shows the same
+        // branch the model sees. Outside a repo this is `None`.
+        let cwd_path = std::env::current_dir().ok();
+        let cwd_display = cwd_path.as_ref().map(|p| {
+            if let Some(home) = dirs::home_dir() {
+                if let Ok(rest) = p.strip_prefix(&home) {
+                    if rest.as_os_str().is_empty() {
+                        return "~".to_string();
+                    }
+                    return format!("~/{}", rest.display());
+                }
+            }
+            p.display().to_string()
+        });
+        let git_branch = if let Some(p) = &cwd_path {
+            cc_git::GitContext::collect(p).await.branch
+        } else {
+            None
+        };
+
         let cfg = TuiConfig {
             model: model.clone(),
             session_id: tui_session_id.clone(),
@@ -422,6 +445,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             command_ctx: cmd_ctx,
             events_tx,
             events_rx,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            cwd: cwd_display,
+            git_branch,
         };
         cc_tui::run_tui(cfg).await?;
         // §5.2: Fire SessionEnd hook with tight 1.5s timeout when TUI exits.

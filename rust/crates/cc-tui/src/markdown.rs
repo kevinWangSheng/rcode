@@ -297,10 +297,7 @@ fn render_inline(text: &str, base: Option<Style>) -> Vec<Span<'static>> {
                     label.to_string(),
                     base.fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
                 ));
-                spans.push(Span::styled(
-                    format!(" ({url})"),
-                    base.fg(Color::DarkGray),
-                ));
+                spans.push(Span::styled(format!(" ({url})"), base.fg(Color::DarkGray)));
                 i += consumed;
                 continue;
             }
@@ -359,8 +356,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            let para =
-                Paragraph::new(lines.to_vec()).wrap(ratatui::widgets::Wrap { trim: false });
+            let para = Paragraph::new(lines.to_vec()).wrap(ratatui::widgets::Wrap { trim: false });
             f.render_widget(para, f.area());
         })
         .unwrap();

@@ -1,7 +1,23 @@
-//! Ratatui rendering — pure function of `&App` plus a small theme.
+//! Ratatui rendering — pure function of `&App` plus the shared theme.
 //!
-//! All layout and styling lives here. Keeping this file free of `Tokio` /
-//! channels makes it easy to write golden-style tests with `TestBackend`.
+//! Phase D layout (top → bottom):
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────┐
+//! │ transcript (Min(0), unbordered, wraps, pinned bottom)│
+//! ├──────────────────────────────────────────────────────┤
+//! │ spinner row (Length 1) — verb + elapsed/tokens/cost  │
+//! ├──────────────────────────────────────────────────────┤
+//! │ PromptInput (Length 3) — bordered, dynamic colour    │
+//! ├──────────────────────────────────────────────────────┤
+//! │ help footer (Length 1) — mode-specific hints         │
+//! ├──────────────────────────────────────────────────────┤
+//! │ status bar (Length 1) — model · ctx · session · git  │
+//! └──────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Keeping this file free of `Tokio` / channels makes it easy to write
+//! golden-style tests with `TestBackend`.
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -14,42 +30,509 @@ use ratatui::{
 use crate::app::{App, AppMode, PendingPermission, TranscriptItem};
 use crate::diff::render_unified_diff;
 use crate::markdown::{minimal_mode_enabled, render_markdown};
+use crate::theme::{self, Theme};
+use crate::welcome;
 
-const TITLE_USER: &str = ">";
-const TITLE_CLAUDE: &str = "Claude:";
-const TITLE_INFO: &str = "i";
-const TITLE_BOUNDARY: &str = "-- compacted --";
+/// Reserved input-tokens budget used as the denominator for the "context
+/// used" percentage in the status bar. Mirrors the auto-compact threshold
+/// the engine uses so the value the user sees here matches the trigger.
+const CONTEXT_TOKEN_BUDGET: u64 = 180_000;
 
 pub fn render(frame: &mut Frame, app: &App) {
+    let theme = theme::current();
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // status bar
-            Constraint::Min(5),    // transcript
+            Constraint::Min(0),    // transcript
+            Constraint::Length(1), // spinner row
             Constraint::Length(3), // input box
+            Constraint::Length(1), // help footer
+            Constraint::Length(1), // status bar
         ])
         .split(frame.area());
 
-    render_status_bar(frame, app, chunks[0]);
-    render_transcript(frame, app, chunks[1]);
-    render_input(frame, app, chunks[2]);
+    render_transcript(frame, app, chunks[0], &theme);
+    render_spinner_row(frame, app, chunks[1], &theme);
+    render_input(frame, app, chunks[2], &theme);
+    render_help_footer(frame, app, chunks[3], &theme);
+    render_status_bar(frame, app, chunks[4], &theme);
 
     if app.mode == AppMode::CommandPalette {
-        render_command_palette(frame, app, chunks[2]);
+        render_command_palette(frame, app, chunks[2], &theme);
     }
 
     if let Some(perm) = &app.permission {
-        render_permission_modal(frame, perm, frame.area());
+        render_permission_modal(frame, perm, frame.area(), &theme);
     }
 }
 
-fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect) {
+// ─── transcript ────────────────────────────────────────────────────────────
+
+fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Empty session → render the welcome banner instead. Covers AC-V10.
+    // CC_TUI_MINIMAL skips the banner so scripted captures stay reproducible.
+    if app.is_empty_session() && !minimal_mode_enabled() {
+        let tip_seed = app.session_started.elapsed().as_secs() / 30;
+        lines.extend(welcome::render_welcome(
+            area.width,
+            &app.version,
+            &app.cwd,
+            tip_seed,
+        ));
+    }
+
+    for item in &app.transcript {
+        match item {
+            TranscriptItem::UserMessage(text) => {
+                push_user_message(&mut lines, text, theme);
+            }
+            TranscriptItem::AssistantText(text) => {
+                push_assistant_text(&mut lines, text);
+            }
+            TranscriptItem::ToolCall {
+                name,
+                input_summary,
+                raw_input,
+            } => {
+                push_tool_call(&mut lines, name, input_summary, raw_input, theme);
+            }
+            TranscriptItem::ToolResult {
+                name,
+                output,
+                is_error,
+            } => {
+                push_tool_result(&mut lines, name, output, *is_error, theme);
+            }
+            TranscriptItem::SystemNotice(text) => {
+                push_system_notice(&mut lines, text, theme);
+            }
+            TranscriptItem::CompactBoundary => {
+                push_compact_boundary(&mut lines, area.width, theme);
+            }
+        }
+    }
+
+    if !app.streaming_text.is_empty() || app.mode == AppMode::Streaming {
+        // Streaming text flows bare — no `Claude:` header per Phase D5.
+        if minimal_mode_enabled() {
+            for ln in app.streaming_text.lines() {
+                lines.push(Line::from(Span::raw(ln.to_string())));
+            }
+        } else {
+            lines.extend(render_markdown(&app.streaming_text));
+        }
+        if app.mode == AppMode::Streaming {
+            // Caret blink so users see the stream is alive even between
+            // token deltas.
+            lines.push(Line::from(Span::styled(
+                "▌",
+                Style::default()
+                    .fg(theme.claude_orange)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            )));
+        }
+    }
+
+    // Pin viewport to the bottom of the transcript by default.
+    let wrap_width = area.width.max(1) as usize;
+    let total_rows: usize = lines
+        .iter()
+        .map(|line| {
+            let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            char_count.div_ceil(wrap_width.max(1)).max(1)
+        })
+        .sum();
+    let viewport_rows = area.height as usize;
+    let max_scroll = total_rows.saturating_sub(viewport_rows) as u16;
+    let y_scroll = max_scroll.saturating_sub(app.scroll);
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((y_scroll, 0));
+    frame.render_widget(para, area);
+}
+
+// Phase D5 gutter conventions:
+//   user      → `>` claude-orange + text, intra-message indent of 2
+//   assistant → no prefix; markdown content flows bare
+//   tool      → `⏺` + tool-color name + (preview) + trailing tick
+//   system    → `ⓘ` warning-yellow + text
+//   compact   → centered `── compacted ──` dim italic
+fn push_user_message(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme) {
+    let mut text_lines = text.lines();
+    if let Some(first) = text_lines.next() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "> ".to_string(),
+                Style::default()
+                    .fg(theme.claude_orange)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(first.to_string()),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "> ".to_string(),
+            Style::default()
+                .fg(theme.claude_orange)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    for ln in text_lines {
+        lines.push(Line::from(Span::raw(format!("  {ln}"))));
+    }
+    lines.push(Line::from(""));
+}
+
+fn push_assistant_text(lines: &mut Vec<Line<'static>>, text: &str) {
+    if minimal_mode_enabled() {
+        for ln in text.lines() {
+            lines.push(Line::from(Span::raw(ln.to_string())));
+        }
+    } else {
+        lines.extend(render_markdown(text));
+    }
+    lines.push(Line::from(""));
+}
+
+fn push_tool_call(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    input_summary: &str,
+    raw_input: &serde_json::Value,
+    theme: &Theme,
+) {
+    if minimal_mode_enabled() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[Tool: {name}] "),
+                Style::default()
+                    .fg(theme.tool_color(name))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(input_summary.to_string(), Style::default().fg(theme.dim)),
+        ]));
+        return;
+    }
+
+    lines.push(render_tool_header(name, input_summary, theme));
+
+    // Edit: render unified diff if the raw input has both old/new strings.
+    if matches!(name, "Edit" | "MultiEdit") {
+        if let (Some(old), Some(new)) = (
+            raw_input.get("old_string").and_then(|v| v.as_str()),
+            raw_input.get("new_string").and_then(|v| v.as_str()),
+        ) {
+            for dline in render_unified_diff(old, new) {
+                let mut spans: Vec<Span<'static>> = vec![Span::raw("  ".to_string())];
+                spans.extend(dline.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+    }
+}
+
+fn push_tool_result(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    output: &str,
+    is_error: bool,
+    theme: &Theme,
+) {
+    if minimal_mode_enabled() {
+        let color = if is_error { theme.error } else { theme.dim };
+        let prefix = if is_error { "[Error] " } else { "[Result] " };
+        let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
+        let truncated = output.lines().count() > 5;
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{preview}"),
+            Style::default().fg(color),
+        )));
+        if truncated {
+            lines.push(Line::from(Span::styled(
+                "  ... (truncated)",
+                Style::default().fg(theme.dim),
+            )));
+        }
+        lines.push(Line::from(""));
+        return;
+    }
+
+    let mark = if is_error { "✗" } else { "✓" };
+    let mark_color = if is_error { theme.error } else { theme.success };
+
+    // First line carries the tick + prefix; subsequent lines indent so the
+    // card reads as a block even when the output is multi-line.
+    let mut iter = output.lines().take(5);
+    if let Some(first) = iter.next() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {mark} "),
+                Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(first.to_string(), tool_output_style(theme, is_error)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("  {mark} (empty)"),
+            Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
+        )));
+    }
+    for ln in iter {
+        lines.push(Line::from(vec![
+            Span::raw("    ".to_string()),
+            Span::styled(ln.to_string(), tool_output_style(theme, is_error)),
+        ]));
+    }
+    if output.lines().count() > 5 {
+        lines.push(Line::from(Span::styled(
+            "    … (truncated)".to_string(),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    let _ = name; // tool_color(name) currently feeds the header; body stays neutral.
+    lines.push(Line::from(""));
+}
+
+fn push_system_notice(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme) {
+    let mut text_lines = text.lines();
+    if let Some(first) = text_lines.next() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "ⓘ  ".to_string(),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(first.to_string(), Style::default().fg(theme.warning)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "ⓘ".to_string(),
+            Style::default().fg(theme.warning),
+        )));
+    }
+    for ln in text_lines {
+        lines.push(Line::from(Span::styled(
+            format!("   {ln}"),
+            Style::default().fg(theme.warning),
+        )));
+    }
+    lines.push(Line::from(""));
+}
+
+fn push_compact_boundary(lines: &mut Vec<Line<'static>>, width: u16, theme: &Theme) {
+    // Center "── compacted ──" within the viewport width using ─ runs that
+    // give the divider a visible "rule" feel.
+    let label = " compacted ";
+    let total = width.max(label.len() as u16 + 4) as usize;
+    let dashes = (total - label.len()) / 2;
+    let bar = format!(
+        "{l}{label}{r}",
+        l = "─".repeat(dashes),
+        r = "─".repeat(total - label.len() - dashes),
+    );
+    lines.push(Line::from(Span::styled(
+        bar,
+        Style::default()
+            .fg(theme.subtle)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    lines.push(Line::from(""));
+}
+
+fn tool_output_style(theme: &Theme, is_error: bool) -> Style {
+    if is_error {
+        Style::default().fg(theme.error)
+    } else {
+        Style::default().fg(theme.text)
+    }
+}
+
+fn render_tool_header(name: &str, preview: &str, theme: &Theme) -> Line<'static> {
+    // `⏺ ToolName(preview_args)` per M5 Phase B + theme colours per D1.
+    let color = theme.tool_color(name);
+    let preview = preview.lines().next().unwrap_or("").to_string();
+    Line::from(vec![
+        Span::styled(
+            "⏺ ".to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("(".to_string(), Style::default().fg(theme.subtle)),
+        Span::styled(preview, Style::default().fg(theme.text)),
+        Span::styled(")".to_string(), Style::default().fg(theme.subtle)),
+    ])
+}
+
+// ─── spinner row (D6) ──────────────────────────────────────────────────────
+
+fn render_spinner_row(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    if app.stream_started_at.is_none() {
+        // Idle — keep the row blank so the layout stays stable but the
+        // user sees no flicker between turns.
+        return;
+    }
+
+    let glyph = app.spinner_glyph();
+    let verb = app.spinner_verb().unwrap_or("Working…");
+    let elapsed = app.turn_elapsed_secs().unwrap_or(0);
+    let cost = app.status.estimated_cost_usd;
+    let in_t = app.status.input_tokens;
+    let out_t = app.status.output_tokens;
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
+    spans.push(Span::styled(
+        format!("{glyph} "),
+        Style::default()
+            .fg(theme.claude_orange)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        verb.to_string(),
+        Style::default()
+            .fg(theme.claude_orange)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!("   {elapsed}s"),
+        Style::default().fg(theme.dim),
+    ));
+    spans.push(Span::styled(
+        format!(
+            " · ↑ {} ↓ {}",
+            crate::app::format_tokens_pub(in_t),
+            crate::app::format_tokens_pub(out_t),
+        ),
+        Style::default().fg(theme.dim),
+    ));
+    spans.push(Span::styled(
+        format!(" · ${cost:.4}"),
+        Style::default().fg(theme.dim),
+    ));
+    if app.queued_count() > 0 {
+        spans.push(Span::styled(
+            format!("   (+{} queued)", app.queued_count()),
+            Style::default().fg(theme.warning),
+        ));
+    }
+
+    let para = Paragraph::new(Line::from(spans));
+    frame.render_widget(para, area);
+}
+
+// ─── input box (D4) ────────────────────────────────────────────────────────
+
+fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let border_color = match app.mode {
+        AppMode::Input | AppMode::CommandPalette => theme.dim,
+        AppMode::Streaming => theme.claude_orange,
+        AppMode::PermissionPrompt => theme.permission_blue,
+    };
+
+    // Inner content: gutter glyph + buffer (or placeholder when idle/empty).
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
+    spans.push(Span::styled(
+        "> ".to_string(),
+        Style::default()
+            .fg(theme.claude_orange)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if app.input.is_empty() && app.mode == AppMode::Input {
+        spans.push(Span::styled(
+            "Ask Claude…".to_string(),
+            Style::default()
+                .fg(theme.dim)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        spans.push(Span::styled(
+            app.input.clone(),
+            Style::default().fg(theme.text),
+        ));
+    }
+
+    let para = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color)),
+    );
+    frame.render_widget(para, area);
+}
+
+// ─── help footer (D4) ──────────────────────────────────────────────────────
+
+fn render_help_footer(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let text = match app.mode {
+        AppMode::Input => "? for shortcuts  ·  / for commands  ·  @ for files  ·  ! for bash",
+        AppMode::Streaming => "esc to interrupt  ·  ctrl+c to cancel",
+        AppMode::PermissionPrompt => "y allow  ·  a always  ·  n deny",
+        AppMode::CommandPalette => "↑↓ select  ·  tab/enter accept  ·  esc cancel",
+    };
+    let para = Paragraph::new(Line::from(Span::styled(
+        format!(" {text}"),
+        Style::default()
+            .fg(theme.dim)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    frame.render_widget(para, area);
+}
+
+// ─── bottom status bar (D7) ────────────────────────────────────────────────
+
+fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let pct = if app.status.input_tokens == 0 {
+        0
+    } else {
+        ((app.status.input_tokens.min(CONTEXT_TOKEN_BUDGET) * 100) / CONTEXT_TOKEN_BUDGET) as u32
+    };
+    let mut parts: Vec<String> = vec![
+        app.status.model.clone(),
+        format!("{pct}% context"),
+        format!("session {}", short_session(&app.session_id)),
+    ];
+    if let Some(branch) = &app.git_branch {
+        parts.push(branch.clone());
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(
+                "  ·  ".to_string(),
+                Style::default().fg(theme.subtle),
+            ));
+        }
+        spans.push(Span::styled(part.clone(), Style::default().fg(theme.dim)));
+    }
+
+    if let Some(hint) = &app.status_hint {
+        spans.push(Span::styled(
+            format!("    {hint}"),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+
+    let para = Paragraph::new(Line::from(spans));
+    frame.render_widget(para, area);
+}
+
+// ─── command palette popup ─────────────────────────────────────────────────
+
+fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect, theme: &Theme) {
     let n = app.palette_matches.len().min(8) as u16;
     if n == 0 {
         return;
     }
     let popup_height = n + 2; // +2 for the border.
-    // Float the popup directly above the input box.
     let width = input_area.width.clamp(20, 50);
     let x = input_area.x;
     let y = input_area.y.saturating_sub(popup_height);
@@ -66,10 +549,10 @@ fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect) {
         let style = if i == app.palette_selected {
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(theme.claude_orange)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.text)
         };
         rows.push(Line::from(Span::styled(format!(" /{name} "), style)));
     }
@@ -78,303 +561,14 @@ fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(" Commands ")
-            .style(Style::default().fg(Color::Cyan)),
+            .style(Style::default().fg(theme.claude_orange)),
     );
     frame.render_widget(para, area);
 }
 
-fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    // Build the status bar as a sequence of spans so the spinner glyph can
-    // carry its own color (green while streaming) without re-styling the
-    // whole line. The baseline line reads:
-    //   ⠋ model: ... | tokens: in/out | $cost | turns: N [| (+N queued)] [| hint]
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let glyph = app.spinner_glyph();
-    if !glyph.is_empty() {
-        spans.push(Span::styled(
-            format!("{glyph} "),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    spans.push(Span::styled(
-        app.status.format(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
-    ));
-    let queued = app.queued_count();
-    if queued > 0 {
-        spans.push(Span::styled(
-            format!(" | (+{queued} queued)"),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    if let Some(hint) = &app.status_hint {
-        spans.push(Span::styled(
-            format!(" | {hint}"),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    }
-    let para = Paragraph::new(Line::from(spans));
-    frame.render_widget(para, area);
-}
+// ─── permission modal ──────────────────────────────────────────────────────
 
-fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
-    for item in &app.transcript {
-        match item {
-            TranscriptItem::UserMessage(text) => {
-                let mut text_lines = text.lines();
-                if let Some(first) = text_lines.next() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{TITLE_USER} "),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(first.to_string()),
-                    ]));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("{TITLE_USER} "),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                }
-                for ln in text_lines {
-                    lines.push(Line::from(Span::raw(format!("  {ln}"))));
-                }
-                lines.push(Line::from(""));
-            }
-            TranscriptItem::AssistantText(text) => {
-                lines.push(Line::from(Span::styled(
-                    TITLE_CLAUDE,
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                if minimal_mode_enabled() {
-                    for ln in text.lines() {
-                        lines.push(Line::from(Span::raw(ln.to_string())));
-                    }
-                } else {
-                    lines.extend(render_markdown(text));
-                }
-                lines.push(Line::from(""));
-            }
-            TranscriptItem::ToolCall {
-                name,
-                input_summary,
-                raw_input,
-            } => {
-                if minimal_mode_enabled() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("[Tool: {name}] "),
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            input_summary.to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
-                } else {
-                    lines.push(render_tool_header(name, input_summary));
-                    // Edit: show a unified diff of old_string → new_string if
-                    // the raw input has both fields.
-                    if name == "Edit" {
-                        if let (Some(old), Some(new)) = (
-                            raw_input
-                                .get("old_string")
-                                .and_then(|v| v.as_str()),
-                            raw_input
-                                .get("new_string")
-                                .and_then(|v| v.as_str()),
-                        ) {
-                            for dline in render_unified_diff(old, new) {
-                                let mut spans: Vec<Span<'static>> =
-                                    vec![Span::raw("  ".to_string())];
-                                spans.extend(dline.spans);
-                                lines.push(Line::from(spans));
-                            }
-                        }
-                    }
-                }
-            }
-            TranscriptItem::ToolResult {
-                name,
-                output,
-                is_error,
-            } => {
-                if minimal_mode_enabled() {
-                    let color = if *is_error {
-                        Color::Red
-                    } else {
-                        Color::DarkGray
-                    };
-                    let prefix = if *is_error { "[Error] " } else { "[Result] " };
-                    let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
-                    let truncated = output.lines().count() > 5;
-                    lines.push(Line::from(Span::styled(
-                        format!("{prefix}{preview}"),
-                        Style::default().fg(color),
-                    )));
-                    if truncated {
-                        lines.push(Line::from(Span::styled(
-                            "  ... (truncated)",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    lines.push(Line::from(""));
-                } else {
-                    let mark = if *is_error { "✗" } else { "✓" };
-                    let mark_color = if *is_error { Color::Red } else { Color::Green };
-                    // First result line carries the tick; subsequent lines are
-                    // indented so the card reads as a block even when the
-                    // output is multi-line.
-                    let mut iter = output.lines().take(5);
-                    if let Some(first) = iter.next() {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("  {mark} "),
-                                Style::default()
-                                    .fg(mark_color)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(first.to_string(), tool_output_style(name, *is_error)),
-                        ]));
-                    } else {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {mark} (empty)"),
-                            Style::default()
-                                .fg(mark_color)
-                                .add_modifier(Modifier::BOLD),
-                        )));
-                    }
-                    for ln in iter {
-                        lines.push(Line::from(vec![
-                            Span::raw("    ".to_string()),
-                            Span::styled(ln.to_string(), tool_output_style(name, *is_error)),
-                        ]));
-                    }
-                    if output.lines().count() > 5 {
-                        lines.push(Line::from(Span::styled(
-                            "    … (truncated)".to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    lines.push(Line::from(""));
-                }
-            }
-            TranscriptItem::SystemNotice(text) => {
-                let mut text_lines = text.lines();
-                if let Some(first) = text_lines.next() {
-                    lines.push(Line::from(Span::styled(
-                        format!("{TITLE_INFO} {first}"),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        TITLE_INFO.to_string(),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                }
-                for ln in text_lines {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {ln}"),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                }
-                lines.push(Line::from(""));
-            }
-            TranscriptItem::CompactBoundary => {
-                lines.push(Line::from(Span::styled(
-                    TITLE_BOUNDARY,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )));
-                lines.push(Line::from(""));
-            }
-        }
-    }
-
-    if !app.streaming_text.is_empty() || app.mode == AppMode::Streaming {
-        lines.push(Line::from(Span::styled(
-            TITLE_CLAUDE,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )));
-        if minimal_mode_enabled() {
-            for ln in app.streaming_text.lines() {
-                lines.push(Line::from(Span::raw(ln.to_string())));
-            }
-        } else {
-            lines.extend(render_markdown(&app.streaming_text));
-        }
-        if app.mode == AppMode::Streaming {
-            lines.push(Line::from(Span::styled(
-                "|",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            )));
-        }
-    }
-
-    // Pin viewport to the bottom of the transcript by default.
-    let wrap_width = (area.width.saturating_sub(2)) as usize;
-    let total_rows: usize = if wrap_width == 0 {
-        lines.len()
-    } else {
-        lines
-            .iter()
-            .map(|line| {
-                let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-                char_count.div_ceil(wrap_width).max(1)
-            })
-            .sum()
-    };
-    let viewport_rows = area.height.saturating_sub(2) as usize;
-    let max_scroll = total_rows.saturating_sub(viewport_rows) as u16;
-    let y_scroll = max_scroll.saturating_sub(app.scroll);
-
-    let title = format!(" Claude -- session {} ", short_session(&app.session_id));
-    let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false })
-        .scroll((y_scroll, 0));
-    frame.render_widget(para, area);
-}
-
-fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let title = match app.mode {
-        AppMode::Input => " Input  (Enter to send  |  / for commands) ",
-        AppMode::Streaming => " Input  (streaming -- Enter queues  |  Ctrl+C aborts) ",
-        AppMode::PermissionPrompt => " Input  (permission prompt -- please respond) ",
-        AppMode::CommandPalette => " Input  (/ command autocomplete) ",
-    };
-    let style = match app.mode {
-        AppMode::Input | AppMode::CommandPalette => Style::default().fg(Color::White),
-        AppMode::Streaming => Style::default().fg(Color::Yellow),
-        AppMode::PermissionPrompt => Style::default().fg(Color::DarkGray),
-    };
-    let para = Paragraph::new(app.input.as_str())
-        .style(style)
-        .block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(para, area);
-}
-
-fn render_permission_modal(frame: &mut Frame, perm: &PendingPermission, area: Rect) {
+fn render_permission_modal(frame: &mut Frame, perm: &PendingPermission, area: Rect, theme: &Theme) {
     let modal = centered_rect(60, 30, area);
     frame.render_widget(Clear, modal);
 
@@ -382,15 +576,15 @@ fn render_permission_modal(frame: &mut Frame, perm: &PendingPermission, area: Re
         Line::from(Span::styled(
             format!("Tool: {}", perm.tool_name),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.permission_blue)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(perm.summary.as_str()),
+        Line::from(perm.summary.as_str().to_string()),
         Line::from(""),
         Line::from(Span::styled(
             "[y] Allow once    [a] Always allow    [n / Esc] Reject",
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text),
         )),
     ];
 
@@ -400,7 +594,7 @@ fn render_permission_modal(frame: &mut Frame, perm: &PendingPermission, area: Re
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Permission required ")
-                .style(Style::default().fg(Color::Yellow)),
+                .style(Style::default().fg(theme.permission_blue)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(para, modal);
@@ -426,50 +620,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Color assigned to a tool card based on the tool name. Matches M5 scope:
-/// Bash=green, Edit=yellow, Read=blue, Grep/Glob=cyan, Web*=magenta, MCP=
-/// dim-white (DarkGray), fallback=magenta to stay visible.
-fn tool_color(name: &str) -> Color {
-    match name {
-        "Bash" => Color::Green,
-        "Edit" | "Write" => Color::Yellow,
-        "Read" => Color::Blue,
-        "Grep" | "Glob" => Color::Cyan,
-        "WebFetch" | "WebSearch" => Color::Magenta,
-        n if n.contains("::") => Color::Gray, // MCP server::tool
-        _ => Color::Magenta,
-    }
-}
-
-fn tool_output_style(name: &str, is_error: bool) -> Style {
-    if is_error {
-        Style::default().fg(Color::Red)
-    } else {
-        // Neutral text for the body; the header carries the tool color.
-        let _ = tool_color(name);
-        Style::default().fg(Color::White)
-    }
-}
-
-fn render_tool_header(name: &str, preview: &str) -> Line<'static> {
-    // `⏺ ToolName(preview_args)` per M5 Phase B.
-    let color = tool_color(name);
-    let preview = preview.lines().next().unwrap_or("").to_string();
-    Line::from(vec![
-        Span::styled(
-            "⏺ ".to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            name.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("(".to_string(), Style::default().fg(Color::DarkGray)),
-        Span::styled(preview, Style::default().fg(Color::White)),
-        Span::styled(")".to_string(), Style::default().fg(Color::DarkGray)),
-    ])
-}
-
 fn short_session(id: &str) -> &str {
     if id.len() > 8 {
         &id[..8]
@@ -486,88 +636,18 @@ mod tests {
 
     use crate::app::{App, PendingPermission};
 
-    #[test]
-    fn renders_empty_app_without_panic() {
-        let backend = TestBackend::new(80, 24);
+    /// Render `app` into an 80×24 `TestBackend` and return the rendered
+    /// buffer as a UTF-8 grid (one row per line). Used by every render-tier
+    /// acceptance test in this module.
+    fn render_to_string(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
-        let app = App::new("abcdef1234".into(), "test-model".into());
-        term.draw(|f| render(f, &app)).unwrap();
-        let buf = term.backend().buffer().clone();
-        let s = buffer_to_string(&buf);
-        assert!(
-            s.contains("abcdef12"),
-            "title bar missing session id; got:\n{s}"
-        );
+        term.draw(|f| render(f, app)).unwrap();
+        buffer_to_string(term.backend().buffer())
     }
 
-    #[test]
-    fn renders_streaming_text_and_cursor() {
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into(), "m".into());
-        app.start_stream();
-        app.on_token("hello world");
-        term.draw(|f| render(f, &app)).unwrap();
-        let s = buffer_to_string(term.backend().buffer());
-        assert!(s.contains("hello world"));
-    }
-
-    #[test]
-    fn multiline_system_message_renders_on_separate_rows() {
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into(), "m".into());
-        app.push_system("Slash commands:\n  /help   show this help\n  /exit   quit".into());
-        term.draw(|f| render(f, &app)).unwrap();
-        let s = buffer_to_string(term.backend().buffer());
-        assert!(s.contains("Slash commands:"));
-        assert!(s.contains("/help"));
-        assert!(s.contains("/exit"));
-    }
-
-    #[test]
-    fn long_transcript_pins_latest_content_to_bottom() {
-        let backend = TestBackend::new(80, 10);
-        let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into(), "m".into());
-        for i in 0..40 {
-            app.push_user(format!("user message number {i}"));
-        }
-        app.scroll = 0;
-        term.draw(|f| render(f, &app)).unwrap();
-        let s = buffer_to_string(term.backend().buffer());
-        assert!(
-            s.contains("user message number 39"),
-            "latest message should be visible at the bottom; got:\n{s}"
-        );
-    }
-
-    #[test]
-    fn renders_permission_modal_when_set() {
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into(), "m".into());
-        app.permission = Some(PendingPermission {
-            tool_name: "Write".into(),
-            summary: "/tmp/foo.txt".into(),
-        });
-        term.draw(|f| render(f, &app)).unwrap();
-        let s = buffer_to_string(term.backend().buffer());
-        assert!(s.contains("Permission required"));
-        assert!(s.contains("Write"));
-    }
-
-    #[test]
-    fn renders_tool_call_and_result() {
-        let backend = TestBackend::new(80, 24);
-        let mut term = Terminal::new(backend).unwrap();
-        let mut app = App::new("s".into(), "m".into());
-        app.push_tool_call("Bash".into(), "ls -la".into());
-        app.push_tool_result("Bash".into(), "file1.rs\nfile2.rs".into(), false);
-        term.draw(|f| render(f, &app)).unwrap();
-        let s = buffer_to_string(term.backend().buffer());
-        assert!(s.contains("Bash"));
-        assert!(s.contains("ls -la"));
+    fn rows(s: &str) -> Vec<&str> {
+        s.split_inclusive('\n').collect()
     }
 
     fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
@@ -580,5 +660,241 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    /// AC-V9 — the bordered "Claude -- session …" title is gone, the help
+    /// footer is at row height-2, and the model name is on the bottom row.
+    #[test]
+    fn idle_layout_has_no_title_and_pinned_footer_and_status() {
+        let app = App::new("abcdef1234".into(), "claude-sonnet-4-6".into());
+        let s = render_to_string(&app, 80, 24);
+        assert!(
+            !s.contains("Claude -- session"),
+            "old bordered title must be gone:\n{s}"
+        );
+        let r = rows(&s);
+        // Help footer at height-2, model at height-1.
+        assert!(
+            r[22].contains('?') || r[22].contains('/'),
+            "expected hint chars at row 22: {:?}",
+            r[22]
+        );
+        assert!(
+            r[23].contains("claude-sonnet-4-6"),
+            "expected model at row 23: {:?}",
+            r[23]
+        );
+    }
+
+    /// AC-V10 — empty session shows the welcome banner with version, cwd,
+    /// and at least one tip. Pushing a user message hides the banner.
+    #[test]
+    fn empty_session_shows_welcome_banner_then_disappears() {
+        let mut app = App::new("s".into(), "m".into());
+        app.set_version("0.1.0");
+        app.set_cwd("~/dev/cc-rust");
+        let s = render_to_string(&app, 80, 24);
+        assert!(s.contains("Welcome to Claude Code"), "{s}");
+        assert!(s.contains("v0.1.0"), "{s}");
+        assert!(s.contains("cwd: ~/dev/cc-rust"), "{s}");
+        let mentions_a_tip = welcome::TIPS.iter().any(|t| s.contains(t));
+        assert!(mentions_a_tip, "expected at least one tip; got:\n{s}");
+
+        app.push_user("hi".into());
+        let s2 = render_to_string(&app, 80, 24);
+        assert!(
+            !s2.contains("Welcome to Claude Code"),
+            "welcome must hide once a turn starts:\n{s2}"
+        );
+    }
+
+    /// AC-V11 — each `AppMode` produces the matching footer hint string at
+    /// row height-2.
+    #[test]
+    fn footer_hint_matches_mode() {
+        let mut app = App::new("s".into(), "m".into());
+
+        // Input
+        let s = render_to_string(&app, 80, 24);
+        assert!(rows(&s)[22].contains("? for shortcuts"));
+
+        // Streaming
+        app.start_stream();
+        let s = render_to_string(&app, 80, 24);
+        assert!(rows(&s)[22].contains("esc to interrupt"));
+
+        // PermissionPrompt
+        app.mode = AppMode::PermissionPrompt;
+        app.permission = Some(PendingPermission {
+            tool_name: "Write".into(),
+            summary: "/tmp/foo".into(),
+        });
+        let s = render_to_string(&app, 80, 24);
+        assert!(rows(&s)[22].contains("y allow"));
+
+        // CommandPalette
+        app.permission = None;
+        app.mode = AppMode::CommandPalette;
+        let s = render_to_string(&app, 80, 24);
+        assert!(rows(&s)[22].contains("↑↓ select"));
+    }
+
+    /// AC-V11 bonus — typing into the input shows the claude-orange `>`
+    /// gutter prefix.
+    #[test]
+    fn input_box_shows_orange_gutter() {
+        let mut app = App::new("s".into(), "m".into());
+        app.input.push_str("hello");
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        // Input row is layout slot 2 (transcript Min(0) + spinner 1 + input top
+        // border). At height=24, slot 2 starts at y = 18 + 1 = 19; the inner
+        // text row is y = 20.
+        let theme = theme::current();
+        let cell = buf[(1u16, 20u16)].clone();
+        assert_eq!(cell.symbol(), ">", "missing > gutter glyph at (1,20)");
+        assert_eq!(cell.fg, theme.claude_orange);
+    }
+
+    /// AC-V12-style anchor — a 4-turn fixture renders the gutter conventions
+    /// (no `Claude:` header, `>` on user, `⏺` on tool, `✓`/`✗` ticks, `──
+    /// compacted ──` divider).
+    #[test]
+    fn gutter_conventions_render_for_four_turn_fixture() {
+        let mut app = App::new("s".into(), "claude-sonnet-4-6".into());
+        app.push_user("first".into());
+        app.transcript
+            .push(crate::app::TranscriptItem::AssistantText("answer".into()));
+        app.push_tool_call("Bash".into(), "ls".into());
+        app.push_tool_result("Bash".into(), "file1\nfile2".into(), false);
+        app.push_compact_boundary();
+        app.push_tool_call("Edit".into(), "foo.rs".into());
+        app.push_tool_result("Edit".into(), "patch failed".into(), true);
+
+        let s = render_to_string(&app, 80, 30);
+        assert!(
+            !s.contains("Claude:"),
+            "assistant header must be gone:\n{s}"
+        );
+        assert!(s.contains("> first"), "user gutter missing:\n{s}");
+        assert!(s.contains("⏺"), "tool bullet missing:\n{s}");
+        assert!(s.contains("✓"), "success tick missing:\n{s}");
+        assert!(s.contains("✗"), "error tick missing:\n{s}");
+        assert!(s.contains("compacted"), "compact divider missing:\n{s}");
+    }
+
+    /// AC-V13 — within the same redraw that started a stream, the spinner
+    /// row carries a verb. After `finish_stream` the row is blank again.
+    #[test]
+    fn spinner_row_appears_during_stream_and_clears_after() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        let s = render_to_string(&app, 80, 24);
+        // Spinner row is layout slot 1 (after Min(0) transcript). At h=24 it
+        // sits at y = 24 - 6 = 18 (1 spinner + 3 input + 1 footer + 1 status).
+        let r = rows(&s);
+        let spinner_line = r[18];
+        let mentions_a_verb = ["Thinking", "Pondering", "Cogitating", "Working"]
+            .iter()
+            .any(|v| spinner_line.contains(v));
+        assert!(
+            mentions_a_verb,
+            "spinner row must show a verb during stream: {spinner_line:?}"
+        );
+
+        app.finish_stream();
+        let s = render_to_string(&app, 80, 24);
+        let r = rows(&s);
+        // Spinner row blank: should not contain any verb.
+        let any_verb = ["Thinking", "Pondering", "Cogitating", "Working"]
+            .iter()
+            .any(|v| r[18].contains(v));
+        assert!(
+            !any_verb,
+            "spinner row must be blank after stream: {:?}",
+            r[18]
+        );
+    }
+
+    /// AC-V14 — the bottom-row status bar surfaces the model name plus
+    /// session and (when set) git branch separated by ` · `.
+    #[test]
+    fn status_bar_shows_model_session_and_branch() {
+        let mut app = App::new("e11cf4bf1234".into(), "claude-sonnet-4-6".into());
+        app.set_git_branch(Some("phase3/implementation".into()));
+        let s = render_to_string(&app, 100, 24);
+        let r = rows(&s);
+        let last = r[23];
+        assert!(last.contains("claude-sonnet-4-6"), "{last}");
+        assert!(last.contains("session e11cf4bf"), "{last}");
+        assert!(last.contains("phase3/implementation"), "{last}");
+    }
+
+    // ─── Pre-existing render tests, updated for the new layout ─────────────
+
+    #[test]
+    fn renders_empty_app_without_panic() {
+        let app = App::new("abcdef1234".into(), "test-model".into());
+        let s = render_to_string(&app, 80, 24);
+        // Session id is no longer in a top title, but the bottom status bar
+        // still shows the truncated form.
+        assert!(s.contains("abcdef12"), "session id missing:\n{s}");
+    }
+
+    #[test]
+    fn renders_streaming_text_and_cursor() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        app.on_token("hello world");
+        let s = render_to_string(&app, 80, 24);
+        assert!(s.contains("hello world"));
+    }
+
+    #[test]
+    fn multiline_system_message_renders_on_separate_rows() {
+        let mut app = App::new("s".into(), "m".into());
+        app.push_system("Slash commands:\n  /help   show this help\n  /exit   quit".into());
+        let s = render_to_string(&app, 80, 24);
+        assert!(s.contains("Slash commands:"));
+        assert!(s.contains("/help"));
+        assert!(s.contains("/exit"));
+    }
+
+    #[test]
+    fn long_transcript_pins_latest_content_to_bottom() {
+        let mut app = App::new("s".into(), "m".into());
+        for i in 0..40 {
+            app.push_user(format!("user message number {i}"));
+        }
+        app.scroll = 0;
+        let s = render_to_string(&app, 80, 14);
+        assert!(
+            s.contains("user message number 39"),
+            "latest message should be visible at the bottom:\n{s}"
+        );
+    }
+
+    #[test]
+    fn renders_permission_modal_when_set() {
+        let mut app = App::new("s".into(), "m".into());
+        app.permission = Some(PendingPermission {
+            tool_name: "Write".into(),
+            summary: "/tmp/foo.txt".into(),
+        });
+        let s = render_to_string(&app, 80, 24);
+        assert!(s.contains("Permission required"));
+        assert!(s.contains("Write"));
+    }
+
+    #[test]
+    fn renders_tool_call_and_result() {
+        let mut app = App::new("s".into(), "m".into());
+        app.push_tool_call("Bash".into(), "ls -la".into());
+        app.push_tool_result("Bash".into(), "file1.rs\nfile2.rs".into(), false);
+        let s = render_to_string(&app, 80, 24);
+        assert!(s.contains("Bash"));
+        assert!(s.contains("ls -la"));
     }
 }

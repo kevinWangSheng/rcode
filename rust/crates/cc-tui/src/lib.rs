@@ -13,6 +13,8 @@ pub mod keybindings;
 pub mod markdown;
 pub mod prompter;
 pub mod render;
+pub mod theme;
+pub mod welcome;
 
 pub use action::{update, AppAction, UpdateContext, UpdateResult};
 pub use app::{App, AppMode, PendingPermission, StatusLine, TranscriptItem};
@@ -49,6 +51,14 @@ pub struct TuiConfig {
     pub events_tx: mpsc::Sender<CoreEvent>,
     /// Receiver half of the engine→TUI event channel.
     pub events_rx: mpsc::Receiver<CoreEvent>,
+    /// Binary version string (e.g. `0.1.0`) shown by the welcome banner
+    /// and `/version` command. Sourced from main's `CARGO_PKG_VERSION`.
+    pub version: String,
+    /// Abbreviated cwd shown by the welcome banner. `None` lets the App
+    /// derive the value itself from `current_dir()`.
+    pub cwd: Option<String>,
+    /// Optional git branch surfaced in the bottom status bar.
+    pub git_branch: Option<String>,
 }
 
 /// Entry point for the interactive TUI.
@@ -83,6 +93,14 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // Edits to ~/.claude/keybindings.json are picked up on demand via the
     // slash command (there is no file watcher — see the optional task 3.1).
     app.keybindings = Keybindings::load();
+    // Phase D metadata: version, cwd and git branch feed the welcome banner
+    // and the bottom status bar. None of these change during a session, so
+    // we set them once here.
+    app.set_version(config.version);
+    if let Some(cwd) = config.cwd {
+        app.set_cwd(cwd);
+    }
+    app.set_git_branch(config.git_branch);
     let commands = config.commands;
     let cmd_ctx = config.command_ctx;
     let update_ctx = UpdateContext {

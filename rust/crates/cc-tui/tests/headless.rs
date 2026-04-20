@@ -619,7 +619,10 @@ fn main() {}
     assert!(s.contains("italic"), "italic text missing: {s}");
     assert!(s.contains("code"), "inline code missing: {s}");
     assert!(s.contains("fn main() {}"), "fenced code body missing: {s}");
-    assert!(s.contains("rust"), "fenced code language label missing: {s}");
+    assert!(
+        s.contains("rust"),
+        "fenced code language label missing: {s}"
+    );
 }
 
 // ── M5 AC-V2: Spinner timing ─────────────────────────────────────────────────
@@ -741,19 +744,25 @@ fn acv3_tool_use_card_renders_with_color_and_no_raw_json() {
         "raw JSON key leaked onto screen: {s}"
     );
 
-    // Walk the ratatui back-buffer to confirm the "B" in "Bash" is green.
-    let mut found_green_bash = false;
+    // Walk the ratatui back-buffer to confirm the "B" in "Bash" carries the
+    // theme-defined Bash colour. Phase D moved the palette to a centralised
+    // `theme` module, so we anchor against that rather than `Color::Green`.
+    let bash_fg = cc_tui::theme::current().tool_color("Bash");
+    let mut found_bash_color = false;
     for y in 0..buf.area.height {
         for x in 0..buf.area.width.saturating_sub(1) {
             if buf[(x, y)].symbol() == "B" && buf[(x + 1, y)].symbol() == "a" {
-                if buf[(x, y)].fg == ratatui::style::Color::Green {
-                    found_green_bash = true;
+                if buf[(x, y)].fg == bash_fg {
+                    found_bash_color = true;
                 }
                 break;
             }
         }
     }
-    assert!(found_green_bash, "Bash header is not rendered in green");
+    assert!(
+        found_bash_color,
+        "Bash header is not rendered in theme.tool_color(\"Bash\") = {bash_fg:?}"
+    );
 }
 
 // ── M5 AC-V4: Edit diff ──────────────────────────────────────────────────────
@@ -836,24 +845,34 @@ fn acv4_edit_renders_unified_diff() {
     }
     assert!(after_ctx >= 2, "expected ≥2 context rows after plus");
 
-    // Color verification: walk the buffer and find a cell whose glyph is 'O'
-    // inside "- OLD" — it must carry red, and 'N' in "+ NEW" must carry green.
+    // Colour verification: walk the buffer and find a cell whose glyph is
+    // 'O' inside "- OLD" — it must carry the theme `error` colour, and 'N'
+    // in "+ NEW" must carry the theme `success` colour.
+    let theme = cc_tui::theme::current();
     let mut found_red_old = false;
     let mut found_green_new = false;
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
             let cell = &buf[(x, y)];
             let c = cell.symbol();
-            if c == "O" && cell.fg == ratatui::style::Color::Red {
+            if c == "O" && cell.fg == theme.error {
                 found_red_old = true;
             }
-            if c == "N" && cell.fg == ratatui::style::Color::Green {
+            if c == "N" && cell.fg == theme.success {
                 found_green_new = true;
             }
         }
     }
-    assert!(found_red_old, "- OLD not rendered in red");
-    assert!(found_green_new, "+ NEW not rendered in green");
+    assert!(
+        found_red_old,
+        "- OLD not rendered in theme.error = {:?}",
+        theme.error
+    );
+    assert!(
+        found_green_new,
+        "+ NEW not rendered in theme.success = {:?}",
+        theme.success
+    );
 }
 
 // ── M5 AC-V5: Slash-command picker ───────────────────────────────────────────
@@ -892,9 +911,7 @@ fn acv5_palette_lists_builtins_and_skills_and_tab_completes() {
     // Match list must include the documented builtins + the skill.
     for required in &["help", "memory", "clear", "demo-skill"] {
         assert!(
-            app.palette_matches
-                .iter()
-                .any(|n| n.as_str() == *required),
+            app.palette_matches.iter().any(|n| n.as_str() == *required),
             "palette missing required entry /{required}: {:?}",
             app.palette_matches
         );

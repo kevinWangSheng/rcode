@@ -2,6 +2,7 @@
 //! be unit-tested headlessly.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::time::Instant;
 
 use cc_core::PromptDecision;
@@ -94,6 +95,38 @@ impl StatusLine {
     }
 }
 
+/// Best-effort default for the welcome banner's `cwd:` line. Falls back to
+/// `?` when the process cannot read its own working directory, which keeps
+/// the renderer infallible.
+fn default_cwd_display() -> String {
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return "?".to_string(),
+    };
+    abbreviate_home(&cwd)
+}
+
+/// Replace the leading `$HOME` segment with `~` so the welcome banner stays
+/// readable on long paths. Used by [`default_cwd_display`] and tests.
+pub fn abbreviate_home(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// Public alias used by `render::render_spinner_row` to show running token
+/// totals in the spinner line. Exported instead of duplicating the
+/// kilo/mega formatting logic.
+pub fn format_tokens_pub(n: u64) -> String {
+    format_tokens(n)
+}
+
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -169,6 +202,21 @@ pub struct App {
     /// restore the buffer byte-for-byte without exposing the partial `/`
     /// filter to a reader.
     pub palette_original: Option<String>,
+    /// Binary version string surfaced in the welcome banner (`v0.1.0`). Set
+    /// by the entry point from `CARGO_PKG_VERSION`; tests construct an App
+    /// directly and inherit the cc-tui crate version.
+    pub version: String,
+    /// Working directory at startup, abbreviated for display (`~/dev/foo`).
+    /// Stored for the welcome banner under D3.
+    pub cwd: String,
+    /// Optional git branch lifted from the `cc_git::GitContext` already
+    /// loaded by main. `None` outside a repo or when git is unavailable.
+    /// Surfaced by the bottom status bar under D7.
+    pub git_branch: Option<String>,
+    /// Wall-clock at App construction. Used as a stable seed for the
+    /// welcome-tip rotation under D3, so the same tip stays on screen for
+    /// 30 s windows without depending on a live timer.
+    pub session_started: Instant,
 }
 
 impl App {
@@ -195,7 +243,69 @@ impl App {
             palette_matches: Vec::new(),
             palette_selected: 0,
             palette_original: None,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            cwd: default_cwd_display(),
+            git_branch: None,
+            session_started: Instant::now(),
         }
+    }
+
+    /// Set the binary version surfaced in the welcome banner. Idempotent —
+    /// callers (main.rs) typically pass the parent crate's
+    /// `CARGO_PKG_VERSION`; tests can leave the cc-tui default in place.
+    pub fn set_version(&mut self, version: impl Into<String>) {
+        self.version = version.into();
+    }
+
+    /// Set the abbreviated cwd shown by the welcome banner. Path is taken
+    /// verbatim — the caller is expected to apply any `$HOME → ~`
+    /// abbreviation it wants.
+    pub fn set_cwd(&mut self, cwd: impl Into<String>) {
+        self.cwd = cwd.into();
+    }
+
+    /// Set the git branch surfaced in the bottom status bar. Pass `None` to
+    /// hide the segment (default for non-repo cwds).
+    pub fn set_git_branch(&mut self, branch: Option<String>) {
+        self.git_branch = branch;
+    }
+
+    /// Empty-session predicate: no transcript items, no streaming text in
+    /// flight. Phase D3 uses this to decide whether to render the welcome
+    /// banner instead of the (empty) transcript.
+    pub fn is_empty_session(&self) -> bool {
+        self.transcript.is_empty() && self.streaming_text.is_empty()
+    }
+
+    /// Streaming verb cycled through every 3 s from the start of the
+    /// current turn. Returns `None` when no stream is active so the spinner
+    /// row can stay blank between turns.
+    ///
+    /// The verb list is a curated, English-friendly subset of the official
+    /// `SPINNER_VERBS` table — full 200+ entry parity is deferred.
+    pub fn spinner_verb(&self) -> Option<&'static str> {
+        const VERBS: &[&str] = &[
+            "Thinking…",
+            "Pondering…",
+            "Cogitating…",
+            "Musing…",
+            "Reflecting…",
+            "Brewing…",
+            "Crafting…",
+            "Computing…",
+            "Reasoning…",
+            "Working…",
+            "Considering…",
+            "Synthesizing…",
+        ];
+        let started = self.stream_started_at?;
+        let bucket = (started.elapsed().as_secs() / 3) as usize;
+        Some(VERBS[bucket % VERBS.len()])
+    }
+
+    /// Elapsed seconds in the current turn, or `None` if no turn is active.
+    pub fn turn_elapsed_secs(&self) -> Option<u64> {
+        self.stream_started_at.map(|t| t.elapsed().as_secs())
     }
 
     /// Current spinner glyph. Returns an empty string when no stream is
