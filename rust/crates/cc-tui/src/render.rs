@@ -150,6 +150,28 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         })
         .sum();
     let viewport_rows = area.height as usize;
+
+    // Chat UX: latest content sits just above the input box. When the
+    // transcript is *taller* than the viewport, Paragraph.scroll pins the
+    // tail to the bottom already (via `max_scroll.saturating_sub(app.scroll)`).
+    // When it's *shorter* (common in Fullscreen-fallback mode at session
+    // start — content ~10 rows, viewport ~35 rows), we need to pre-pad with
+    // blank rows so the content bottom-aligns instead of pinning to the
+    // top and leaving a big gap above the input box. Only the fallback
+    // path actually hits this: Inline viewport shrinks to content so there
+    // is no extra slack.
+    if total_rows < viewport_rows {
+        let pad = viewport_rows - total_rows;
+        let mut padded: Vec<Line<'static>> = Vec::with_capacity(pad + lines.len());
+        for _ in 0..pad {
+            padded.push(Line::from(""));
+        }
+        padded.extend(lines);
+        let para = Paragraph::new(padded).wrap(Wrap { trim: false });
+        frame.render_widget(para, area);
+        return;
+    }
+
     let max_scroll = total_rows.saturating_sub(viewport_rows) as u16;
     let y_scroll = max_scroll.saturating_sub(app.scroll);
 

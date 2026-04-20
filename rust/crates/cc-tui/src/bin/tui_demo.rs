@@ -87,8 +87,13 @@ async fn main() -> anyhow::Result<()> {
     let tx = events_tx.clone();
     tokio::spawn(async move {
         for step in script {
+            tracing::debug!("demo step: {step:?}");
             match step {
-                Step::SleepMs(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                Step::SleepMs(ms) => {
+                    tracing::debug!("sleeping {ms}ms");
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    tracing::debug!("wake");
+                }
                 Step::StreamDelta(text) => {
                     let _ = tx.send(CoreEvent::StreamDelta(text)).await;
                 }

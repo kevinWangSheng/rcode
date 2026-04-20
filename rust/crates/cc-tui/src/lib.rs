@@ -115,6 +115,19 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
         app.set_cwd(cwd);
     }
     app.set_git_branch(config.git_branch);
+
+    // Probe/test hook: when `CC_TUI_DEMO_AUTO_STREAM=1` is set, start the
+    // app already in Streaming mode so scripted `StreamDelta` events fed
+    // over the channel are accepted immediately. Without this, the demo
+    // binary's events are all dropped by the `AppAction::StreamDelta`
+    // guard (which correctly refuses tokens when mode is Input — that's
+    // the AC-2b abort-safety invariant). Production clients do not set
+    // this variable; the engine flips mode to Streaming on user submit
+    // like normal.
+    if std::env::var_os("CC_TUI_DEMO_AUTO_STREAM").is_some() {
+        app.start_stream();
+    }
+
     let commands = config.commands;
     let cmd_ctx = config.command_ctx;
     let update_ctx = UpdateContext {
