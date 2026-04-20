@@ -546,12 +546,18 @@ where
     let capped = clamp_viewport(desired, term_size.1);
 
     let terminal_resized = term_size != vp.term_size;
-    let needs_grow = capped > vp.height;
 
-    let new_height = if terminal_resized {
-        // Follow the terminal faithfully on real SIGWINCH, including shrinks.
-        capped
-    } else if needs_grow {
+    // Shrink-policy: during Streaming we keep the viewport monotonically
+    // growing so every token doesn't trigger a resize (flicker). Once the
+    // stream ends (mode != Streaming AND streaming_text is empty) we allow
+    // shrinking back to the estimated size — otherwise the viewport sticks
+    // at its peak height leaving a big empty block between content and the
+    // input box (user screenshot 2026-04-20). SIGWINCH always follows the
+    // terminal faithfully, shrink or grow.
+    let idle = app.mode != AppMode::Streaming && app.streaming_text.is_empty();
+    let grow_allowed = capped > vp.height;
+    let shrink_allowed = idle && capped < vp.height;
+    let new_height = if terminal_resized || grow_allowed || shrink_allowed {
         capped
     } else {
         vp.height
