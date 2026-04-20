@@ -308,6 +308,79 @@ impl App {
         self.stream_started_at.map(|t| t.elapsed().as_secs())
     }
 
+    /// Estimated total rows the renderer will draw given a viewport `width`.
+    ///
+    /// Used by the inline-viewport sizer in `lib.rs::run_tui` so the TUI grows
+    /// with its content (welcome + transcript) instead of always taking the
+    /// full terminal height. The estimate is intentionally conservative — a
+    /// few rows of slack avoids visible "twitch" when wrapping pushes a line
+    /// to the next row mid-stream.
+    ///
+    /// Layout slots accounted for:
+    ///
+    /// | slot           | rows |
+    /// |----------------|-----:|
+    /// | welcome banner | 0..8 |
+    /// | transcript     | dyn  |
+    /// | streaming text | dyn  |
+    /// | spinner row    | 1    |
+    /// | input box      | 3    |
+    /// | help footer    | 1    |
+    /// | status bar     | 1    |
+    pub fn estimate_viewport_rows(&self, width: u16) -> u16 {
+        let bottom_chrome: u16 = 1 + 3 + 1 + 1; // spinner + input + footer + status
+
+        let wrap = width.max(1) as usize;
+        let count_wrapped = |s: &str| -> u16 {
+            // 1 row per logical line, plus extra rows for wrap within a line.
+            // Use terminal-cell width so CJK / emoji (width 2) don't misjudge
+            // the inline viewport height.
+            use unicode_width::UnicodeWidthStr;
+            s.lines()
+                .map(|l| UnicodeWidthStr::width(l).div_ceil(wrap).max(1))
+                .sum::<usize>()
+                .max(1) as u16
+        };
+
+        let mut transcript: u16 = 0;
+
+        // Welcome banner. Heights match `welcome::render_welcome` exactly:
+        //   fancy mode  → 1 (welcome) + 1 (spacer) + 6 (box) + 1 (spacer) + 2 (cwd+tip) + 1 = 12
+        //   compact     → 4 lines
+        if self.is_empty_session() {
+            transcript += if width < crate::welcome::MIN_FANCY_WIDTH {
+                4
+            } else {
+                12
+            };
+        }
+
+        for item in &self.transcript {
+            transcript = transcript.saturating_add(match item {
+                TranscriptItem::UserMessage(t) => count_wrapped(t).saturating_add(1),
+                TranscriptItem::AssistantText(t) => count_wrapped(t).saturating_add(1),
+                TranscriptItem::ToolCall { input_summary, .. } => {
+                    count_wrapped(input_summary).max(1)
+                }
+                TranscriptItem::ToolResult { output, .. } => {
+                    let body = (output.lines().count().min(5)) as u16;
+                    body.max(1).saturating_add(1)
+                }
+                TranscriptItem::SystemNotice(t) => count_wrapped(t).saturating_add(1),
+                TranscriptItem::CompactBoundary => 2,
+            });
+        }
+
+        if !self.streaming_text.is_empty() || self.mode == AppMode::Streaming {
+            transcript = transcript.saturating_add(count_wrapped(&self.streaming_text));
+            if self.mode == AppMode::Streaming {
+                transcript = transcript.saturating_add(1); // blink caret
+            }
+        }
+
+        bottom_chrome.saturating_add(transcript).max(8)
+    }
+
     /// Current spinner glyph. Returns an empty string when no stream is
     /// active so the status bar is clean between turns.
     pub fn spinner_glyph(&self) -> &'static str {

@@ -23,11 +23,15 @@ pub use event::AppEvent;
 pub use keybindings::Keybindings;
 pub use prompter::ChannelPrompter;
 
+use std::io;
 use std::sync::Arc;
 
 use cc_core::{AppEvent as CoreEvent, MessageParam};
 use cc_query::QueryEngine;
 use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -108,15 +112,37 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
         command_ctx: &cmd_ctx,
     };
 
-    // ── Initialize terminal ───────────────────────────────────────────────
-    let mut terminal = ratatui::init();
+    // ── Initialize terminal (inline viewport) ─────────────────────────────
+    //
+    // Phase D follow-up: switch from `ratatui::init()` (alt-screen) to an
+    // inline viewport so the TUI behaves like the official Claude Code CLI:
+    //   * content lives in the terminal's normal scrollback (no clear on
+    //     enter, content remains visible after exit)
+    //   * the viewport sits at the bottom of the terminal and grows with its
+    //     content instead of always taking the whole screen
+    //
+    // We size the viewport to `App::estimate_viewport_rows(width)`, capped at
+    // `terminal_height - 1`, and resize before each draw so the box visually
+    // tracks the conversation.
+    crossterm::terminal::enable_raw_mode()
+        .map_err(|e| cc_core::CcError::Other(format!("enable raw mode: {e}")))?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let term_size = crossterm::terminal::size()
+        .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
+    let initial_height = clamp_viewport(app.estimate_viewport_rows(term_size.0), term_size.1);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(initial_height),
+        },
+    )
+    .map_err(|e| cc_core::CcError::Other(format!("terminal init: {e}")))?;
+
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
     // Initial render.
-    terminal
-        .draw(|frame| render::render(frame, &app))
-        .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
+    draw_with_resize(&mut terminal, &app)?;
 
     loop {
         let action: Option<AppAction> = tokio::select! {
@@ -146,12 +172,12 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
             match result {
                 UpdateResult::Quit => break,
                 UpdateResult::ForceQuit => {
-                    // Emergency exit: restore terminal state (disable raw
-                    // mode, leave alternate screen), cancel root token so
-                    // any outstanding child tasks observe cancellation, and
-                    // exit with SIGINT-style status.
+                    // Emergency exit: drop raw mode, cancel root token so any
+                    // outstanding child tasks observe cancellation, and exit
+                    // with SIGINT-style status. No alt-screen to leave under
+                    // inline mode.
                     root_cancel.cancel();
-                    ratatui::restore();
+                    let _ = crossterm::terminal::disable_raw_mode();
                     std::process::exit(130);
                 }
                 UpdateResult::SubmitToEngine(text) => {
@@ -176,14 +202,44 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
             }
         }
 
-        // Redraw after every event.
-        terminal
-            .draw(|frame| render::render(frame, &app))
-            .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
+        // Redraw after every event, resizing the inline viewport if the
+        // estimated content height has changed.
+        draw_with_resize(&mut terminal, &app)?;
     }
 
-    // Restore terminal.
-    ratatui::restore();
+    // Restore terminal: drop raw mode but leave the rendered inline content
+    // in scrollback. Insert a trailing newline so the user's next shell
+    // prompt starts on a fresh row instead of overlapping our last line.
+    let _ = crossterm::terminal::disable_raw_mode();
+    println!();
+    Ok(())
+}
+
+/// Cap a desired inline viewport height to `terminal_height - 1` so a row of
+/// breathing room remains between the prior shell prompt and our top edge.
+/// Floors at 4 so we never collapse below "input + footer" usability.
+fn clamp_viewport(desired: u16, term_height: u16) -> u16 {
+    let max = term_height.saturating_sub(1).max(4);
+    desired.clamp(4, max)
+}
+
+/// Resize the inline viewport to match the App's current content estimate,
+/// then draw. Recomputes terminal width on every call so SIGWINCH-driven
+/// resizes flow through naturally without an extra event handler.
+fn draw_with_resize<B>(terminal: &mut Terminal<B>, app: &App) -> cc_core::CcResult<()>
+where
+    B: ratatui::backend::Backend,
+{
+    let term_size = crossterm::terminal::size()
+        .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
+    let want = clamp_viewport(app.estimate_viewport_rows(term_size.0), term_size.1);
+    let current = terminal.get_frame().area();
+    if current.width != term_size.0 || current.height != want {
+        let _ = terminal.resize(Rect::new(0, 0, term_size.0, want));
+    }
+    terminal
+        .draw(|frame| render::render(frame, app))
+        .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
     Ok(())
 }
 

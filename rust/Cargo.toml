@@ -71,6 +71,7 @@ regex = "1"
 
 # Unicode
 unicode-normalization = "0.1"
+unicode-width = "0.2"
 
 # Keychain (macOS Keychain, Linux SecretService, Windows Credential Manager)
 keyring = { version = "3", features = ["apple-native", "sync-secret-service"] }
