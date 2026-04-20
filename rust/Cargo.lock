@@ -414,6 +414,7 @@ dependencies = [
  "cc-memory",
  "cc-query",
  "cc-session",
+ "chrono",
  "crossterm",
  "dirs",
  "futures",

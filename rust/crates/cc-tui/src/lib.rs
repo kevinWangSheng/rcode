@@ -112,6 +112,17 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
         command_ctx: &cmd_ctx,
     };
 
+    // ── Install panic hook before touching the terminal ──────────────────
+    //
+    // Under crossterm raw mode a panic rewrites the screen, garbles the
+    // cursor, and throws the panic message into the void — the user sees a
+    // corrupt terminal and has no idea what crashed. This hook writes the
+    // full panic message + backtrace to `~/.claude/cc-tui-crash.log`
+    // *before* letting the default hook fire, then drops raw mode so at
+    // least stderr is readable by the parent shell. It's installed exactly
+    // once per process via `OnceLock`.
+    install_panic_hook();
+
     // ── Initialize terminal (inline viewport) ─────────────────────────────
     //
     // Phase D follow-up: switch from `ratatui::init()` (alt-screen) to an
@@ -138,11 +149,22 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     )
     .map_err(|e| cc_core::CcError::Other(format!("terminal init: {e}")))?;
 
+    // Current viewport state. Kept outside `draw_with_resize` so we can
+    // resize *lazily* — only when the terminal itself changed size (SIGWINCH)
+    // or when content actually needs another row. Without this gate, every
+    // streamed token re-ran `estimate_viewport_rows`, resized the inline
+    // viewport, and pushed the previous frame up into scrollback, producing
+    // the "rendering flickers mid-chat" symptom the user reported.
+    let mut vp = ViewportState {
+        height: initial_height,
+        term_size,
+    };
+
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
 
     // Initial render.
-    draw_with_resize(&mut terminal, &app)?;
+    draw_with_resize(&mut terminal, &app, &mut vp)?;
 
     loop {
         let action: Option<AppAction> = tokio::select! {
@@ -202,9 +224,9 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
             }
         }
 
-        // Redraw after every event, resizing the inline viewport if the
-        // estimated content height has changed.
-        draw_with_resize(&mut terminal, &app)?;
+        // Redraw after every event, resizing the inline viewport only if
+        // the terminal itself resized or content genuinely needs more rows.
+        draw_with_resize(&mut terminal, &app, &mut vp)?;
     }
 
     // Restore terminal: drop raw mode but leave the rendered inline content
@@ -223,20 +245,113 @@ fn clamp_viewport(desired: u16, term_height: u16) -> u16 {
     desired.clamp(4, max)
 }
 
-/// Resize the inline viewport to match the App's current content estimate,
-/// then draw. Recomputes terminal width on every call so SIGWINCH-driven
-/// resizes flow through naturally without an extra event handler.
-fn draw_with_resize<B>(terminal: &mut Terminal<B>, app: &App) -> cc_core::CcResult<()>
+/// Install a global panic hook that restores the terminal before letting the
+/// default hook fire, and also writes the panic info + backtrace to a crash
+/// log under `$HOME/.claude/cc-tui-crash.log`. Idempotent.
+///
+/// Why: without this, a panic in any render/update path scrambles the
+/// terminal (raw mode still on) and the panic message gets over-written
+/// before the user can read it. The crash log is the *only* reliable way
+/// to get a post-mortem on a real-world crash. After a crash, the user
+/// should `cat ~/.claude/cc-tui-crash.log` to see the stack.
+fn install_panic_hook() {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // 1. Drop raw mode so stderr is readable and the cursor returns.
+            let _ = crossterm::terminal::disable_raw_mode();
+            // Emit a newline so the default hook's stderr output doesn't
+            // land in the middle of the last rendered row.
+            eprintln!();
+
+            // 2. Capture a backtrace. `std::backtrace::Backtrace::force_capture`
+            //    always captures, irrespective of RUST_BACKTRACE. We want
+            //    full info regardless of the user's env.
+            let backtrace = std::backtrace::Backtrace::force_capture();
+
+            // 3. Write the full report to ~/.claude/cc-tui-crash.log.
+            //    Append so multiple crashes in a session are preserved.
+            if let Some(mut path) = dirs::home_dir() {
+                path.push(".claude");
+                let _ = std::fs::create_dir_all(&path);
+                path.push("cc-tui-crash.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    use std::io::Write;
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = writeln!(f, "\n=== cc-tui panic at {now} ===");
+                    let _ = writeln!(f, "{info}");
+                    let _ = writeln!(f, "--- backtrace ---\n{backtrace}");
+                    // Surface where the log lives so the user doesn't have
+                    // to hunt for it.
+                    eprintln!("cc-tui crashed — details in {}", path.display());
+                }
+            }
+
+            // 4. Chain to the original hook so stderr still shows the panic
+            //    in case the user can read it (e.g. ran under `tee`).
+            previous(info);
+        }));
+    });
+}
+
+/// Snapshot of the most recent inline viewport size + the terminal size it
+/// was sized for. Held across draws so we resize only on real changes.
+struct ViewportState {
+    height: u16,
+    term_size: (u16, u16),
+}
+
+/// Draw the frame, resizing the inline viewport **only** when necessary:
+///
+///   1. The terminal itself resized (SIGWINCH) — always resize to the new
+///      width and recompute the clamp against the new height.
+///   2. The content estimate grew beyond the current viewport *and* we
+///      haven't hit the terminal-height cap.
+///
+/// Specifically we do **not** shrink the viewport as the user types or the
+/// model streams — that produced a nasty flicker where the inline area
+/// pulsed up/down by one row on every delta, pushing the prior frame up
+/// into scrollback each time. Ratatui's `Paragraph.scroll` inside
+/// `render_transcript` already handles "too much content for the viewport"
+/// by pinning the tail to the bottom, so shrinking is never required to
+/// stay correct — only growing is.
+fn draw_with_resize<B>(
+    terminal: &mut Terminal<B>,
+    app: &App,
+    vp: &mut ViewportState,
+) -> cc_core::CcResult<()>
 where
     B: ratatui::backend::Backend,
 {
     let term_size = crossterm::terminal::size()
         .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
-    let want = clamp_viewport(app.estimate_viewport_rows(term_size.0), term_size.1);
-    let current = terminal.get_frame().area();
-    if current.width != term_size.0 || current.height != want {
-        let _ = terminal.resize(Rect::new(0, 0, term_size.0, want));
+    let desired = app.estimate_viewport_rows(term_size.0);
+    let capped = clamp_viewport(desired, term_size.1);
+
+    let terminal_resized = term_size != vp.term_size;
+    let needs_grow = capped > vp.height;
+
+    let new_height = if terminal_resized {
+        // Follow the terminal faithfully on real SIGWINCH, including shrinks.
+        capped
+    } else if needs_grow {
+        capped
+    } else {
+        vp.height
+    };
+
+    if terminal_resized || new_height != vp.height {
+        let _ = terminal.resize(Rect::new(0, 0, term_size.0, new_height));
+        vp.height = new_height;
+        vp.term_size = term_size;
     }
+
     terminal
         .draw(|frame| render::render(frame, app))
         .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
@@ -362,6 +477,25 @@ fn map_engine_event(event: CoreEvent) -> Option<AppAction> {
     }
 }
 
+/// Return the longest prefix of `s` that fits in `max_bytes` **and** ends on
+/// a UTF-8 char boundary. Using `&s[..max_bytes]` directly panics if byte
+/// `max_bytes` lands inside a multi-byte codepoint — very common with CJK
+/// (3 bytes/char) and emoji (4 bytes/char). Because the renderer runs under
+/// crossterm raw mode, such a panic scrambles the terminal and the stderr
+/// message is swallowed, making the TUI look like it "just died after a few
+/// messages". This helper is the canonical truncation point for all
+/// byte-bounded previews in this file.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Format a JSON `Value` as a short one-line summary for the transcript.
 fn summarize_input(v: &serde_json::Value) -> String {
     match v {
@@ -371,7 +505,7 @@ fn summarize_input(v: &serde_json::Value) -> String {
                 if let Some(serde_json::Value::String(s)) = map.get(*key) {
                     let s = s.trim();
                     if s.len() > 120 {
-                        return format!("{}…", &s[..120]);
+                        return format!("{}…", truncate_at_char_boundary(s, 120));
                     }
                     return s.to_string();
                 }
@@ -379,14 +513,14 @@ fn summarize_input(v: &serde_json::Value) -> String {
             // Fall back to compact JSON, truncated.
             let s = serde_json::to_string(v).unwrap_or_default();
             if s.len() > 120 {
-                format!("{}…", &s[..120])
+                format!("{}…", truncate_at_char_boundary(&s, 120))
             } else {
                 s
             }
         }
         serde_json::Value::String(s) => {
             if s.len() > 120 {
-                format!("{}…", &s[..120])
+                format!("{}…", truncate_at_char_boundary(s, 120))
             } else {
                 s.clone()
             }
@@ -394,7 +528,7 @@ fn summarize_input(v: &serde_json::Value) -> String {
         other => {
             let s = other.to_string();
             if s.len() > 120 {
-                format!("{}…", &s[..120])
+                format!("{}…", truncate_at_char_boundary(&s, 120))
             } else {
                 s
             }
@@ -405,12 +539,12 @@ fn summarize_input(v: &serde_json::Value) -> String {
 /// Truncate long tool output to a preview for transcript display.
 fn truncate_output(s: &str) -> String {
     const MAX_LINES: usize = 20;
-    const MAX_CHARS: usize = 2000;
+    const MAX_BYTES: usize = 2000;
     let lines: Vec<&str> = s.lines().take(MAX_LINES + 1).collect();
     let truncated_lines = lines.len() > MAX_LINES;
     let joined = lines[..lines.len().min(MAX_LINES)].join("\n");
-    if truncated_lines || joined.len() > MAX_CHARS {
-        let preview = &joined[..joined.len().min(MAX_CHARS)];
+    if truncated_lines || joined.len() > MAX_BYTES {
+        let preview = truncate_at_char_boundary(&joined, MAX_BYTES);
         format!("{preview}\n… (truncated)")
     } else {
         joined
@@ -475,5 +609,98 @@ mod keymap_tests {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let action = map_key_event(&ctrl_c, &kb, &app);
         assert!(matches!(action, Some(AppAction::Abort)), "got {action:?}");
+    }
+}
+
+#[cfg(test)]
+mod utf8_safety_tests {
+    //! The TUI used to run `&s[..120]` / `&joined[..2000]` byte slicing on
+    //! tool input summaries and tool output previews. A single Chinese/emoji
+    //! character at the exact cutoff byte turned into a panic under
+    //! crossterm raw mode, which is why chat sessions with CJK content
+    //! "just died". These tests anchor the boundary-safe helpers so a
+    //! future refactor can't reintroduce the panic silently.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn truncate_at_char_boundary_never_splits_codepoints() {
+        // 41 CJK chars × 3 bytes = 123 bytes — byte 120 lands inside the
+        // 41st char. Direct slicing would panic.
+        let s: String = "我".repeat(41);
+        assert_eq!(s.len(), 123);
+        let truncated = truncate_at_char_boundary(&s, 120);
+        // 120 / 3 = 40 chars, 120 bytes exactly is a boundary.
+        assert_eq!(truncated.chars().count(), 40);
+        assert_eq!(truncated.len() % 3, 0);
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_backs_off_partial_codepoints() {
+        // One 4-byte emoji: if we try to cut at 2 bytes we must back off to 0.
+        let s = "🎉abc"; // emoji is 4 bytes
+        let cut = truncate_at_char_boundary(s, 2);
+        assert_eq!(cut, ""); // must back off before the emoji
+        let cut4 = truncate_at_char_boundary(s, 4);
+        assert_eq!(cut4, "🎉"); // exact boundary
+        let cut5 = truncate_at_char_boundary(s, 5);
+        assert_eq!(cut5, "🎉a"); // one ASCII after the emoji
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_returns_full_string_when_short() {
+        assert_eq!(truncate_at_char_boundary("hi", 100), "hi");
+        assert_eq!(truncate_at_char_boundary("", 100), "");
+    }
+
+    /// Regression: a long Chinese bash command used to crash the TUI the
+    /// moment it arrived as a tool-start event.
+    #[test]
+    fn summarize_long_chinese_command_does_not_panic() {
+        let long = "echo ".to_string() + &"测试中文命令超过一百二十字节的情况".repeat(10);
+        // This would panic on the old byte-slicing path.
+        let s = summarize_input(&json!({ "command": long }));
+        assert!(s.ends_with("…"), "expected ellipsis suffix, got {s:?}");
+    }
+
+    /// Regression: tool output filled with emoji used to crash on the
+    /// 2 KiB truncate path.
+    #[test]
+    fn truncate_output_with_emoji_does_not_panic() {
+        let huge = "🎉".repeat(800); // ~3.2 KiB — above MAX_BYTES (2000)
+        let s = truncate_output(&huge);
+        assert!(s.contains("… (truncated)"), "got {s:?}");
+    }
+
+    /// Pure ASCII path is unchanged — a 200-byte command truncates at
+    /// exactly 120 bytes + ellipsis.
+    #[test]
+    fn summarize_long_ascii_command_truncates_to_120_bytes() {
+        let long = "a".repeat(200);
+        let s = summarize_input(&json!({ "command": long }));
+        assert!(s.ends_with("…"));
+        // 120 'a's + one '…' (3-byte char).
+        assert_eq!(s.chars().count(), 121);
+    }
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    //! Anchor the inline-viewport resize policy: grow on demand, follow
+    //! SIGWINCH, but do NOT shrink per stream delta (which caused the
+    //! mid-chat flicker).
+    use super::*;
+
+    #[test]
+    fn clamp_viewport_never_produces_invalid_range() {
+        // Terminal smaller than our minimum: must floor at 4 without panic.
+        assert_eq!(clamp_viewport(20, 3), 4);
+        assert_eq!(clamp_viewport(20, 0), 4);
+        // Terminal larger than our desired: pass through.
+        assert_eq!(clamp_viewport(10, 30), 10);
+        // Desired larger than terminal cap: clamp to terminal - 1.
+        assert_eq!(clamp_viewport(100, 30), 29);
+        // Both at boundary: just below terminal height.
+        assert_eq!(clamp_viewport(29, 30), 29);
     }
 }

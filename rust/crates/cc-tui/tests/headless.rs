@@ -1020,3 +1020,123 @@ fn acv6_minimal_opt_out_skips_markdown_transforms() {
     assert!(!s.contains("▎"), "M5 heading glyph leaked in minimal mode");
     assert!(!s.contains("• "), "M5 bullet glyph leaked in minimal mode");
 }
+
+// ── Stress / panic-safety test ───────────────────────────────────────────────
+//
+// The unit tests pass a handful of carefully-shaped inputs through render;
+// this one hammers the renderer with 100 turns of mixed content (ASCII,
+// CJK, emoji, markdown, long lines, narrow viewports, unterminated fences)
+// and asserts that no draw panics. It's the cheapest way to catch a whole
+// class of bugs the TestBackend unit tests can't see — subtle Unicode
+// width miscalculations, dividing by zero at tiny widths, string slices
+// landing on non-char boundaries after future refactors, etc.
+//
+// If this fails in CI, the panic message in the failure output points at
+// the exact offending combination. Rerun locally with
+// `RUST_BACKTRACE=full cargo test -p cc-tui --test headless
+//  stress_render_never_panics_on_unicode_mix` for the stack.
+
+/// Large, deterministic unicode corpus. Not `random` — we want the same
+/// run every invocation so a CI failure is reproducible.
+fn unicode_corpus() -> Vec<&'static str> {
+    vec![
+        "plain ascii",
+        "中文字符测试渲染引擎对 CJK 的处理,看看会不会在字节边界上崩溃。",
+        "emoji burst 🎉🚀🔥💡🧠🦀🐳✨🌈⭐",
+        "mixed 你好 world 再见 🌏 end",
+        "# markdown heading with 中文 in body",
+        "`code with 日本語` inline",
+        "```rust\nlet x = \"中文字符串\"; // unterminated fence",
+        "very long line ".repeat(20).leak() as &str, // > 200 cells
+        "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np",
+        "mixed widths: a가ab 한글ababab 混合",
+        "- bullet 一\n- bullet 二\n- bullet 三",
+        "> blockquote with ✨ emoji",
+        "1. ordered 中文\n2. ordered 英文\n3. plain",
+    ]
+}
+
+#[test]
+fn stress_render_never_panics_on_unicode_mix() {
+    use cc_tui::render::render;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let corpus = unicode_corpus();
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+
+    // Exercise multiple viewport sizes so any dimension-specific panic
+    // (division by tiny width, clamp underflow, wrap math on 1-col) is hit.
+    let widths: [u16; 5] = [20, 40, 60, 80, 160];
+    let heights: [u16; 4] = [6, 14, 24, 40];
+
+    for pass in 0..100 {
+        let mut app = App::new("stress-session".into(), "claude-sonnet-4-6".into());
+        // Build a transcript of 1..N items where N grows per pass, mixing
+        // push_user / stream / tool call / tool result / system notice /
+        // compact. Every text field pulled from the unicode corpus.
+        for i in 0..(pass % 20 + 1) {
+            let text = corpus[i % corpus.len()].to_string();
+            match i % 6 {
+                0 => app.push_user(text),
+                1 => {
+                    app.start_stream();
+                    update(&mut app, AppAction::StreamDelta(text), &uctx);
+                    update(
+                        &mut app,
+                        AppAction::TurnComplete {
+                            usage: zero_usage(),
+                        },
+                        &uctx,
+                    );
+                }
+                2 => app.push_tool_call("Bash".into(), text),
+                3 => app.push_tool_result("Bash".into(), text, false),
+                4 => app.push_system(text),
+                _ => app.push_compact_boundary(),
+            }
+        }
+
+        // Draw at every (w, h) combination. No panic → pass.
+        for &w in &widths {
+            for &h in &heights {
+                let backend = TestBackend::new(w, h);
+                let mut term = Terminal::new(backend).unwrap();
+                term.draw(|f| render(f, &app))
+                    .unwrap_or_else(|e| panic!("pass {pass} w={w} h={h} draw error: {e}"));
+            }
+        }
+    }
+}
+
+/// Specific regression for the bug the user reported: a long Chinese
+/// bash-tool input used to panic at render time because the summary
+/// path byte-sliced at 120. Here we drive an AppAction::ToolStart with
+/// a long CJK summary and render at narrow widths. If the fix regresses,
+/// the draw will panic.
+#[test]
+fn stress_long_cjk_tool_call_renders_cleanly() {
+    use cc_tui::render::render;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut app = App::new("s".into(), "m".into());
+    let long_command = "echo ".to_string() + &"测试中文命令".repeat(40);
+    app.push_tool_call_with_input(
+        "Bash".into(),
+        long_command.clone(),
+        serde_json::json!({ "command": long_command }),
+    );
+
+    // Hit a bunch of widths including the narrow fallback.
+    for w in [20u16, 40, 60, 80, 120, 200] {
+        let backend = TestBackend::new(w, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &app))
+            .unwrap_or_else(|e| panic!("CJK tool call draw @ w={w}: {e}"));
+    }
+}
