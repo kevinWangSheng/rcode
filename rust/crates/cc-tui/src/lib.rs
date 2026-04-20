@@ -155,17 +155,60 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // tracks the conversation.
     crossterm::terminal::enable_raw_mode()
         .map_err(|e| cc_core::CcError::Other(format!("enable raw mode: {e}")))?;
-    let backend = CrosstermBackend::new(io::stdout());
     let term_size = crossterm::terminal::size()
         .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
     let initial_height = clamp_viewport(app.estimate_viewport_rows(term_size.0), term_size.1);
-    let mut terminal = Terminal::with_options(
+
+    // `Viewport::Inline` queries the terminal cursor position via DSR
+    // (`ESC[6n`) at init time. Some emulators answer too slowly (>2 s
+    // crossterm timeout), or in some setups (nested tmux, slow ssh
+    // pipelines, certain headless emulators) the response gets eaten
+    // entirely. Surfacing that as "terminal init: cursor position could
+    // not be read" was the symptom this fallback fixes — the user got an
+    // unhelpful error and had to bail. Now we silently fall back to
+    // Fullscreen, which works everywhere; the only visible loss is that
+    // history doesn't flow into terminal scrollback (the user instead
+    // scrolls inside the app via PageUp). We log a one-line warning to
+    // both the tracing log and the crash log so the user can opt to
+    // re-run on a faster terminal if they want full inline behaviour.
+    let backend = CrosstermBackend::new(io::stdout());
+    let inline_attempt = Terminal::with_options(
         backend,
         TerminalOptions {
             viewport: Viewport::Inline(initial_height),
         },
-    )
-    .map_err(|e| cc_core::CcError::Other(format!("terminal init: {e}")))?;
+    );
+    let (mut terminal, viewport_kind) = match inline_attempt {
+        Ok(t) => (t, ViewportKind::Inline),
+        Err(e) => {
+            tracing::warn!(
+                "Inline viewport init failed ({e}); falling back to Fullscreen. \
+                 Terminal scrollback inheritance disabled — use PageUp/PageDown \
+                 inside the app to see history."
+            );
+            let _ = log_inline_fallback(&format!("{e}"));
+            let backend = CrosstermBackend::new(io::stdout());
+            let t = Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Fullscreen,
+                },
+            )
+            .map_err(|e| cc_core::CcError::Other(format!("terminal init: {e}")))?;
+            (t, ViewportKind::Fullscreen)
+        }
+    };
+
+    // In Fullscreen fallback we own the whole terminal but did NOT enter
+    // alt-screen (we want history to remain visible after exit). Without
+    // this clear the prior shell prompt + any output stays painted under
+    // the empty rows of our viewport, so the user sees our chrome
+    // overlapping the previous output. `Terminal::clear` blanks the whole
+    // viewport in one operation. Skipped under Inline because there's no
+    // overlap risk — Inline only paints its own carved region.
+    if viewport_kind == ViewportKind::Fullscreen {
+        let _ = terminal.clear();
+    }
 
     // Current viewport state. Kept outside `draw_with_resize` so we can
     // resize *lazily* — only when the terminal itself changed size (SIGWINCH)
@@ -176,6 +219,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     let mut vp = ViewportState {
         height: initial_height,
         term_size,
+        kind: viewport_kind,
     };
 
     let mut reader = EventStream::new();
@@ -284,6 +328,32 @@ fn clamp_viewport(desired: u16, term_height: u16) -> u16 {
     desired.clamp(4, max)
 }
 
+/// Append a one-line note to `~/.claude/cc-tui-crash.log` recording that
+/// the inline-viewport init had to fall back to Fullscreen. We piggy-back
+/// on the crash log rather than spawning a third file because users
+/// already know to check that file when something looks wrong, and the
+/// fallback is the kind of thing they'd want to see alongside crashes.
+fn log_inline_fallback(reason: &str) -> std::io::Result<()> {
+    if let Some(mut path) = dirs::home_dir() {
+        path.push(".claude");
+        std::fs::create_dir_all(&path)?;
+        path.push("cc-tui-crash.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = writeln!(
+                f,
+                "[{now}] inline-viewport init fell back to Fullscreen: {reason}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Route `tracing` events to `$CC_TUI_LOG_FILE` when that env var is set.
 /// No-op when the env var is missing (avoids spamming a stray file during
 /// normal use) and no-op after the first successful install.
@@ -377,11 +447,24 @@ fn install_panic_hook() {
     });
 }
 
+/// Active viewport flavour. `Fullscreen` is the fallback we land in when
+/// the inline init's DSR-cursor probe times out (slow / nested terminals).
+/// In Fullscreen mode, `flush_to_scrollback` and the lazy-resize logic are
+/// no-ops because Ratatui's `Viewport::Fullscreen` doesn't support
+/// `Terminal::insert_before` (it'd be a silent no-op anyway) and the area
+/// is fixed to the terminal size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewportKind {
+    Inline,
+    Fullscreen,
+}
+
 /// Snapshot of the most recent inline viewport size + the terminal size it
 /// was sized for. Held across draws so we resize only on real changes.
 struct ViewportState {
     height: u16,
     term_size: (u16, u16),
+    kind: ViewportKind,
 }
 
 /// Draw the frame, resizing the inline viewport **only** when necessary:
@@ -406,6 +489,18 @@ fn draw_with_resize<B>(
 where
     B: ratatui::backend::Backend,
 {
+    // In Fullscreen-fallback mode, the viewport is fixed to the terminal
+    // size and `insert_before` is a Ratatui no-op. Skip the flush + resize
+    // dance entirely; just draw. `render_transcript` already handles the
+    // "render everything" case correctly because `app.emitted_to_scrollback`
+    // stays at 0 (we never advance it in Fullscreen mode).
+    if vp.kind == ViewportKind::Fullscreen {
+        terminal
+            .draw(|frame| render::render(frame, app))
+            .map_err(|e| cc_core::CcError::Other(format!("terminal draw error: {e}")))?;
+        return Ok(());
+    }
+
     let term_size = crossterm::terminal::size()
         .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
 
@@ -631,11 +726,38 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 }
 
 /// Format a JSON `Value` as a short one-line summary for the transcript.
+///
+/// Field-priority list mirrors the names used by the actual tool schemas
+/// in `cc-tools/src/`:
+///   - `command`           — Bash
+///   - `file_path`         — Edit, Write, MultiEdit, Read
+///   - `path`              — Glob (and any future tool that prefers `path`)
+///   - `pattern`           — Grep, Glob
+///   - `query`             — WebSearch
+///   - `url`               — WebFetch
+///   - `content`           — Write
+///   - `prompt`            — TaskCreate, ApiSummarizer
+///   - `name` / `title`    — TaskUpdate / generic
+///
+/// Adding `file_path` here was the user-visible fix for "Edit tool card
+/// shows raw JSON" surfaced by the npcterm-driven smoke test. Without it,
+/// every Edit/Write call rendered as `Edit({"file_path":"…","old_string":
+/// "…",…})` instead of the cleaner `Edit(src/main.rs)`.
 fn summarize_input(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Object(map) => {
-            // Pick the most informative field: command, path, pattern, query, url.
-            for key in &["command", "path", "pattern", "query", "url", "content"] {
+            for key in &[
+                "command",
+                "file_path",
+                "path",
+                "pattern",
+                "query",
+                "url",
+                "content",
+                "prompt",
+                "name",
+                "title",
+            ] {
                 if let Some(serde_json::Value::String(s)) = map.get(*key) {
                     let s = s.trim();
                     if s.len() > 120 {
@@ -815,6 +937,39 @@ mod utf8_safety_tests {
         assert!(s.ends_with("…"));
         // 120 'a's + one '…' (3-byte char).
         assert_eq!(s.chars().count(), 121);
+    }
+
+    /// Regression for the npcterm-found bug: Edit/Write/MultiEdit use
+    /// `file_path`, not `path`. Pre-fix the summary fell through to a
+    /// raw JSON dump, so every Edit tool card looked like
+    /// `Edit({"file_path":"…","old_string":"…",…})`.
+    #[test]
+    fn summarize_edit_uses_file_path_field() {
+        let s = summarize_input(&json!({
+            "file_path": "src/main.rs",
+            "old_string": "hello",
+            "new_string": "world"
+        }));
+        assert_eq!(s, "src/main.rs", "got {s:?}");
+    }
+
+    /// `path` (Glob) and `pattern` (Grep) keep working alongside file_path.
+    #[test]
+    fn summarize_path_and_pattern_still_work() {
+        assert_eq!(summarize_input(&json!({ "path": "**/*.rs" })), "**/*.rs");
+        assert_eq!(
+            summarize_input(&json!({ "pattern": "fn main", "glob": "*.rs" })),
+            "fn main"
+        );
+    }
+
+    /// `prompt` (TaskCreate, ApiSummarizer) is now picked up too.
+    #[test]
+    fn summarize_picks_up_prompt_field() {
+        assert_eq!(
+            summarize_input(&json!({ "prompt": "summarise this file", "max_tokens": 200 })),
+            "summarise this file"
+        );
     }
 }
 
