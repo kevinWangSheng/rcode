@@ -127,6 +127,31 @@ fn palette_filter(input: &str) -> &str {
     input.trim_start().strip_prefix('/').unwrap_or("")
 }
 
+/// Reply to the pending permission prompt, close the dialog, and restore
+/// the pre-dialog mode. Factored out so the three Permission arms don't
+/// each repeat the send-take-clear-restore sequence.
+fn resolve_permission(app: &mut App, decision: PromptDecision) {
+    if let Some(reply) = app.pending_reply.take() {
+        let _ = reply.send(decision);
+    }
+    app.permission = None;
+    app.mode = restore_after_permission(app);
+}
+
+/// Close the slash-command palette: flip back to Input mode, clear the
+/// match list + selection, and replace the input buffer with
+/// `replacement` (`Some("/foo ")` for Accept, the snapshot for Cancel,
+/// `None` to leave whatever the user typed so far).
+fn close_palette(app: &mut App, replacement: Option<String>) {
+    app.mode = AppMode::Input;
+    app.palette_original = None;
+    app.palette_matches.clear();
+    app.palette_selected = 0;
+    if let Some(new_input) = replacement {
+        app.input = new_input;
+    }
+}
+
 /// Resolve the post-permission-dialog mode.
 ///
 /// Prefer the snapshot captured when `ShowPermission` fired. If the snapshot
@@ -159,10 +184,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                     // Backspacing the leading `/` cancels the palette so the
                     // user isn't stuck picking from stale results.
                     if !app.input.trim_start().starts_with('/') {
-                        app.palette_original = None;
-                        app.mode = AppMode::Input;
-                        app.palette_matches.clear();
-                        app.palette_selected = 0;
+                        close_palette(app, None);
                     } else {
                         refresh_palette(app, ctx.commands);
                     }
@@ -285,27 +307,9 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             app.mode = AppMode::PermissionPrompt;
             app.pending_reply = Some(reply);
         }
-        AppAction::PermissionAllow => {
-            if let Some(reply) = app.pending_reply.take() {
-                let _ = reply.send(PromptDecision::Allow);
-            }
-            app.permission = None;
-            app.mode = restore_after_permission(app);
-        }
-        AppAction::PermissionAllowAlways => {
-            if let Some(reply) = app.pending_reply.take() {
-                let _ = reply.send(PromptDecision::AllowAlways);
-            }
-            app.permission = None;
-            app.mode = restore_after_permission(app);
-        }
-        AppAction::PermissionDeny => {
-            if let Some(reply) = app.pending_reply.take() {
-                let _ = reply.send(PromptDecision::Deny);
-            }
-            app.permission = None;
-            app.mode = restore_after_permission(app);
-        }
+        AppAction::PermissionAllow => resolve_permission(app, PromptDecision::Allow),
+        AppAction::PermissionAllowAlways => resolve_permission(app, PromptDecision::AllowAlways),
+        AppAction::PermissionDeny => resolve_permission(app, PromptDecision::Deny),
         AppAction::Abort => {
             // Stamp regardless of mode so `ForceQuit` escalation works even
             // if the first Ctrl+C happened outside an active stream (e.g. a
@@ -398,22 +402,16 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             if app.mode != AppMode::CommandPalette {
                 return UpdateResult::Continue;
             }
-            if let Some(name) = app.palette_matches.get(app.palette_selected).cloned() {
-                app.input = format!("/{name} ");
-            }
-            app.mode = AppMode::Input;
-            app.palette_original = None;
-            app.palette_matches.clear();
-            app.palette_selected = 0;
+            let accepted = app
+                .palette_matches
+                .get(app.palette_selected)
+                .map(|name| format!("/{name} "));
+            close_palette(app, accepted);
         }
         AppAction::PaletteCancel => {
             if app.mode == AppMode::CommandPalette {
-                if let Some(orig) = app.palette_original.take() {
-                    app.input = orig;
-                }
-                app.mode = AppMode::Input;
-                app.palette_matches.clear();
-                app.palette_selected = 0;
+                let restored = app.palette_original.take();
+                close_palette(app, restored);
             }
         }
         AppAction::Tick => {
