@@ -501,8 +501,8 @@ fn format_status(ctx: &CommandContext) -> String {
 }
 
 fn format_context(ctx: &CommandContext) -> String {
-    // Approximate remaining context (200k for recent Claude models)
-    const CONTEXT_WINDOW: u64 = 200_000;
+    // Canonical context-window size, shared with the render-path status bar.
+    const CONTEXT_WINDOW: u64 = cc_core::model::models::DEFAULT_CONTEXT_WINDOW as u64;
     let used = ctx.input_tokens;
     let remaining = CONTEXT_WINDOW.saturating_sub(used);
     let pct = (used as f64 / CONTEXT_WINDOW as f64 * 100.0) as u32;

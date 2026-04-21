@@ -798,7 +798,7 @@ fn compact_threshold() -> u32 {
     let context_window: u32 = std::env::var("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200_000);
+        .unwrap_or(cc_core::model::models::DEFAULT_CONTEXT_WINDOW);
     context_window.saturating_sub(13_000)
 }
 
