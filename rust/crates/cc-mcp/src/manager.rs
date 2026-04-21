@@ -45,16 +45,19 @@ impl std::fmt::Debug for ConnectedServer {
 /// MCP server manager — handles all configured servers.
 pub struct McpManager {
     servers: HashMap<String, McpServerState>,
-    #[allow(dead_code)]
-    http: reqwest::Client,
 }
 
 impl McpManager {
     /// Initialize all servers from config.
-    pub async fn init_from_config(config: &HashMap<String, Value>, http: reqwest::Client) -> Self {
+    ///
+    /// No `reqwest::Client` parameter: the manager only speaks to MCP servers
+    /// through `McpHttpClient` (HTTP Streamable transport), which builds its
+    /// own client, and `McpClient` (stdio transport), which doesn't need
+    /// HTTP at all. A previously threaded `http: reqwest::Client` field was
+    /// never read anywhere and has been removed.
+    pub async fn init_from_config(config: &HashMap<String, Value>) -> Self {
         let mut manager = McpManager {
             servers: HashMap::new(),
-            http,
         };
 
         for (name, cfg) in config {
