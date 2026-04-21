@@ -315,12 +315,11 @@ impl CommandRegistry {
         if !self.skills.is_empty() {
             out.push_str("\nSkills:\n");
             for s in &self.skills {
-                let desc = if s.description.is_empty() {
-                    "(no description)"
-                } else {
-                    s.description.as_str()
-                };
-                out.push_str(&format!("  /{:<10} {}\n", s.name, desc));
+                out.push_str(&format!(
+                    "  /{:<10} {}\n",
+                    s.name,
+                    desc_or_placeholder(&s.description)
+                ));
             }
         }
         out.push_str(
@@ -352,12 +351,12 @@ fn format_memories(memories: &[MemoryFile]) -> String {
     }
     let mut out = String::from("Memories:\n");
     for m in memories {
-        let desc = if m.description.is_empty() {
-            "(no description)"
-        } else {
-            m.description.as_str()
-        };
-        out.push_str(&format!("  {} [{:?}]  {}\n", m.name, m.memory_type, desc));
+        out.push_str(&format!(
+            "  {} [{:?}]  {}\n",
+            m.name,
+            m.memory_type,
+            desc_or_placeholder(&m.description)
+        ));
     }
     out
 }
@@ -463,14 +462,22 @@ fn format_skills(registry: &CommandRegistry) -> String {
     }
     let mut out = String::from("Available skills:\n");
     for s in &registry.skills {
-        let desc = if s.description.is_empty() {
-            "(no description)"
-        } else {
-            s.description.as_str()
-        };
-        out.push_str(&format!("  /{:<12} {}\n", s.name, desc));
+        out.push_str(&format!(
+            "  /{:<12} {}\n",
+            s.name,
+            desc_or_placeholder(&s.description)
+        ));
     }
     out
+}
+
+/// Fallback placeholder used when a skill / memory description is empty.
+fn desc_or_placeholder(s: &str) -> &str {
+    if s.is_empty() {
+        "(no description)"
+    } else {
+        s
+    }
 }
 
 fn format_permissions(ctx: &CommandContext) -> String {
