@@ -154,23 +154,58 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // to a temp file they then read + assert on. Idempotent per process.
     install_file_log();
 
+    // ── Print welcome banner to scrollback, BEFORE raw mode ──────────────
+    //
+    // The welcome banner is ~12 rows tall (fancy variant). Trying to render
+    // it inside the fixed 8-row inline viewport just clips it. Instead we
+    // emit it as a normal println! sequence so it sits in the terminal's
+    // native scrollback above wherever our inline viewport ends up. User
+    // scrolls up with mouse-wheel to see it; it also persists after exit
+    // like any other CLI output.
+    if app.is_empty_session() {
+        let banner_width = crossterm::terminal::size().map(|s| s.0).unwrap_or(80);
+        let tip_seed = app.session_started.elapsed().as_secs() / 30;
+        for line in crate::welcome::render_welcome(banner_width, &app.version, &app.cwd, tip_seed) {
+            // Strip ANSI styling for this path — we're writing directly to
+            // stdout pre-raw-mode; ratatui's Line style attributes don't
+            // survive the println! boundary cleanly. Plain text is fine
+            // for the banner: version/cwd/tip readability is the goal.
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            println!("{plain}");
+        }
+    }
+
     // ── Initialize terminal (inline viewport) ─────────────────────────────
     //
     // Phase D follow-up: switch from `ratatui::init()` (alt-screen) to an
     // inline viewport so the TUI behaves like the official Claude Code CLI:
     //   * content lives in the terminal's normal scrollback (no clear on
     //     enter, content remains visible after exit)
-    //   * the viewport sits at the bottom of the terminal and grows with its
-    //     content instead of always taking the whole screen
-    //
-    // We size the viewport to `App::estimate_viewport_rows(width)`, capped at
-    // `terminal_height - 1`, and resize before each draw so the box visually
-    // tracks the conversation.
+    //   * the viewport sits at a fixed small size at the bottom; streaming
+    //     paragraphs flush into scrollback via `insert_before` to keep the
+    //     viewport payload short.
     crossterm::terminal::enable_raw_mode()
         .map_err(|e| cc_core::CcError::Other(format!("enable raw mode: {e}")))?;
     let term_size = crossterm::terminal::size()
         .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
-    let initial_height = clamp_viewport(app.estimate_viewport_rows(term_size.0), term_size.1);
+    // Fixed inline viewport height. We no longer grow it with content:
+    //
+    //   - Streaming paragraphs are flushed to terminal scrollback the moment
+    //     they cross a stable `\n\n` boundary (`flush_to_scrollback`), so
+    //     `streaming_text` stays short and the viewport never needs to bulge
+    //     to hold the whole response.
+    //
+    //   - Growing + later shrinking the inline viewport produced visual
+    //     artefacts (user-reported empty-block below completed content,
+    //     2026-04-20) because Ratatui's `Terminal::resize` interacts oddly
+    //     with Inline viewport origin tracking after `insert_before` has
+    //     shifted the viewport around.
+    //
+    // Keeping the viewport at a small, stable size sidesteps both problems
+    // and matches what Claude Code's Ink TUI does: the live area is just
+    // input + chrome, content lives in scrollback.
+    const FIXED_INLINE_ROWS: u16 = 8;
+    let initial_height = clamp_viewport(FIXED_INLINE_ROWS, term_size.1);
 
     // `Viewport::Inline` queries the terminal cursor position via DSR
     // (`ESC[6n`) at init time. Some emulators answer too slowly (>2 s
@@ -542,28 +577,13 @@ where
     // to render — just live state (streaming text, spinner, input, chrome).
     flush_to_scrollback(terminal, app, term_size.0)?;
 
-    let desired = app.estimate_viewport_rows(term_size.0);
-    let capped = clamp_viewport(desired, term_size.1);
-
+    // Viewport size is fixed (see FIXED_INLINE_ROWS). We only react to real
+    // SIGWINCH events (terminal width or height actually changed) — the
+    // height we pass to the terminal is still clamped to `term_height - 1`
+    // in case the user shrinks their terminal below our fixed size.
     let terminal_resized = term_size != vp.term_size;
-
-    // Shrink-policy: during Streaming we keep the viewport monotonically
-    // growing so every token doesn't trigger a resize (flicker). Once the
-    // stream ends (mode != Streaming AND streaming_text is empty) we allow
-    // shrinking back to the estimated size — otherwise the viewport sticks
-    // at its peak height leaving a big empty block between content and the
-    // input box (user screenshot 2026-04-20). SIGWINCH always follows the
-    // terminal faithfully, shrink or grow.
-    let idle = app.mode != AppMode::Streaming && app.streaming_text.is_empty();
-    let grow_allowed = capped > vp.height;
-    let shrink_allowed = idle && capped < vp.height;
-    let new_height = if terminal_resized || grow_allowed || shrink_allowed {
-        capped
-    } else {
-        vp.height
-    };
-
-    if terminal_resized || new_height != vp.height {
+    if terminal_resized {
+        let new_height = clamp_viewport(vp.height, term_size.1);
         let _ = terminal.resize(Rect::new(0, 0, term_size.0, new_height));
         vp.height = new_height;
         vp.term_size = term_size;

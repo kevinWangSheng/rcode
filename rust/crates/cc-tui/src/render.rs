@@ -32,7 +32,6 @@ use crate::app::{App, AppMode, PendingPermission, TranscriptItem};
 use crate::diff::render_unified_diff;
 use crate::markdown::{minimal_mode_enabled, render_markdown};
 use crate::theme::{self, Theme};
-use crate::welcome;
 
 /// Tool-card bullet glyph. On macOS we use `⏺` (U+23FA) — the same glyph
 /// `figures.ts` picks for Darwin. On Linux / Windows many default monospace
@@ -86,17 +85,13 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Empty session → render the welcome banner instead. Covers AC-V10.
-    // CC_TUI_MINIMAL skips the banner so scripted captures stay reproducible.
-    if app.is_empty_session() && !minimal_mode_enabled() {
-        let tip_seed = app.session_started.elapsed().as_secs() / 30;
-        lines.extend(welcome::render_welcome(
-            area.width,
-            &app.version,
-            &app.cwd,
-            tip_seed,
-        ));
-    }
+    // The welcome banner is NOT rendered here anymore — `run_tui` prints
+    // it to the terminal via plain stdout before entering raw mode, so it
+    // sits in native terminal scrollback above the inline viewport (fits
+    // regardless of our fixed small viewport height). Kept the TIPS /
+    // welcome render helpers accessible for Fullscreen-fallback + tests
+    // that still need them.
+    let _ = theme; // theme still threaded for sub-renderers below
 
     // Skip items already flushed to terminal scrollback via `insert_before`.
     // `run_tui` keeps `emitted_to_scrollback` monotonically increasing; this
@@ -759,19 +754,21 @@ mod tests {
         );
     }
 
-    /// AC-V10 — empty session shows the welcome banner with version, cwd,
-    /// and at least one tip. Pushing a user message hides the banner.
+    /// AC-V10 — the welcome banner is NO LONGER rendered into the ratatui
+    /// frame. `run_tui` now prints it to the terminal via plain stdout
+    /// before entering raw mode (so it survives the small fixed inline
+    /// viewport by sitting in native terminal scrollback). The frame must
+    /// therefore NOT contain the banner in any state.
     #[test]
-    fn empty_session_shows_welcome_banner_then_disappears() {
+    fn welcome_banner_is_not_in_ratatui_frame() {
         let mut app = App::new("s".into(), "m".into());
         app.set_version("0.1.0");
         app.set_cwd("~/dev/cc-rust");
         let s = render_to_string(&app, 80, 24);
-        assert!(s.contains("Welcome to Claude Code"), "{s}");
-        assert!(s.contains("v0.1.0"), "{s}");
-        assert!(s.contains("cwd: ~/dev/cc-rust"), "{s}");
-        let mentions_a_tip = welcome::TIPS.iter().any(|t| s.contains(t));
-        assert!(mentions_a_tip, "expected at least one tip; got:\n{s}");
+        assert!(
+            !s.contains("Welcome to Claude Code"),
+            "welcome leaked into frame: {s}"
+        );
 
         app.push_user("hi".into());
         let s2 = render_to_string(&app, 80, 24);
