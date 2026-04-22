@@ -9,6 +9,16 @@ use tokio_util::sync::CancellationToken;
 
 pub struct EditTool;
 
+/// Test-only hook: milliseconds to sleep between the read and the
+/// `stat-after` snapshot, so a concurrent writer can deterministically
+/// land in the stat-pair window. Production code reads `0` and skips
+/// the sleep entirely. Left at zero by default; only one test sets it
+/// (and resets it via RAII). See
+/// `tests::edit_detects_concurrent_write_between_stat_pair`.
+#[cfg(test)]
+pub(crate) static TEST_PAUSE_AFTER_READ_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[async_trait]
 impl Tool for EditTool {
     fn name(&self) -> &str {
@@ -64,23 +74,39 @@ impl Tool for EditTool {
             return Ok(ToolResult::error(format!("File not found: {file_path}")));
         }
 
+        // Lost-update detection. We stat the path once *before* the read
+        // and once *after*. If (len, mtime) changes across that pair,
+        // another writer landed during the read window and the content
+        // we just loaded is no longer tied to an identifiable on-disk
+        // version — bail rather than persist a partial merge. A second
+        // re-stat right before persist (below) catches writers that
+        // land during the compute-new-content window.
+        //
+        // The previous shape of this check captured the snapshot only
+        // AFTER `read_to_string`, which left a race window: a write
+        // that landed between the read and the snapshot would be
+        // captured in `read_snapshot`, match the pre-persist stat, and
+        // silently clobber the concurrent writer. The stat-before +
+        // stat-after pair closes that window by tying the read content
+        // to a consistent on-disk version. See openspec
+        // `fix-edit-atomic-write` §2 (2026-04-21 QA reopen).
+        let pre_read_snapshot = snapshot_metadata(path).await;
         let content = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| CcError::tool("tool", format!("failed to read {file_path}: {e}")))?;
-
-        // Lost-update detection snapshot. We stat the path right after the
-        // read, then stat it again just before persist. If (len, mtime)
-        // changed in between, another writer raced us and our in-memory
-        // `content` is stale — committing our new_content would silently
-        // overwrite their change. See openspec fix-edit-atomic-write §2.
-        //
-        // This is the "auto-snapshot within a single execute" variant
-        // (option b in the proposal): it catches races between our own
-        // read and our own persist. It does NOT catch the case where the
-        // file changed between a *prior* Read tool call and this Edit —
-        // that would require threading a caller-provided snapshot, which
-        // is a larger contract change and tracked separately.
+        #[cfg(test)]
+        {
+            let pause = TEST_PAUSE_AFTER_READ_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(pause)).await;
+            }
+        }
         let read_snapshot = snapshot_metadata(path).await;
+        if pre_read_snapshot.is_some() && pre_read_snapshot != read_snapshot {
+            return Ok(ToolResult::error(format!(
+                "file changed on disk during read; call Read again before Edit ({file_path})"
+            )));
+        }
 
         let occurrences = content.matches(old_string).count();
         if occurrences == 0 {
@@ -299,98 +325,119 @@ mod tests {
 
     // ── Lost-update detection (openspec fix-edit-atomic-write §2) ─────────────
 
-    #[tokio::test]
-    async fn edit_detects_lost_update_between_read_and_persist() {
-        // Two Edits racing, but with an artificial gap between the first
-        // Edit's read and its persist. Because we simulate the race via
-        // mtime-changing sleeps, we drive it deterministically instead of
-        // relying on tokio scheduling like the concurrent-writers test.
-        //
-        // Flow:
-        //   1. write "v1" to file
-        //   2. first Edit reads "v1", captures snapshot (len_v1, mtime_v1)
-        //   3. while first Edit is mid-execute, another writer overwrites
-        //      the file with "v2" (mtime bumps)
-        //   4. first Edit re-stats just before persist, sees mismatch,
-        //      returns an error instead of clobbering "v2"
-        //
-        // We can't literally pause inside `execute`, so instead we drive
-        // the check directly: after a fresh write, stat it, sleep past
-        // filesystem mtime granularity, overwrite, stat again — the two
-        // snapshots must differ. Then we run Edit end-to-end on the
-        // post-mutation file and confirm the unchanged-path still works.
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("lost.txt");
-        std::fs::write(&file, "v1-content-here\n").unwrap();
-        let snap1 = snapshot_metadata(&file).await.expect("stat v1");
-        // Sleep past common filesystem mtime granularity (HFS+/APFS: 1ns,
-        // ext4: 1ns, but tmpfs can coalesce writes within 10ms). 50ms is
-        // safe across platforms we care about.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        std::fs::write(&file, "v2-content-here-longer\n").unwrap();
-        let snap2 = snapshot_metadata(&file).await.expect("stat v2");
-        assert_ne!(
-            snap1, snap2,
-            "snapshot must differ between v1 and v2 (mtime or len)"
-        );
+    /// RAII guard that clears `TEST_PAUSE_AFTER_READ_MS` on drop so a
+    /// failing assertion does not leave a stale pause that slows every
+    /// subsequent edit test in the binary.
+    struct PauseGuard;
+    impl Drop for PauseGuard {
+        fn drop(&mut self) {
+            TEST_PAUSE_AFTER_READ_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
-        // Drive a full Edit against the post-mutation file. This
-        // exercises the read → snapshot → (no concurrent writer) →
-        // persist path, which must succeed — the lost-update check only
-        // fires when something ELSE writes between read and persist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edit_detects_concurrent_write_between_stat_pair() {
+        // Deterministic proof of the read-phase race-detection contract:
+        // while the Edit is paused between its stat-before and stat-after
+        // (via the test hook), a concurrent writer rewrites the file.
+        // `execute` must surface the lost-update error and MUST NOT
+        // persist — the background writer's content has to survive.
+        //
+        // This is the scenario the pre-2026-04-21 code silently
+        // clobbered: it captured the snapshot only after `read_to_string`,
+        // so the write landing in the stat-pair window was absorbed into
+        // `read_snapshot`, matched the pre-persist stat, and the edit
+        // went through.
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("stat-pair-race.txt");
+        std::fs::write(&file, "v1-content\n").unwrap();
+
+        // 300ms pause gives the background writer a comfortable window
+        // to land between the read and the stat-after. RAII guard
+        // resets on drop so a panic here does not poison other tests.
+        TEST_PAUSE_AFTER_READ_MS.store(300, Ordering::Relaxed);
+        let _guard = PauseGuard;
+
+        let file_for_writer = file.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::write(&file_for_writer, "v2-background-writer-wins\n").unwrap();
+        });
+
         let tool = EditTool;
         let cancel = CancellationToken::new();
         let r = tool
             .execute(
                 json!({
                     "file_path": file.to_string_lossy(),
-                    "old_string": "v2-content-here-longer",
-                    "new_string": "v3-final",
+                    "old_string": "v1-content",
+                    "new_string": "v3-edit-should-not-land",
                 }),
                 &cancel,
             )
             .await
-            .unwrap();
-        assert!(!r.is_error, "uncontested edit must succeed: {}", r.content);
+            .expect("execute should return, not panic");
+        writer.await.unwrap();
+
+        assert!(
+            r.is_error,
+            "edit must fail when a concurrent write landed during the read window; got: {:?}",
+            r.content
+        );
+        assert!(
+            r.content.contains("file changed on disk"),
+            "expected lost-update error message, got: {:?}",
+            r.content
+        );
+        // The background writer's content must be what's on disk — the
+        // Edit MUST NOT have persisted over it.
         let final_content = std::fs::read_to_string(&file).unwrap();
-        assert!(final_content.contains("v3-final"));
+        assert_eq!(
+            final_content, "v2-background-writer-wins\n",
+            "background writer's content must survive; edit must not clobber it"
+        );
     }
 
     #[tokio::test]
     async fn edit_lost_update_surfaces_clear_error() {
-        // End-to-end lost-update race. We race the Edit against a
-        // background thread that repeatedly rewrites the file, so at
-        // least one Edit iteration will observe a snapshot change
-        // between read and persist. We retry a few times because the
-        // race is timing-dependent.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+        // End-to-end lost-update race, driven deterministically via
+        // the test hook. A background writer lands during the Edit's
+        // read window; `execute` must surface the lost-update error
+        // (hard assertion, not "optional observation") and must not
+        // truncate the file.
+        //
+        // This is the hardened companion to
+        // `edit_detects_concurrent_write_between_stat_pair`: same
+        // invariant, but loops a few times to ensure we don't depend
+        // on a single lucky schedule.
+        use std::sync::atomic::Ordering;
 
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("race-lost.txt");
         std::fs::write(&file, "alpha-original-content\n").unwrap();
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = stop.clone();
-        let file2 = file.clone();
-        // Background writer: bump the file's mtime + len every 1ms. This
-        // maximizes the chance of landing inside the read→persist window.
-        let writer = std::thread::spawn(move || {
-            let mut n: u64 = 0;
-            while !stop2.load(Ordering::Relaxed) {
-                let _ = std::fs::write(
-                    &file2,
-                    format!("alpha-original-content-bg-{n}\n").as_bytes(),
-                );
-                n += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        });
+        // Pause long enough that a writer 50ms in lands well inside
+        // the stat-pair window.
+        TEST_PAUSE_AFTER_READ_MS.store(200, Ordering::Relaxed);
+        let _guard = PauseGuard;
 
         let tool = EditTool;
         let cancel = CancellationToken::new();
         let mut saw_lost_update = false;
-        for _ in 0..40 {
+        for i in 0..5 {
+            // Re-seed so each iteration starts from the same pre-image.
+            std::fs::write(&file, "alpha-original-content\n").unwrap();
+            let file_for_writer = file.clone();
+            let writer = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                std::fs::write(
+                    &file_for_writer,
+                    format!("alpha-background-{i}-wins\n").as_bytes(),
+                )
+                .unwrap();
+            });
             let r = tool
                 .execute(
                     json!({
@@ -401,21 +448,20 @@ mod tests {
                     &cancel,
                 )
                 .await;
+            writer.await.unwrap();
             if let Ok(tr) = r {
-                if tr.is_error && tr.content.contains("file changed on disk since last read") {
+                if tr.is_error && tr.content.contains("file changed on disk") {
                     saw_lost_update = true;
                     break;
                 }
             }
         }
-        stop.store(true, Ordering::Relaxed);
-        writer.join().unwrap();
 
-        // We don't hard-assert on saw_lost_update because the race can
-        // occasionally miss on very fast machines (persist wins). What
-        // matters is the error message shape is reachable AND the file
-        // was never truncated.
-        let _ = saw_lost_update;
+        assert!(
+            saw_lost_update,
+            "lost-update error must be observed when a concurrent writer lands \
+             during the stat-pair window"
+        );
         let final_content = std::fs::read_to_string(&file).unwrap();
         assert!(
             !final_content.is_empty(),
