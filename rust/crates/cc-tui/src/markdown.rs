@@ -30,6 +30,8 @@ use ratatui::{
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_fence = false;
+    #[cfg(feature = "tui-syntect")]
+    let mut highlighter: Option<crate::syntax::FenceHighlighter> = None;
 
     for raw in text.split_inclusive('\n') {
         // Strip trailing newline; the Line itself carries the row break.
@@ -43,13 +45,30 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                 let lang = rest.trim();
                 let fence_lang: Option<String> = (!lang.is_empty()).then(|| lang.to_string());
                 out.push(render_fence_open(fence_lang.as_deref()));
+                #[cfg(feature = "tui-syntect")]
+                {
+                    highlighter = fence_lang
+                        .as_deref()
+                        .and_then(crate::syntax::FenceHighlighter::new);
+                }
             } else {
                 in_fence = false;
                 out.push(render_fence_close());
+                #[cfg(feature = "tui-syntect")]
+                {
+                    highlighter = None;
+                }
             }
             continue;
         }
         if in_fence {
+            #[cfg(feature = "tui-syntect")]
+            {
+                if let Some(h) = highlighter.as_mut() {
+                    out.push(h.highlight_line(line));
+                    continue;
+                }
+            }
             out.push(render_code_line(line));
             continue;
         }
@@ -517,6 +536,35 @@ fn main() {}
         let out = render_markdown("> quoted");
         let plain = lines_to_string(&out);
         assert!(plain.contains("▏ quoted"));
+    }
+
+    #[cfg(feature = "tui-syntect")]
+    #[test]
+    fn syntect_colors_rust_fence_with_rgb_spans() {
+        // AC-V7 wire-up: under `tui-syntect`, a rust-language fence must
+        // emit multiple Rgb-coloured spans (keyword / identifier / punct),
+        // not a single LightYellow code span like the plain renderer.
+        let input = "```rust\nfn main() {}\n```";
+        let out = render_markdown(input);
+        // Find the code body line (between fence open `┌─` and close `└─`).
+        // Syntect may split "fn main" across span boundaries, so match on
+        // the concatenated line content rather than any single span.
+        let code_line = out
+            .iter()
+            .find(|l| {
+                let joined: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                joined.contains("fn main")
+            })
+            .expect("code body line missing");
+        let rgb_count = code_line
+            .spans
+            .iter()
+            .filter(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))))
+            .count();
+        assert!(
+            rgb_count >= 2,
+            "expected >=2 Rgb-coloured spans from syntect, got {rgb_count}"
+        );
     }
 
     #[test]

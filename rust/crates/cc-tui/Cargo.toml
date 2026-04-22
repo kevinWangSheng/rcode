@@ -30,12 +30,20 @@ anyhow.workspace = true
 name = "cc-tui-demo"
 path = "src/bin/tui_demo.rs"
 
+[dependencies.syntect]
+# Pure-Rust regex engine (`fancy-regex`) so we don't drag in the `onig`
+# C library. `default-fancy` already excludes `onig` but we disable
+# default features first to be explicit — keeps the surface audit-able.
+version = "5"
+default-features = false
+features = ["default-fancy"]
+optional = true
+
 [features]
 # Default-off: enable syntax-highlighted fenced code blocks via `syntect`.
 # Carries ~2 MiB of grammar data in the release binary, so it is gated
-# behind an explicit opt-in per M5 AC-V7. The feature is scaffolded now;
-# the `syntect` dependency is not pulled in until the integration lands.
-tui-syntect = []
+# behind an explicit opt-in per M5 AC-V7.
+tui-syntect = ["dep:syntect"]
 
 [dev-dependencies]
 tempfile.workspace = true

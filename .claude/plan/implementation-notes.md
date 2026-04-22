@@ -176,3 +176,38 @@ a `tracing::warn!` naming the bypassed host + resolved IP. Intended for
 local dev against `127.0.0.1` dev servers; never set this in production.
 
 Reference: `openspec/changes/fix-webfetch-ssrf/`, `cc-tools/src/web_fetch/ssrf.rs`.
+
+---
+
+## TUI / Visual Parity (cc-tui)
+
+### M5 AC-V7 binary size budget (measured 2026-04-21)
+
+Release build of `rust/target/release/claude` on macOS arm64, stripped
+by `cargo`'s release profile defaults (no explicit `strip = true`):
+
+| Build | Bytes | Δ vs pre-M5 baseline |
+|---|---|---|
+| Pre-M5 baseline (commit `8a6b36c`, just before `c8fe5dd` Phase A) | 14,047,488 | — |
+| HEAD, `tui-syntect` OFF (default features) | 14,293,216 | **+240 KiB** |
+| HEAD, `tui-syntect` ON (`--features cc-tui/tui-syntect`) | 15,090,112 | **+1,017 KiB** |
+
+Both AC-V7 clauses pass with room to spare (budgets: 500 KiB default,
+2 MiB with `tui-syntect`). The +240 KiB default-build cost is the sum
+of M5 Phase A–D rendering code; no third-party dependency was pulled
+in for the default build. The +1,017 KiB feature-on cost is syntect's
+compiled grammars + `base16-ocean.dark` theme + `fancy-regex`.
+
+**How to reproduce:**
+```
+cargo build --manifest-path rust/Cargo.toml --release -p claude-cli
+stat -f '%z bytes' rust/target/release/claude                    # OFF
+cargo build --manifest-path rust/Cargo.toml --release -p claude-cli --features cc-tui/tui-syntect
+stat -f '%z bytes' rust/target/release/claude                    # ON
+```
+
+For the baseline, `git worktree add /tmp/cc-baseline 8a6b36c` then
+build `claude-cli` in that tree.
+
+**Link-order jitter:** repeated release builds of the same sources vary
+by ≈15 KiB. Treat any delta under ~30 KiB as noise.

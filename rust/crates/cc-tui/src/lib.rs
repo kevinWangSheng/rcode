@@ -14,6 +14,8 @@ pub mod markdown;
 pub mod prompter;
 pub mod render;
 mod runtime;
+#[cfg(feature = "tui-syntect")]
+pub mod syntax;
 pub mod theme;
 mod util;
 pub mod welcome;
