@@ -522,6 +522,43 @@ fn streaming_flushes_stable_paragraphs_to_scrollback() {
     drop(tui);
 }
 
+/// Welcome banner must appear in the transcript area when the Inline
+/// viewport fell back to Fullscreen (terminals whose DSR reply is slow
+/// or missing — nested tmux, ssh with proxy, some MCP-hosted emulators).
+///
+/// Under the pre-fix code, the banner was printed to stdout BEFORE raw
+/// mode and then wiped by `Terminal::clear()` in the Fullscreen-fallback
+/// branch, leaving the empty-session screen totally blank above the
+/// input box. After the fix, `run_tui` stashes the banner on `App` when
+/// falling back to Fullscreen and `render_transcript` paints it into
+/// the frame while `is_empty_session()` holds.
+///
+/// `CC_TUI_FORCE_FULLSCREEN=1` skips the Inline attempt entirely,
+/// guaranteeing the Fullscreen code path runs.
+#[test]
+fn welcome_banner_visible_under_fullscreen_fallback() {
+    build_demo_once().unwrap();
+
+    let opts = LaunchOpts {
+        cols: 100,
+        rows: 40,
+        script: r#"[{"sleep_ms": 300}]"#.to_string(),
+        log_path: None,
+        extra_env: vec![("CC_TUI_FORCE_FULLSCREEN".to_string(), "1".to_string())],
+    };
+    let tui = TuiPty::launch(opts).unwrap();
+
+    let (matched, screen) = tui.wait_for(
+        |s| s.contains("Welcome to Claude Code"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        matched,
+        "welcome banner missing under Fullscreen fallback — \
+         did the banner leak into the pre-raw-mode println path again?\n{screen}"
+    );
+}
+
 /// M3 manual runtime check: 80-column Terminal.app launch must render
 /// cleanly with no rendering artifacts.
 ///

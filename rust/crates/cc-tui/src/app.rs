@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use cc_core::PromptDecision;
+use ratatui::text::Line;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -234,6 +235,12 @@ pub struct App {
     /// native scrollback, which the user can scroll back through with
     /// their terminal's own mouse-wheel / Shift+PageUp bindings.
     pub emitted_to_scrollback: usize,
+    /// Welcome banner captured at startup, rendered in-frame by the
+    /// transcript layer ONLY when the Inline viewport couldn't be
+    /// obtained (Fullscreen fallback). Under a working Inline viewport
+    /// the banner is pushed into terminal scrollback via
+    /// `Terminal::insert_before`, so the in-frame copy stays `None`.
+    pub welcome_banner: Option<Vec<Line<'static>>>,
 }
 
 impl App {
@@ -265,7 +272,16 @@ impl App {
             git_branch: None,
             session_started: Instant::now(),
             emitted_to_scrollback: 0,
+            welcome_banner: None,
         }
+    }
+
+    /// Stash the rendered welcome banner so `render_transcript` paints
+    /// it into the frame. Used only by the Fullscreen-fallback path in
+    /// `run_tui`; under an Inline viewport the banner is pushed to
+    /// native terminal scrollback via `Terminal::insert_before` instead.
+    pub fn set_welcome_banner(&mut self, lines: Vec<Line<'static>>) {
+        self.welcome_banner = Some(lines);
     }
 
     /// Set the binary version surfaced in the welcome banner. Idempotent —

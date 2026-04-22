@@ -85,12 +85,17 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // The welcome banner is NOT rendered here anymore — `run_tui` prints
-    // it to the terminal via plain stdout before entering raw mode, so it
-    // sits in native terminal scrollback above the inline viewport (fits
-    // regardless of our fixed small viewport height). Kept the TIPS /
-    // welcome render helpers accessible for Fullscreen-fallback + tests
-    // that still need them.
+    // Welcome banner: rendered in-frame ONLY when `run_tui` stashed one
+    // on `App` — that happens exclusively on the Fullscreen-fallback
+    // path, because Inline mode pushes the banner into native terminal
+    // scrollback via `insert_before` and never populates this field.
+    // Once the user submits a turn, `is_empty_session()` flips false and
+    // the banner naturally hides without further bookkeeping.
+    if app.is_empty_session() {
+        if let Some(banner) = &app.welcome_banner {
+            lines.extend(banner.iter().cloned());
+        }
+    }
     let _ = theme; // theme still threaded for sub-renderers below
 
     // Skip items already flushed to terminal scrollback via `insert_before`.
@@ -754,22 +759,49 @@ mod tests {
         );
     }
 
-    /// AC-V10 — the welcome banner is NO LONGER rendered into the ratatui
-    /// frame. `run_tui` now prints it to the terminal via plain stdout
-    /// before entering raw mode (so it survives the small fixed inline
-    /// viewport by sitting in native terminal scrollback). The frame must
-    /// therefore NOT contain the banner in any state.
+    /// AC-V10 (Inline default) — when the caller has NOT stashed a
+    /// welcome banner on `App`, the frame contains no banner. The
+    /// Inline-viewport path in `run_tui` pushes the banner into native
+    /// terminal scrollback via `insert_before` and leaves
+    /// `app.welcome_banner == None`, so the frame itself stays banner-
+    /// free. This test pins that empty-state invariant.
     #[test]
-    fn welcome_banner_is_not_in_ratatui_frame() {
+    fn welcome_banner_is_not_in_ratatui_frame_under_inline() {
         let mut app = App::new("s".into(), "m".into());
         app.set_version("0.1.0");
         app.set_cwd("~/dev/cc-rust");
         let s = render_to_string(&app, 80, 24);
         assert!(
             !s.contains("Welcome to Claude Code"),
-            "welcome leaked into frame: {s}"
+            "welcome leaked into frame when no banner is stashed: {s}"
+        );
+    }
+
+    /// AC-V10 (Fullscreen fallback) — when the caller has stashed a
+    /// banner on `App` (the Fullscreen-fallback path in `run_tui`), the
+    /// banner renders inside the transcript area and hides automatically
+    /// once a transcript item arrives.
+    #[test]
+    fn welcome_banner_renders_in_ratatui_frame_under_fullscreen() {
+        use ratatui::text::{Line, Span};
+        let mut app = App::new("s".into(), "m".into());
+        app.set_version("0.1.0");
+        app.set_cwd("~/dev/cc-rust");
+        app.set_welcome_banner(vec![
+            Line::from(Span::raw("Welcome to Claude Code".to_string())),
+            Line::from(Span::raw("v0.1.0".to_string())),
+            Line::from(Span::raw("cwd: ~/dev/cc-rust".to_string())),
+        ]);
+
+        // Empty session → banner is visible.
+        let s = render_to_string(&app, 80, 24);
+        assert!(
+            s.contains("Welcome to Claude Code"),
+            "welcome banner missing in Fullscreen empty-session frame:\n{s}"
         );
 
+        // Once a transcript item lands, is_empty_session flips false and
+        // the banner hides even though `app.welcome_banner` is still set.
         app.push_user("hi".into());
         let s2 = render_to_string(&app, 80, 24);
         assert!(

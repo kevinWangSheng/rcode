@@ -163,27 +163,6 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // to a temp file they then read + assert on. Idempotent per process.
     install_file_log();
 
-    // ── Print welcome banner to scrollback, BEFORE raw mode ──────────────
-    //
-    // The welcome banner is ~12 rows tall (fancy variant). Trying to render
-    // it inside the fixed 8-row inline viewport just clips it. Instead we
-    // emit it as a normal println! sequence so it sits in the terminal's
-    // native scrollback above wherever our inline viewport ends up. User
-    // scrolls up with mouse-wheel to see it; it also persists after exit
-    // like any other CLI output.
-    if app.is_empty_session() {
-        let banner_width = crossterm::terminal::size().map(|s| s.0).unwrap_or(80);
-        let tip_seed = app.session_started.elapsed().as_secs() / 30;
-        for line in crate::welcome::render_welcome(banner_width, &app.version, &app.cwd, tip_seed) {
-            // Strip ANSI styling for this path — we're writing directly to
-            // stdout pre-raw-mode; ratatui's Line style attributes don't
-            // survive the println! boundary cleanly. Plain text is fine
-            // for the banner: version/cwd/tip readability is the goal.
-            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            println!("{plain}");
-        }
-    }
-
     // ── Initialize terminal (inline viewport) ─────────────────────────────
     //
     // Phase D follow-up: switch from `ratatui::init()` (alt-screen) to an
@@ -262,6 +241,47 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // overlap risk — Inline only paints its own carved region.
     if viewport_kind == ViewportKind::Fullscreen {
         let _ = terminal.clear();
+    }
+
+    // ── Welcome banner (empty-session only) ──────────────────────────────
+    //
+    // The banner sits above any assistant output. We render it through
+    // two different paths depending on the viewport we ended up with:
+    //
+    //   Inline  → push into native terminal scrollback via
+    //             `Terminal::insert_before`. The banner survives across
+    //             the whole session and the user can scroll the terminal
+    //             up to see it later.
+    //   Fullscreen → stash on `App`; `render_transcript` paints it into
+    //             the transcript area for as long as `is_empty_session()`
+    //             holds. Once the user submits a turn, transcript items
+    //             take over naturally.
+    //
+    // We deliberately do NOT println! the banner before raw mode like
+    // the earlier implementation did: the Fullscreen fallback calls
+    // `terminal.clear()` right above this block, which would wipe a
+    // pre-printed banner off the screen.
+    if app.is_empty_session() {
+        let banner_width = term_size.0;
+        let tip_seed = app.session_started.elapsed().as_secs() / 30;
+        let lines =
+            crate::welcome::render_welcome(banner_width, &app.version, &app.cwd, tip_seed);
+        match viewport_kind {
+            ViewportKind::Inline => {
+                let n = lines.len() as u16;
+                let lines_for_closure = lines.clone();
+                if let Err(e) = terminal.insert_before(n, |buf| {
+                    use ratatui::widgets::{Paragraph, Widget};
+                    let area = buf.area;
+                    Paragraph::new(lines_for_closure).render(area, buf);
+                }) {
+                    tracing::warn!("welcome insert_before failed: {e}");
+                }
+            }
+            ViewportKind::Fullscreen => {
+                app.set_welcome_banner(lines);
+            }
+        }
     }
 
     // Current viewport state. Kept outside `draw_with_resize` so we can
