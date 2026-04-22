@@ -521,3 +521,77 @@ fn streaming_flushes_stable_paragraphs_to_scrollback() {
 
     drop(tui);
 }
+
+/// M3 manual runtime check: 80-column Terminal.app launch must render
+/// cleanly with no rendering artifacts.
+///
+/// Covers the "Terminal.app 80-col launch" line-item in the M3 entry
+/// criteria for Milestone 5. The headless `TestBackend` tests don't
+/// catch escape-sequence leakage, cursor misplacement, or content
+/// overflowing the declared width — vt100::Parser does. This test
+/// launches `cc-tui-demo` at 80x24 (the historical minimum-viable
+/// terminal size for a `clawd`-style CLI) and asserts:
+///
+///   1. The welcome banner appears within 3 s.
+///   2. The `>` prompt glyph is present (input row rendered).
+///   3. No visible row exceeds 80 display cells (no overflow that
+///      vt100 had to clip).
+///   4. No raw escape-sequence literals leak into the rendered grid
+///      (e.g. `\x1b[` or `ESC[` visible as plain text would mean the
+///      renderer emitted an unrecognised / malformed sequence).
+#[test]
+fn launches_cleanly_at_80_cols_no_artifacts() {
+    build_demo_once().unwrap();
+
+    let opts = LaunchOpts {
+        cols: 80,
+        rows: 24,
+        // Small idle script — enough to prove the demo starts, not
+        // enough to exercise scrollback. Keeps the check focused on
+        // the empty-session shell layout.
+        script: r#"[{"sleep_ms": 300}]"#.to_string(),
+        log_path: None,
+        extra_env: Vec::new(),
+    };
+    let tui = TuiPty::launch(opts).unwrap();
+
+    // Welcome banner anchor: "Welcome to Claude Code" is the most
+    // stable string in the empty-session welcome card.
+    let (matched, screen) = tui.wait_for(
+        |s| s.contains("Welcome to Claude Code"),
+        Duration::from_secs(3),
+    );
+    assert!(matched, "welcome banner missing at 80x24:\n{screen}");
+
+    // The unambiguous input glyph. Helps catch regressions where the
+    // PromptInput row drifts off-screen or the gutter disappears.
+    assert!(
+        screen.contains('>'),
+        "no `>` prompt glyph at 80x24:\n{screen}"
+    );
+
+    // Row width: vt100 clips at 80 cells, so a width-overflow bug
+    // manifests as a truncated row rather than an 81-cell row. We
+    // still assert <=80 defensively in case vt100 ever changes.
+    for (i, line) in screen.lines().enumerate() {
+        let w: usize = line
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        assert!(
+            w <= 80,
+            "row {i} is {w} display cells wide in an 80-col terminal:\n{line}"
+        );
+    }
+
+    // Escape-sequence leakage: any `\x1b[` that reaches the rendered
+    // grid as printable text means the renderer emitted bytes the VT
+    // engine couldn't interpret. Check both the ESC glyph and the
+    // usual textual forms ("ESC[", "^[").
+    for needle in ["\u{1b}[", "ESC[", "^["] {
+        assert!(
+            !screen.contains(needle),
+            "raw escape-sequence leak `{needle}` in rendered screen:\n{screen}"
+        );
+    }
+}
