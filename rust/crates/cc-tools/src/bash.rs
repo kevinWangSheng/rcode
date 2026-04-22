@@ -8,6 +8,30 @@ use tokio_util::sync::CancellationToken;
 
 pub struct BashTool;
 
+/// Send SIGKILL to the child's process group so any descendants the
+/// wrapper shell spawned (commands it `exec`ed, background jobs, etc.)
+/// are torn down too. On Unix we paired this with `Command::process_group(0)`
+/// at spawn time, so the child's PID equals its process-group id.
+/// On non-Unix platforms this is a no-op; the direct `child.kill()`
+/// that callers still invoke is the best we can do there.
+#[cfg(unix)]
+fn kill_process_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // SAFETY: `kill` is a POSIX syscall with no preconditions beyond
+        // the arguments being in range. A negative `pid` targets the
+        // process group whose id equals `-pid` (see kill(2)).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: Option<u32>) {
+    // Process groups are a Unix concept; fall back to the per-child
+    // kill that the caller still issues.
+}
+
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &str {
@@ -57,13 +81,37 @@ impl Tool for BashTool {
 
         // Spawn the child so we can kill it on cancel. `Command::output()`
         // doesn't give us a handle to do that — it buffers the entire run.
-        let mut child = Command::new("bash")
-            .arg("-c")
+        //
+        // On Unix we also put the child in its own process group via
+        // `process_group(0)` so that on cancel/timeout we can send
+        // SIGKILL to the *whole group* (pgid = child PID). Without
+        // this, `child.kill()` only reaps the wrapper shell and any
+        // long-lived descendants bash spawned (`sleep 30`, background
+        // jobs, etc.) are reparented to init and keep running — which
+        // breaks the "next bash sees a clean slate" invariant this fix
+        // is supposed to guarantee. See openspec
+        // `fix-bash-cancel-explicit-kill` §1.
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
             .arg(&command)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            // `tokio::process::Command::process_group` is the inherent
+            // wrapper over `std::os::unix::process::CommandExt::process_group`,
+            // so no trait import is needed. Pgid `0` creates a new group
+            // with the child as leader, giving us a stable target for
+            // `killpg` on cancel/timeout.
+            cmd.process_group(0);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| cc_core::CcError::tool("tool", format!("failed to spawn bash: {e}")))?;
+        // Capture the PID up-front: `child.id()` returns `None` after
+        // `wait()` consumes the exit status, and we may need the PID
+        // in the cancel/timeout arms below which run after wait.
+        let child_pid = child.id();
 
         let output = {
             // Drive wait + cancel in a separate scope so the borrow of `child`
@@ -93,9 +141,11 @@ impl Tool for BashTool {
                 result = tokio::time::timeout(timeout, run) => {
                     match result {
                         Err(_) => {
-                            // Timeout: explicit kill + reap. Don't rely on Drop —
-                            // the zombie window on Linux under load leaves the
-                            // PID alive from the caller's POV.
+                            // Timeout: kill the whole process group (shell +
+                            // descendants) then reap the direct child. A plain
+                            // `child.kill()` only signals the wrapper shell
+                            // and leaves its children running.
+                            kill_process_group(child_pid);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
                             return Err(cc_core::CcError::tool(
@@ -110,11 +160,12 @@ impl Tool for BashTool {
                     }
                 }
                 // Cancel token fires (Ctrl+C, permission denied mid-flight,
-                // etc.). Explicitly kill + reap the child before returning —
-                // Drop is asynchronous and can leave the PID alive from the
-                // caller's POV, which breaks "the next bash sees a clean
-                // slate" invariants.
+                // etc.). Kill the entire process group + reap — Drop is
+                // asynchronous and only reaps the shell, which leaves
+                // grandchild commands (e.g. `sleep 30`) orphaned and alive,
+                // breaking "the next bash sees a clean slate".
                 _ = cancel.cancelled() => {
+                    kill_process_group(child_pid);
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     return Err(cc_core::CcError::tool("tool", "bash execution cancelled"));
@@ -241,45 +292,59 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn bash_cancel_explicitly_kills_and_reaps() {
-        // Launch a long-running bash that writes its own pid to a sentinel
-        // file, then sleeps. Cancel the tool. Once the tool returns, the
-        // pid MUST no longer be alive from the OS's POV.
+    async fn bash_cancel_kills_descendant_process_tree() {
+        // Regression for the QA reopen of `fix-bash-cancel-explicit-kill`:
+        // plain `child.kill()` only reaps the wrapper `bash -c` shell. If
+        // that shell spawned a long-lived command (`sleep 30`, a backgrounded
+        // job, …), the command is reparented to init and keeps running —
+        // which breaks the "next bash sees a clean slate" invariant.
+        //
+        // This test records the GRANDCHILD's pid (the `sleep 30`), not `$$`
+        // (the shell), cancels mid-run, and asserts the grandchild is gone
+        // by the time the tool returns. It is the specific assertion the
+        // previous `echo $$ > pidfile` test did not make.
         use std::time::Duration;
 
         let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("pid");
+        let pidfile = dir.path().join("child_pid");
         let pidfile_str = pidfile.to_string_lossy().to_string();
 
         let tool = BashTool;
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
-            // Give bash time to write the pid.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Give bash time to launch sleep and write the pid.
+            tokio::time::sleep(Duration::from_millis(250)).await;
             cancel2.cancel();
         });
 
-        let command = format!("echo $$ > {pidfile_str} && sleep 30");
+        // `sleep 30 &` backgrounds the sleep; `$!` is the backgrounded
+        // pid (the actual long-lived grandchild). `wait $!` blocks the
+        // shell until sleep exits, which it never does before cancel.
+        // Note: without process-group kill, SIGKILL'ing the shell
+        // leaves the `sleep 30` orphaned and still running — which is
+        // what this test guards against.
+        let command = format!("sleep 30 & echo $! > {pidfile_str} && wait $!");
         let result = tool.execute(json!({"command": command}), &cancel).await;
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
 
-        // Read the pid that bash wrote before sleeping.
         let pid_str = std::fs::read_to_string(&pidfile).unwrap_or_default();
-        let pid: i32 = match pid_str.trim().parse() {
-            Ok(p) => p,
-            Err(_) => return, // If bash didn't even write the pid, nothing to verify.
-        };
+        let pid: i32 = pid_str
+            .trim()
+            .parse()
+            .expect("background sleep pid should be recorded before cancel");
+        assert!(pid > 0, "pid must be positive, got {pid}");
 
-        // Poll briefly for reaping; on cancel we issue kill+wait so the child
-        // should be gone by the time the tool returns, but the immediate
-        // parent-child relationship only guarantees the tokio Child was
-        // reaped — the bash pid may linger as a zombie on very slow systems.
-        // `kill(pid, 0)` returns Err(ESRCH) when the process is gone.
+        // The grandchild can linger briefly after cancel returns on slow
+        // systems (zombie reap window). Poll with a short budget — if it
+        // outlives this window we've leaked a descendant.
         let mut alive = true;
-        for _ in 0..20 {
-            // SAFETY: kill(pid, 0) is a no-op signal used to probe liveness.
+        for _ in 0..40 {
+            // SAFETY: kill(pid, 0) is a no-op signal used only to probe
+            // liveness. It returns 0 while the pid is alive, -1 once
+            // it's gone (errno = ESRCH).
             let res = unsafe { libc::kill(pid, 0) };
             if res != 0 {
                 alive = false;
@@ -289,7 +354,8 @@ mod tests {
         }
         assert!(
             !alive,
-            "pid {pid} still alive after cancel — kill+reap failed"
+            "grandchild pid {pid} (the `sleep 30`) still alive after cancel — \
+             process-group kill failed to reach the descendant subtree"
         );
     }
 

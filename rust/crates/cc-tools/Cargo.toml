@@ -21,6 +21,8 @@ reqwest.workspace = true
 tempfile = "3"
 url = "2"
 
-[dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
 tracing-test = "0.2"
