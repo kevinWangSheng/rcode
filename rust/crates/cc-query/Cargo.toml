@@ -19,6 +19,7 @@ tracing.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
+crossterm.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

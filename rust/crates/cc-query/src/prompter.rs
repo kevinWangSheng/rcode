@@ -42,6 +42,24 @@ impl PermissionPrompter for StdinPrompter {
             );
         }
 
+        // Guard against deadlock in TUI mode: crossterm owns stdin via an
+        // EventStream in raw mode, so a blocking `read_line` here would
+        // wait forever. Return a graceful message so the assistant can
+        // proceed without hanging the turn. Reported 2026-04-21 as a
+        // "Crafting… 200s" spinner that never completed after the model
+        // called AskUserQuestion. The TUI path will grow a proper
+        // AskUserQuestion dialog; until then this keeps the engine
+        // unblocked.
+        if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+            return Ok(
+                "User cannot be reached interactively in this TUI session; \
+                 a dedicated AskUserQuestion dialog has not been wired up yet. \
+                 Please proceed with reasonable defaults or ask the question as \
+                 regular assistant text so the user can answer in the prompt box."
+                    .to_string(),
+            );
+        }
+
         // Print question and options to stderr
         eprintln!("\n{question}");
         for (i, opt) in options.iter().enumerate() {

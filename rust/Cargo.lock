@@ -394,6 +394,7 @@ dependencies = [
  "cc-permissions",
  "cc-session",
  "cc-tools",
+ "crossterm",
  "futures",
  "reqwest",
  "serde",
