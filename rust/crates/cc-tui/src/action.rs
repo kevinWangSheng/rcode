@@ -17,6 +17,17 @@ pub enum AppAction {
     // Input
     InsertChar(char),
     Backspace,
+    /// Delete the char AT the caret (Delete key — opposite direction
+    /// from Backspace).
+    DeleteChar,
+    /// Move the insertion caret by one char. +1 = right, -1 = left.
+    /// Anything else is ignored so callers can't silently move by
+    /// multiple chars at a time.
+    CursorMove(i32),
+    /// Jump the caret to the start of the input buffer (Home).
+    CursorHome,
+    /// Jump the caret to the end of the input buffer (End).
+    CursorEnd,
     Submit,
     NewLine,
 
@@ -148,7 +159,7 @@ fn close_palette(app: &mut App, replacement: Option<String>) {
     app.palette_matches.clear();
     app.palette_selected = 0;
     if let Some(new_input) = replacement {
-        app.input = new_input;
+        app.set_input(new_input);
     }
 }
 
@@ -171,7 +182,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
     match action {
         AppAction::InsertChar(c) => {
             if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
-                app.input.push(c);
+                app.input_insert_char(c);
                 if app.mode == AppMode::CommandPalette {
                     refresh_palette(app, ctx.commands);
                 }
@@ -179,7 +190,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
         }
         AppAction::Backspace => {
             if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
-                app.input.pop();
+                app.input_backspace();
                 if app.mode == AppMode::CommandPalette {
                     // Backspacing the leading `/` cancels the palette so the
                     // user isn't stuck picking from stale results.
@@ -191,12 +202,39 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 }
             }
         }
+        AppAction::DeleteChar => {
+            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+                app.input_delete();
+                if app.mode == AppMode::CommandPalette {
+                    refresh_palette(app, ctx.commands);
+                }
+            }
+        }
+        AppAction::CursorMove(delta) => {
+            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+                match delta {
+                    d if d < 0 => app.input_cursor_left(),
+                    d if d > 0 => app.input_cursor_right(),
+                    _ => {}
+                }
+            }
+        }
+        AppAction::CursorHome => {
+            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+                app.input_cursor_home();
+            }
+        }
+        AppAction::CursorEnd => {
+            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+                app.input_cursor_end();
+            }
+        }
         AppAction::Submit => {
             let text = app.input.trim().to_string();
             if text.is_empty() {
                 return UpdateResult::Continue;
             }
-            app.input.clear();
+            app.clear_input();
 
             // Check if it's a slash command
             if let Some(cmd) = parse(&text) {
@@ -259,7 +297,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             }
         }
         AppAction::NewLine => {
-            app.input.push('\n');
+            app.input_insert_char('\n');
         }
         AppAction::ScrollUp(n) => {
             app.scroll = app.scroll.saturating_add(n);
@@ -381,7 +419,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 // Tests that call PaletteOpen directly on a non-empty buffer
                 // preserve whatever is already there.
                 if !app.input.starts_with('/') {
-                    app.input.push('/');
+                    app.input_insert_char('/');
                 }
                 refresh_palette(app, ctx.commands);
             }
@@ -497,6 +535,79 @@ mod tests {
         assert!(matches!(result, UpdateResult::SubmitToEngine(t) if t == "hi"));
     }
 
+    /// Pins the 2026-04-22 "can't move cursor left/right" regression:
+    /// InsertChar must honour `input_cursor` so the user can edit the
+    /// middle of a buffer, and Left/Right/Home/End/Delete must mutate
+    /// the caret position / buffer as expected.
+    #[test]
+    fn cursor_movement_inserts_mid_buffer_and_deletes_at_caret() {
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+
+        // Type "helo" end-on.
+        for c in "helo".chars() {
+            update(&mut app, AppAction::InsertChar(c), &uctx);
+        }
+        assert_eq!(app.input, "helo");
+        assert_eq!(app.input_cursor, 4);
+
+        // Move one char left → between 'l' and 'o'.
+        update(&mut app, AppAction::CursorMove(-1), &uctx);
+        assert_eq!(app.input_cursor, 3);
+
+        // Insert 'l' — buffer becomes "hello", caret advances past it.
+        update(&mut app, AppAction::InsertChar('l'), &uctx);
+        assert_eq!(app.input, "hello");
+        assert_eq!(app.input_cursor, 4);
+
+        // Home jumps to start; Delete removes 'h'.
+        update(&mut app, AppAction::CursorHome, &uctx);
+        assert_eq!(app.input_cursor, 0);
+        update(&mut app, AppAction::DeleteChar, &uctx);
+        assert_eq!(app.input, "ello");
+        assert_eq!(app.input_cursor, 0);
+
+        // End jumps to buffer end.
+        update(&mut app, AppAction::CursorEnd, &uctx);
+        assert_eq!(app.input_cursor, app.input.len());
+
+        // Backspace at start of buffer is a no-op (invariant guard).
+        update(&mut app, AppAction::CursorHome, &uctx);
+        let before = app.input.clone();
+        update(&mut app, AppAction::Backspace, &uctx);
+        assert_eq!(app.input, before);
+        assert_eq!(app.input_cursor, 0);
+    }
+
+    /// CJK / emoji insertion must keep the caret on UTF-8 char
+    /// boundaries — otherwise a follow-up left-arrow panics on
+    /// `String::remove`. This anchors the invariant.
+    #[test]
+    fn cursor_movement_respects_utf8_boundaries() {
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+
+        update(&mut app, AppAction::InsertChar('中'), &uctx);
+        update(&mut app, AppAction::InsertChar('文'), &uctx);
+        assert_eq!(app.input, "中文");
+        assert_eq!(app.input_cursor, "中文".len());
+
+        update(&mut app, AppAction::CursorMove(-1), &uctx);
+        assert_eq!(app.input_cursor, "中".len());
+
+        update(&mut app, AppAction::Backspace, &uctx);
+        assert_eq!(app.input, "文");
+        assert_eq!(app.input_cursor, 0);
+    }
+
     #[test]
     fn quit_action_returns_quit() {
         let mut app = App::new("s".into(), "m".into());
@@ -512,7 +623,7 @@ mod tests {
     #[test]
     fn slash_exit_returns_quit() {
         let mut app = App::new("s".into(), "m".into());
-        app.input = "/exit".into();
+        app.set_input("/exit");
         let (reg, ctx) = test_ctx();
         let uctx = UpdateContext {
             commands: &reg,
@@ -537,7 +648,7 @@ mod tests {
         let tok = tokio_util::sync::CancellationToken::new();
         app.current_turn_cancel = Some(tok.clone());
 
-        app.input = "/exit".into();
+        app.set_input("/exit");
         let (reg, ctx) = test_ctx();
         let uctx = UpdateContext {
             commands: &reg,
@@ -989,7 +1100,7 @@ mod tests {
     #[test]
     fn slash_reload_keybindings_dispatches_reload_not_submit_to_engine() {
         let mut app = App::new("s".into(), "m".into());
-        app.input = "/reload-keybindings".into();
+        app.set_input("/reload-keybindings");
         let (reg, ctx) = test_ctx();
         let uctx = UpdateContext {
             commands: &reg,

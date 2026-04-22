@@ -552,13 +552,21 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // very long buffer never points outside the box (the visible text
     // inside the box is already truncated at the border by Paragraph).
     if !matches!(app.mode, AppMode::PermissionPrompt) {
-        let typed_width = UnicodeWidthStr::width(app.input.as_str()) as u16;
+        // Width of the text PRECEDING the caret, not the whole buffer —
+        // otherwise Left/Home would visually move the caret to the same
+        // end-of-text column as the "typing at the end" case. The
+        // `input_cursor` field on `App` tracks the byte offset; slicing
+        // at that offset is safe because the offset is maintained on a
+        // UTF-8 char boundary by every edit helper.
+        let cursor_offset = app.input_cursor.min(app.input.len());
+        let before_caret = &app.input[..cursor_offset];
+        let prefix_width = UnicodeWidthStr::width(before_caret) as u16;
         let gutter_cells: u16 = 2; // "> "
         let cursor_x = area
             .x
             .saturating_add(1) // step past left border
             .saturating_add(gutter_cells)
-            .saturating_add(typed_width)
+            .saturating_add(prefix_width)
             .min(area.x.saturating_add(area.width).saturating_sub(2));
         let cursor_y = area.y.saturating_add(1); // step past top border
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -883,7 +891,7 @@ mod tests {
 
         // Typed "hello" → cursor advances 5 cells.
         let mut app_typed = App::new("s".into(), "m".into());
-        app_typed.input = "hello".into();
+        app_typed.set_input("hello");
         term.draw(|f| render(f, &app_typed)).unwrap();
         assert_eq!(
             term.backend_mut().get_cursor_position().unwrap(),
@@ -893,12 +901,44 @@ mod tests {
 
         // CJK ideograph (2 cells wide) → cursor advances 2.
         let mut app_cjk = App::new("s".into(), "m".into());
-        app_cjk.input = "中".into();
+        app_cjk.set_input("中");
         term.draw(|f| render(f, &app_cjk)).unwrap();
         assert_eq!(
             term.backend_mut().get_cursor_position().unwrap(),
             Position::new(5, 20),
             "caret didn't account for CJK width"
+        );
+
+        // Left-arrow moves caret one char back — for "hello" with caret
+        // at end (x=8), Left should land it at x=7 (between "l" and
+        // "o"). Pins the regression for "can't move cursor left/right"
+        // reported 2026-04-22.
+        let mut app_mid = App::new("s".into(), "m".into());
+        app_mid.set_input("hello");
+        app_mid.input_cursor_left();
+        term.draw(|f| render(f, &app_mid)).unwrap();
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(7, 20),
+            "caret didn't move left after input_cursor_left()"
+        );
+
+        // Home jumps caret to start; End jumps to end.
+        let mut app_home = App::new("s".into(), "m".into());
+        app_home.set_input("hello");
+        app_home.input_cursor_home();
+        term.draw(|f| render(f, &app_home)).unwrap();
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(3, 20),
+            "Home didn't land caret at gutter"
+        );
+        app_home.input_cursor_end();
+        term.draw(|f| render(f, &app_home)).unwrap();
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(8, 20),
+            "End didn't return caret to buffer end"
         );
     }
 
@@ -917,7 +957,7 @@ mod tests {
         // (the maximum the popup ever shows). Real palette_matches
         // contents don't matter for the OOB check — only the count.
         app.mode = AppMode::CommandPalette;
-        app.input = "/".into();
+        app.set_input("/");
         app.palette_matches = (0..8).map(|i| format!("cmd{i}")).collect();
         // FIXED_INLINE_ROWS = 8 in the runtime; reproduce that height
         // here. Width matches the user's report (354) so any width-

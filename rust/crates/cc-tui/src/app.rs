@@ -241,6 +241,12 @@ pub struct App {
     /// the banner is pushed into terminal scrollback via
     /// `Terminal::insert_before`, so the in-frame copy stays `None`.
     pub welcome_banner: Option<Vec<Line<'static>>>,
+    /// Byte-offset of the insertion caret within `input`. Always lies
+    /// on a UTF-8 char boundary. `0` = before the first char; `input.len()`
+    /// = after the last char. Mutated by the cursor-movement and edit
+    /// actions in `action.rs`; reset to `input.len()` whenever `input`
+    /// is replaced wholesale (Submit, NewLine, palette accept/cancel).
+    pub input_cursor: usize,
 }
 
 impl App {
@@ -273,6 +279,7 @@ impl App {
             session_started: Instant::now(),
             emitted_to_scrollback: 0,
             welcome_banner: None,
+            input_cursor: 0,
         }
     }
 
@@ -536,6 +543,105 @@ impl App {
         }
         self.mode = AppMode::Input;
         self.stream_started_at = None;
+    }
+
+    // ── Input caret edit helpers ───────────────────────────────────────
+    //
+    // Every mutation of `input` routes through one of these so the
+    // caret stays on a UTF-8 char boundary and the view layer
+    // (`render_input`) can trust `input_cursor` without re-checking.
+
+    /// Set the input buffer wholesale and park the caret at the end.
+    /// Call this whenever a programmatic replacement happens (e.g.
+    /// palette accept substitutes `/name ` into the buffer).
+    pub fn set_input(&mut self, text: impl Into<String>) {
+        self.input = text.into();
+        self.input_cursor = self.input.len();
+    }
+
+    /// Clear the input buffer and reset the caret to 0.
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    /// Insert `c` at the caret and advance the caret past it.
+    pub fn input_insert_char(&mut self, c: char) {
+        self.input.insert(self.input_cursor, c);
+        self.input_cursor += c.len_utf8();
+    }
+
+    /// Append a literal to the caret position and park the caret after
+    /// it. Used for palette insertions (`/`) and NewLine (`\n`).
+    pub fn input_insert_str(&mut self, s: &str) {
+        self.input.insert_str(self.input_cursor, s);
+        self.input_cursor += s.len();
+    }
+
+    /// Delete the char immediately before the caret (Backspace).
+    /// No-op when the caret is at the start of the buffer.
+    pub fn input_backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let prev = self.input[..self.input_cursor]
+            .chars()
+            .next_back()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        let start = self.input_cursor - prev;
+        self.input.replace_range(start..self.input_cursor, "");
+        self.input_cursor = start;
+    }
+
+    /// Delete the char at the caret (Delete key). No-op at EOL.
+    pub fn input_delete(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        let next = self.input[self.input_cursor..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        self.input
+            .replace_range(self.input_cursor..self.input_cursor + next, "");
+    }
+
+    /// Move the caret one char to the left (toward the start).
+    pub fn input_cursor_left(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let prev = self.input[..self.input_cursor]
+            .chars()
+            .next_back()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        self.input_cursor -= prev;
+    }
+
+    /// Move the caret one char to the right (toward the end).
+    pub fn input_cursor_right(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        let next = self.input[self.input_cursor..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        self.input_cursor += next;
+    }
+
+    /// Move caret to the start of the buffer.
+    pub fn input_cursor_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    /// Move caret to the end of the buffer.
+    pub fn input_cursor_end(&mut self) {
+        self.input_cursor = self.input.len();
     }
 
     /// Mark the stream as aborted, preserving any partial text already received.

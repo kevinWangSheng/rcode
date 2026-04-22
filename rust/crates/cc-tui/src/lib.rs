@@ -427,6 +427,11 @@ fn map_key_event(
             KeyCode::Tab | KeyCode::Enter => Some(AppAction::PaletteAccept),
             KeyCode::Up => Some(AppAction::PaletteMove(-1)),
             KeyCode::Down => Some(AppAction::PaletteMove(1)),
+            KeyCode::Left => Some(AppAction::CursorMove(-1)),
+            KeyCode::Right => Some(AppAction::CursorMove(1)),
+            KeyCode::Home => Some(AppAction::CursorHome),
+            KeyCode::End => Some(AppAction::CursorEnd),
+            KeyCode::Delete => Some(AppAction::DeleteChar),
             KeyCode::Char(c) => Some(AppAction::InsertChar(c)),
             KeyCode::Backspace => Some(AppAction::Backspace),
             _ => None,
@@ -439,6 +444,11 @@ fn map_key_event(
             KeyCode::Char('/') if app.input.is_empty() => Some(AppAction::PaletteOpen),
             KeyCode::Char(c) => Some(AppAction::InsertChar(c)),
             KeyCode::Backspace => Some(AppAction::Backspace),
+            KeyCode::Delete => Some(AppAction::DeleteChar),
+            KeyCode::Left => Some(AppAction::CursorMove(-1)),
+            KeyCode::Right => Some(AppAction::CursorMove(1)),
+            KeyCode::Home => Some(AppAction::CursorHome),
+            KeyCode::End => Some(AppAction::CursorEnd),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 Some(AppAction::NewLine)
             }
