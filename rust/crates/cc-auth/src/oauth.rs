@@ -296,18 +296,25 @@ pub async fn refresh_oauth_token(
     http: &reqwest::Client,
     refresh_token: &str,
 ) -> CcResult<OAuthTokenResponse> {
+    // RFC 6749 §6: `scope` is OPTIONAL on a refresh request and, when
+    // omitted, the authorization server reuses the scopes originally
+    // granted to the refresh token. We deliberately omit it because
+    // platform.claude.com started returning `400 invalid_scope` when a
+    // previously-registered scope is renamed or retired server-side
+    // (observed 2026-04-22: `user:sessions:claude_code` had been in
+    // our default list but the server rejected the whole request over
+    // it). By sending only the minimum required fields we let the
+    // server pick whichever scope set is still valid.
     #[derive(Serialize)]
     struct RefreshRequest<'a> {
         grant_type: &'a str,
         refresh_token: &'a str,
         client_id: &'a str,
-        scope: String,
     }
     let body = RefreshRequest {
         grant_type: "refresh_token",
         refresh_token,
         client_id: &cfg.client_id,
-        scope: cfg.scopes.join(" "),
     };
     let resp = http
         .post(&cfg.token_url)
@@ -611,6 +618,75 @@ mod tests {
         assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh-abc"));
         assert_eq!(tokens.expires_in, Some(28800));
         server.await.unwrap();
+    }
+
+    /// Regression: refresh request must NOT include a `scope` field.
+    /// platform.claude.com returns 400 invalid_scope when one of the
+    /// previously-registered scopes is renamed/retired server-side;
+    /// omitting the field lets the server reuse the original grant.
+    #[tokio::test]
+    async fn refresh_oauth_token_omits_scope_field() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token_url = format!("http://127.0.0.1:{port}/v1/oauth/token");
+
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line).await;
+            let mut content_length: usize = 0;
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header).await {
+                    Ok(0) => break,
+                    Ok(_) if header == "\r\n" || header == "\n" => break,
+                    Ok(_) => {
+                        let lower = header.to_ascii_lowercase();
+                        if let Some(rest) = lower.strip_prefix("content-length:") {
+                            content_length = rest.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            tokio::io::AsyncReadExt::read_exact(&mut reader, &mut body)
+                .await
+                .unwrap();
+            let _ = body_tx.send(String::from_utf8_lossy(&body).into_owned());
+            let json = br#"{"access_token":"a","refresh_token":"b","expires_in":28800}"#;
+            let reply_headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                json.len()
+            );
+            let _ = writer.write_all(reply_headers.as_bytes()).await;
+            let reply = json;
+            let _ = writer.write_all(reply).await;
+            let _ = writer.shutdown().await;
+        });
+
+        let cfg = OAuthConfig {
+            token_url,
+            ..OAuthConfig::default()
+        };
+        let http = reqwest::Client::new();
+        let _ = refresh_oauth_token(&cfg, &http, "rt-xyz").await.unwrap();
+        server.await.unwrap();
+
+        let sent_body = body_rx.await.expect("mock did not forward body");
+        assert!(
+            !sent_body.contains("\"scope\""),
+            "refresh body must not include a scope field — RFC 6749 \
+             §6 says scope is optional and should default to the \
+             originally granted scopes. body was: {sent_body}"
+        );
+        // Sanity: the fields we DO want must be present.
+        assert!(sent_body.contains("\"grant_type\":\"refresh_token\""));
+        assert!(sent_body.contains("\"refresh_token\":\"rt-xyz\""));
+        assert!(sent_body.contains("\"client_id\""));
     }
 
     #[tokio::test]
