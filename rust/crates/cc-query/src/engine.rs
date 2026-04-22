@@ -696,51 +696,49 @@ where
 
     while let Some(item) = rx.recv().await {
         let event = item?;
-        match &event {
+        // Forward user-visible deltas to the TUI. If the TUI receiver
+        // has been dropped, stop consuming upstream immediately:
+        // cancel the shared token (so the HTTP stream is torn down)
+        // and break out of this loop. Continuing to drain buffered
+        // upstream events after the receiver is gone is what the
+        // 2026-04-21 QA reopen of `fix-tui-event-dropping` §1.2 / §3.2
+        // called out — it is not what the "treat SendError as
+        // cancellation" contract says. Returning here still produces
+        // a well-formed `Message` via the accumulator so the partial-
+        // save path in `run_turn` can persist whatever landed first.
+        let forward = match &event {
             StreamEvent::ContentBlockDelta {
                 delta: ContentBlockDelta::TextDelta { text },
                 ..
             } => {
                 text_buf.push_str(text);
                 on_text(text);
-                if let Some(tx) = events_tx {
-                    if tx.send(AppEvent::StreamDelta(text.clone())).await.is_err() {
-                        cancel.cancel();
-                    }
-                }
+                events_tx.map(|tx| tx.send(AppEvent::StreamDelta(text.clone())))
             }
             StreamEvent::ContentBlockDelta {
                 delta: ContentBlockDelta::ThinkingDelta { thinking },
                 ..
-            } => {
-                if let Some(tx) = events_tx {
-                    if tx
-                        .send(AppEvent::StreamThinking(thinking.clone()))
-                        .await
-                        .is_err()
-                    {
-                        cancel.cancel();
-                    }
-                }
-            }
+            } => events_tx.map(|tx| tx.send(AppEvent::StreamThinking(thinking.clone()))),
             StreamEvent::ContentBlockStart {
                 content_block: ContentBlockStartData::ToolUse { id, name, input },
                 ..
             } => {
-                if let Some(tx) = events_tx {
-                    let tu = ToolUseBlock {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    };
-                    if tx.send(AppEvent::StreamToolUse(tu)).await.is_err() {
-                        cancel.cancel();
-                    }
-                }
+                let tu = ToolUseBlock {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                };
+                events_tx.map(|tx| tx.send(AppEvent::StreamToolUse(tu)))
             }
-            _ => {}
-        }
+            _ => None,
+        };
         acc.apply(&event);
+        if let Some(fut) = forward {
+            if fut.await.is_err() {
+                cancel.cancel();
+                break;
+            }
+        }
     }
 
     Ok(acc.into_message_and_usage_recovering())
@@ -1250,18 +1248,34 @@ mod tests {
     }
 
     /// If the TUI receiver is dropped mid-turn, drain_stream cancels the
-    /// CancellationToken and returns Ok with whatever accumulated so far.
+    /// CancellationToken AND breaks out of the stream loop immediately
+    /// rather than continuing to drain already-buffered upstream events.
+    ///
+    /// Proof: count how many events the producer manages to send. With the
+    /// break-on-SendError fix, drain_stream returns after the first forward
+    /// fails, drops `in_rx`, and the producer's subsequent `send().await`
+    /// calls fail — so the producer never gets all 50 deltas through. The
+    /// pre-fix behaviour ("cancel but keep consuming") let the producer
+    /// push every event into the upstream channel, so this discriminator
+    /// catches the 2026-04-21 QA regression directly.
     #[tokio::test]
     async fn drain_stream_cancels_when_tui_receiver_drops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
         let (in_tx, in_rx) = mpsc::channel::<CcResult<StreamEvent>>(8);
         let (out_tx, out_rx) = mpsc::channel::<AppEvent>(1);
         let cancel = CancellationToken::new();
 
         drop(out_rx);
 
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_clone = sent.clone();
         let producer = tokio::spawn(async move {
             in_tx.send(Ok(message_start_event("msg_2"))).await.unwrap();
+            sent_clone.fetch_add(1, Ordering::Relaxed);
             in_tx.send(Ok(content_block_start_text(0))).await.unwrap();
+            sent_clone.fetch_add(1, Ordering::Relaxed);
             for i in 0..50 {
                 if in_tx
                     .send(Ok(text_delta_event(&format!("{i}"))))
@@ -1270,6 +1284,7 @@ mod tests {
                 {
                     return;
                 }
+                sent_clone.fetch_add(1, Ordering::Relaxed);
             }
             drop(in_tx);
         });
@@ -1279,14 +1294,24 @@ mod tests {
         let result = drain_stream(in_rx, &mut on_text, &mut text_buf, Some(&out_tx), &cancel).await;
 
         producer.await.unwrap();
-        // drain_stream itself does not error on receiver drop — it cancels
-        // the upstream token and keeps accumulating the remaining frames
-        // that were already in the mpsc buffer. Callers observe
-        // cancellation via `cancel.is_cancelled()`.
         assert!(result.is_ok(), "drain_stream should not error");
         assert!(
             cancel.is_cancelled(),
             "cancel token must fire when TUI drops"
+        );
+
+        // Strong assertion: drain_stream must tear down the upstream
+        // consumer promptly. If it kept draining buffered events (the
+        // pre-fix regression the QA flagged), the producer would get
+        // all 52 sends through (msg_start + content_block_start + 50
+        // deltas). With the break the producer's channel closes
+        // before it finishes, so the total stays well below 52.
+        let total_sent = sent.load(Ordering::Relaxed);
+        assert!(
+            total_sent < 52,
+            "drain_stream did not break promptly on receiver close: \
+             producer managed to send {total_sent}/52 events before in_rx closed — \
+             that is the pre-fix 'cancel but keep draining' behaviour."
         );
     }
 

@@ -16,6 +16,20 @@
       cancellation via the shared token; the partial-save path at
       `engine.rs:204-229` then persists the accumulated `text_buf` with
       the `[Interrupted by user]` marker per §4 contract.
+      QA 2026-04-21: reopened. The current code sets the cancellation
+      token but does not break the loop immediately; `drain_stream`
+      keeps consuming already-buffered upstream events until the source
+      closes. That is weaker than the task's stated "break out of the
+      stream loop and return a cancelled TurnOutcome".
+      Fixed 2026-04-21 (round 2): `drain_stream` now folds the three
+      per-variant branches into a single "optional forward" per event,
+      which is awaited after `acc.apply`. A `SendError` on that single
+      `.await` site now `cancel.cancel()`s AND `break`s out of the
+      consumer loop immediately, so `rx` is dropped the moment the TUI
+      receiver closes and upstream tears down without us continuing to
+      absorb buffered events. The accumulator still produces a
+      well-formed `Message` via `into_message_and_usage_recovering`, so
+      the §4 partial-save path keeps working.
 - [x] 1.3 Keep (or introduce) a small bounded capacity (256) to bound
       memory.
       Fixed: `cc-tui` keeps the inherited bounded `mpsc::Sender<AppEvent>`
@@ -59,6 +73,19 @@
       (line 1156). Drops the receiver before the producer sends, runs
       `drain_stream`, asserts the function returns `Ok(_)` without
       panic and `cancel.is_cancelled()` became true.
+      QA 2026-04-21: reopened. The current test only proves the token is
+      cancelled; it does not prove `drain_stream` stops promptly rather
+      than draining the remaining producer-side buffer.
+      Strengthened 2026-04-21 (round 2): the test now counts how many
+      events the producer manages to push into `in_tx` and hard-asserts
+      that total stays below 52 (msg_start + content_block_start + 50
+      deltas). With the pre-fix "cancel but keep draining" behaviour
+      the producer would successfully send all 52 because
+      `drain_stream` kept consuming; with the break-on-SendError fix,
+      `drain_stream` drops `in_rx` after the first failed forward and
+      the producer's subsequent `send().await` calls return SendError,
+      so the count stays well below 52. This is the discriminator the
+      QA asked for.
 
 ## 4. Observability
 
@@ -96,3 +123,18 @@ the three original `try_send` sites line-by-line), so the task IDs
 above did not map one-to-one to the diff. This file was refreshed
 2026-04-18 to reflect the actual landing — see commits `ca5de9a`,
 `4483587`, and `d13186d`.
+
+## QA Notes
+
+- 2026-04-21 validation: the no-drop/backpressure part looks good and
+  `cargo test --workspace` stayed green, but the receiver-closed path is
+  only partially implemented. The current behavior is "mark cancelled
+  and keep draining until upstream closes", not "treat channel closed as
+  immediate stream-loop termination".
+- 2026-04-21 round-2 validation: receiver-closed path now matches the
+  contract. `drain_stream` breaks out of the consumer loop on the first
+  failed forward, dropping `in_rx` so upstream tears down immediately.
+  The hardened §3.2 test hard-asserts the producer does not complete
+  its 52-event budget — proving the break actually fires, not just the
+  cancellation token. Full workspace `cargo test` and
+  `cargo clippy --workspace --all-targets -- -D warnings` are clean.
