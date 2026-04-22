@@ -537,6 +537,32 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             .border_style(Style::default().fg(border_color)),
     );
     frame.render_widget(para, area);
+
+    // ── Caret ────────────────────────────────────────────────────────────
+    //
+    // Hide the caret while a permission prompt is up — keystrokes there
+    // map to the y/a/n shortcut, not free text — but show it everywhere
+    // else (Input, CommandPalette, even Streaming where the user can
+    // queue follow-up input). Without this the input box looks dead and
+    // the user can't tell where typing will land.
+    //
+    // Cursor sits one row down from the top border, after `> ` gutter +
+    // already-typed text. We measure with `UnicodeWidthStr` so CJK /
+    // emoji land at the right cell. Clamp to area's right edge so a
+    // very long buffer never points outside the box (the visible text
+    // inside the box is already truncated at the border by Paragraph).
+    if !matches!(app.mode, AppMode::PermissionPrompt) {
+        let typed_width = UnicodeWidthStr::width(app.input.as_str()) as u16;
+        let gutter_cells: u16 = 2; // "> "
+        let cursor_x = area
+            .x
+            .saturating_add(1) // step past left border
+            .saturating_add(gutter_cells)
+            .saturating_add(typed_width)
+            .min(area.x.saturating_add(area.width).saturating_sub(2));
+        let cursor_y = area.y.saturating_add(1); // step past top border
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 // ─── help footer (D4) ──────────────────────────────────────────────────────
@@ -830,6 +856,49 @@ mod tests {
         assert!(
             !s2.contains("Welcome to Claude Code"),
             "welcome must hide once a turn starts:\n{s2}"
+        );
+    }
+
+    /// Caret must sit on the input row at column = "> " gutter +
+    /// already-typed text width. Without this the input box looks
+    /// frozen and the user can't tell where keystrokes will land.
+    /// Reported by user via screenshot 2026-04-21.
+    #[test]
+    fn input_caret_position_tracks_typed_text() {
+        use ratatui::backend::Backend;
+        use ratatui::layout::Position;
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+
+        // Empty input → cursor right after the "> " gutter (x=3 inside
+        // the bordered box at x=0). Input row sits at y = h - 5 = 19;
+        // caret is one row down from the top border, so y = 20.
+        let app_empty = App::new("s".into(), "m".into());
+        term.draw(|f| render(f, &app_empty)).unwrap();
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(3, 20),
+            "caret not at gutter on empty input"
+        );
+
+        // Typed "hello" → cursor advances 5 cells.
+        let mut app_typed = App::new("s".into(), "m".into());
+        app_typed.input = "hello".into();
+        term.draw(|f| render(f, &app_typed)).unwrap();
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(8, 20),
+            "caret not after typed text"
+        );
+
+        // CJK ideograph (2 cells wide) → cursor advances 2.
+        let mut app_cjk = App::new("s".into(), "m".into());
+        app_cjk.input = "中".into();
+        term.draw(|f| render(f, &app_cjk)).unwrap();
+        assert_eq!(
+            term.backend_mut().get_cursor_position().unwrap(),
+            Position::new(5, 20),
+            "caret didn't account for CJK width"
         );
     }
 
