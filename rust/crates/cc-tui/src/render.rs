@@ -601,13 +601,36 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 // ─── command palette popup ─────────────────────────────────────────────────
 
 fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect, theme: &Theme) {
-    let n = app.palette_matches.len().min(8) as u16;
+    let n_matches = app.palette_matches.len().min(8);
+    if n_matches == 0 {
+        return;
+    }
+
+    // Clamp the popup so it stays inside the frame buffer. In Inline
+    // mode the viewport is FIXED_INLINE_ROWS tall (8), so the rows
+    // available ABOVE the input box can be as few as 2. Without this
+    // clamp `frame.render_widget(Clear, area)` writes to absolute
+    // coordinates that fall outside `frame.area()` and ratatui's
+    // `Buffer::index_of` panics with "index outside of buffer".
+    // Repro: 8 matches → popup_height=10, input_area.y=94, frame.y=91
+    // → y=84 < 91 → panic.
+    let frame_top = frame.area().y;
+    let rows_above_input = input_area.y.saturating_sub(frame_top);
+    // Need at least 3 rows: top border + 1 entry + bottom border.
+    if rows_above_input < 3 {
+        return;
+    }
+    let max_entries_by_room = (rows_above_input - 2) as usize;
+    let n = n_matches.min(max_entries_by_room) as u16;
     if n == 0 {
         return;
     }
     let popup_height = n + 2; // +2 for the border.
     let width = input_area.width.clamp(20, 50);
     let x = input_area.x;
+    // popup_height ≤ rows_above_input by construction above, so this
+    // subtraction is exact (no saturating). Keeping saturating_sub
+    // anyway as belt-and-braces against future edits to the clamp.
     let y = input_area.y.saturating_sub(popup_height);
     let area = Rect {
         x,
@@ -618,7 +641,7 @@ fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect, theme:
     frame.render_widget(Clear, area);
 
     let mut rows: Vec<Line<'static>> = Vec::with_capacity(n as usize);
-    for (i, name) in app.palette_matches.iter().take(8).enumerate() {
+    for (i, name) in app.palette_matches.iter().take(n as usize).enumerate() {
         let style = if i == app.palette_selected {
             Style::default()
                 .fg(Color::Black)
@@ -808,6 +831,29 @@ mod tests {
             !s2.contains("Welcome to Claude Code"),
             "welcome must hide once a turn starts:\n{s2}"
         );
+    }
+
+    /// Regression: rendering the slash-command palette at the small
+    /// FIXED_INLINE_ROWS=8 viewport height with a maximum-sized 8-entry
+    /// match list panicked with
+    /// `index outside of buffer: the area is Rect{ x:0, y:91, h:8 }
+    /// but index is (0, 84)` because the palette popup was placed at
+    /// `input_area.y - (n+2)` without bounding to the frame top.
+    /// User-supplied stack on 2026-04-21.
+    #[test]
+    fn palette_popup_does_not_panic_on_8_row_viewport() {
+        use crate::app::AppMode;
+        let mut app = App::new("s".into(), "m".into());
+        // Mimic the post-`/` state: mode = CommandPalette, 8 matches
+        // (the maximum the popup ever shows). Real palette_matches
+        // contents don't matter for the OOB check — only the count.
+        app.mode = AppMode::CommandPalette;
+        app.input = "/".into();
+        app.palette_matches = (0..8).map(|i| format!("cmd{i}")).collect();
+        // FIXED_INLINE_ROWS = 8 in the runtime; reproduce that height
+        // here. Width matches the user's report (354) so any width-
+        // dependent regression also lands.
+        let _ = render_to_string(&app, 354, 8);
     }
 
     /// AC-V11 — each `AppMode` produces the matching footer hint string at
