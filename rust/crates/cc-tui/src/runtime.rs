@@ -226,7 +226,23 @@ where
     // Step 1: flush finalized transcript items to terminal scrollback before
     // we draw. After this returns, the viewport has *no* transcript items
     // to render — just live state (streaming text, spinner, input, chrome).
-    flush_to_scrollback(terminal, app, term_size.0)?;
+    //
+    // EXCEPT while a permission dialog is up. `insert_before` issues
+    // scroll-region sequences to make room above the viewport; those
+    // interact badly with the centered modal overlay (the modal paints
+    // a `Clear` rect, then `insert_before` scrolls region 0..viewport_top
+    // which shifts already-painted modal chrome into scrollback). User
+    // screenshots (2026-04-21) showed the permission help footer,
+    // spinner row, and input-box borders ending up in scrollback with
+    // the overlapping "y allow · a always · n deny" + streaming text
+    // artefact. Deferring the flush is safe: items stay in
+    // `transcript[emitted..]` and get rendered in-frame by
+    // `render_transcript` until the user answers y/a/n and `app.mode`
+    // leaves `PermissionPrompt`, at which point the next draw flushes
+    // everything to scrollback cleanly.
+    if app.mode != crate::app::AppMode::PermissionPrompt {
+        flush_to_scrollback(terminal, app, term_size.0)?;
+    }
 
     // Viewport size is fixed (see FIXED_INLINE_ROWS). We only react to real
     // SIGWINCH events (terminal width or height actually changed) — the
@@ -467,6 +483,49 @@ mod viewport_tests {
     //! SIGWINCH, but do NOT shrink per stream delta (which caused the
     //! mid-chat flicker).
     use super::*;
+
+    /// Regression: `flush_to_scrollback` must not advance
+    /// `app.emitted_to_scrollback` while a permission dialog is up.
+    /// Scroll-region sequences from `insert_before` interact badly with
+    /// the centered modal overlay and left the permission help footer +
+    /// streaming text + input-box chrome visible in scrollback
+    /// (2026-04-21 screenshot). Deferring the flush preserves all
+    /// pending items — they stay in `transcript[emitted..]` and render
+    /// in-frame until the user answers y/a/n.
+    #[test]
+    fn flush_is_deferred_under_permission_prompt() {
+        use crate::app::{App, AppMode, TranscriptItem};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new("s".into(), "m".into());
+        app.transcript.push(TranscriptItem::UserMessage("hi".into()));
+        // Simulate an in-flight permission prompt — mode is what the
+        // real handler flips to when PermissionRequest arrives.
+        app.mode = AppMode::PermissionPrompt;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut vp = ViewportState {
+            height: 8,
+            term_size: (80, 24),
+            kind: ViewportKind::Inline,
+        };
+
+        draw_with_resize(&mut terminal, &mut app, &mut vp).unwrap();
+
+        assert_eq!(
+            app.emitted_to_scrollback, 0,
+            "flush_to_scrollback must not advance emitted_to_scrollback \
+             while a permission dialog is up; got {}",
+            app.emitted_to_scrollback
+        );
+        assert_eq!(
+            app.transcript.len(),
+            1,
+            "transcript item must still be present for in-frame rendering"
+        );
+    }
 
     #[test]
     fn clamp_viewport_never_produces_invalid_range() {
