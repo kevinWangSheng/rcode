@@ -3,6 +3,33 @@
 Last M5 exit criterion. Run the Rust `claude` binary in macOS Terminal.app
 across a scripted 10-turn session and attach screenshots to the release PR.
 
+## Automation status (2026-04-21, HEAD cd6766b)
+
+The following turns have been auto-verified via the `npcterm` MCP at
+120×40 against the release binary. The PTY regression tests listed at
+the end of this file cover them permanently in CI.
+
+| # | Covered | Evidence |
+|---|---------|----------|
+| 01 (welcome state) | ✅ auto | `pty::tests::welcome_banner_visible_under_fullscreen_fallback` + live npcterm at 2026-04-21T00:58 |
+| 07 (slash palette) | ✅ auto | `/` opens palette listing builtins + skills; Tab accepts top match `/align`; Esc dismisses |
+| 08 (`/help`) | ✅ auto | `/help` outputs full command + skill table |
+| Ctrl+C force-quit | ✅ auto | 2× Ctrl+C returns to shell |
+
+Turns 02–06 and 09–10 still need a live Anthropic-API session. Those
+cover markdown streaming, tool cards, Edit diff, streaming overflow,
+and the permission dialog — all tied to real API turns.
+
+## Prerequisites for the manual portion
+
+- **Refresh credentials** — the earlier session captured on 2026-04-21
+  hit `HTTP 401 Invalid authentication credentials`. Run
+  `./rust/target/release/claude login` and complete the browser
+  OAuth flow before starting the manual run.
+- Terminal.app at **120 × 40** or larger (80 × 24 works but the
+  welcome banner truncates). Avoid nested tmux if possible — it
+  forces the Fullscreen fallback.
+
 ## Prerequisites
 
 - Authenticated session (`claude login` or `ANTHROPIC_API_KEY` exported).
@@ -58,6 +85,18 @@ is byte-identical modulo timing.
 Drop the two screenshot bundles (`default/` and `syntect/` subfolders)
 into the release PR description. Reference them back here via commit
 hash so future readers can audit the M5 exit evidence.
+
+## Regression tests pinning this
+
+| Test | Covers |
+|---|---|
+| `rust/crates/cc-tui/tests/pty.rs::smoke_demo_launches_and_renders_prompt` | banner visible at 100 × 24 Inline |
+| `rust/crates/cc-tui/tests/pty.rs::welcome_banner_visible_under_fullscreen_fallback` | banner visible under Fullscreen (`CC_TUI_FORCE_FULLSCREEN=1`) |
+| `rust/crates/cc-tui/tests/pty.rs::launches_cleanly_at_80_cols_no_artifacts` | welcome + `>` prompt + no escape leakage at 80 × 24 |
+| `rust/crates/cc-tui/tests/headless.rs::acv5_palette_*` | palette lists builtins + skills, Tab accepts, Esc restores |
+| `rust/crates/cc-tui/tests/headless.rs::ac2_abort_latency_under_100ms_end_to_end` | Ctrl+C cancels a streaming turn within 100 ms |
+| `rust/crates/cc-tui/tests/headless.rs::ac4_100_turns_complete` / `ac5_no_deadlock_100_turns` | 100 consecutive turns do not leak / deadlock |
+| `rust/crates/cc-tui/src/markdown.rs::tests::syntect_colors_rust_fence_with_rgb_spans` | `tui-syntect` feature produces Rgb-coloured spans |
 
 ## Known deviations to expect
 
