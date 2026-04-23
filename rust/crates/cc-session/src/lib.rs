@@ -1,12 +1,34 @@
 use cc_core::{CcError, CcResult, ContentBlock, MessageContent, MessageParam, Role};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use cc_core::Usage;
+
+// ── Interrupt-marker constants (parity with TS src/utils/messages.ts:207-209)
+//
+// TS exports these exact literals from a single module so every resume-aware
+// consumer (the transcript reader, the TUI, the query engine, the prompt-
+// suggestion service) compares against the *same* string. Rust had scattered
+// `"[Interrupted by user]"` literals (different wording!) that resume could
+// not detect. Re-exporting them from `cc-session` gives every crate one
+// place to import from and keeps wire compatibility with transcripts
+// produced by the TS binary.
+
+/// Literal that marks a user-initiated interrupt with no pending tool_use.
+/// Must match TS `src/utils/messages.ts::INTERRUPT_MESSAGE` exactly —
+/// transcripts written by the TS binary compare against this string on
+/// resume, so any drift silently breaks cross-binary resume.
+pub const INTERRUPT_MESSAGE: &str = "[Request interrupted by user]";
+
+/// Literal marking an interrupt that happened while a tool_use was in
+/// flight. Matches TS `src/utils/messages.ts::INTERRUPT_MESSAGE_FOR_TOOL_USE`.
+pub const INTERRUPT_MESSAGE_FOR_TOOL_USE: &str =
+    "[Request interrupted by user for tool use]";
 
 /// Abstracts `File::sync_all` so the fsync step of an append can be
 /// observed in tests.
@@ -51,6 +73,222 @@ pub struct TranscriptEntry {
     /// If true, marks a compaction boundary in the transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_boundary: Option<bool>,
+}
+
+// Hand-written PartialEq so `SessionEntry` (above) can derive it without
+// forcing `MessageParam` / `MessageContent` / `Usage` in `cc-core` to
+// also become `PartialEq`. We compare the serialised JSON — this is only
+// used in tests (roundtrip assertions) where wire-level equality is what
+// we actually care about.
+impl PartialEq for TranscriptEntry {
+    fn eq(&self, other: &Self) -> bool {
+        serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
+    }
+}
+
+// ── FileHistorySnapshot (parity with TS src/utils/fileHistory.ts:33-52)
+//
+// TS writes one `file-history-snapshot` JSONL entry per edit so the
+// edited-file backup map is recoverable on resume (used by /undo, /diff,
+// and the Edit tool's `originalFile` reference). We mirror the TS wire
+// shape exactly — camelCase field names, same field set — so a Rust-written
+// transcript is a drop-in replacement for a TS-written one and vice versa.
+
+/// One backup entry for a tracked file. A `backup_file_name` of `None`
+/// represents "the file did not exist at this version" (parity with TS
+/// `BackupFileName = string | null`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHistoryBackup {
+    pub backup_file_name: Option<String>,
+    pub version: u32,
+    /// ISO-8601 timestamp (TS persists `Date` as an ISO string).
+    pub backup_time: String,
+}
+
+/// Per-message snapshot of every file Claude touched up to that turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHistorySnapshot {
+    /// UUID of the message this snapshot belongs to.
+    pub message_id: String,
+    /// Map of absolute file path → backup slot.
+    pub tracked_file_backups: BTreeMap<String, FileHistoryBackup>,
+    /// ISO-8601 timestamp.
+    pub timestamp: String,
+}
+
+/// JSONL wrapper around a `FileHistorySnapshot`. This is what ends up on
+/// disk as one `{"type":"file-history-snapshot", ...}` line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHistorySnapshotMessage {
+    pub message_id: String,
+    pub snapshot: FileHistorySnapshot,
+    /// `true` when this snapshot refines an earlier one for the same
+    /// message (matches TS `isSnapshotUpdate`).
+    pub is_snapshot_update: bool,
+}
+
+/// Meta entries written to the JSONL transcript alongside message turns.
+///
+/// Discriminated by `type` on the wire (kebab-case), matching TS
+/// `src/types/logs.ts:297-317`. Variants cover the set TS writes in every
+/// normal run; experimental variants fall through to `SessionEntry::Unknown`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum MetaEntry {
+    /// Conversation summary attached to a leaf message.
+    Summary {
+        #[serde(rename = "leafUuid")]
+        leaf_uuid: String,
+        summary: String,
+    },
+    /// User-set session title.
+    CustomTitle {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "customTitle")]
+        custom_title: String,
+    },
+    /// AI-generated session title (regenerable; user titles win).
+    AiTitle {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "aiTitle")]
+        ai_title: String,
+    },
+    /// Last prompt in the session — used to quickly preview a saved
+    /// session in `/resume`.
+    LastPrompt {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "lastPrompt")]
+        last_prompt: String,
+    },
+    /// Periodic "what is the agent doing" snapshot.
+    TaskSummary {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        summary: String,
+        timestamp: String,
+    },
+    /// User-set searchable tag.
+    Tag {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        tag: String,
+    },
+    /// Teammate/agent display name.
+    AgentName {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "agentName")]
+        agent_name: String,
+    },
+    /// Teammate/agent display color.
+    AgentColor {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "agentColor")]
+        agent_color: String,
+    },
+    /// Agent definition file the session was spawned from.
+    AgentSetting {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "agentSetting")]
+        agent_setting: String,
+    },
+    /// Link from the session to a GitHub PR.
+    PrLink {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "prNumber")]
+        pr_number: u64,
+        #[serde(rename = "prUrl")]
+        pr_url: String,
+        #[serde(rename = "prRepository")]
+        pr_repository: String,
+        timestamp: String,
+    },
+    /// Per-edit file-history snapshot (P0 #6).
+    FileHistorySnapshot {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        snapshot: FileHistorySnapshot,
+        #[serde(rename = "isSnapshotUpdate")]
+        is_snapshot_update: bool,
+    },
+    /// Character-level attribution snapshot (used for commit attribution).
+    /// Kept opaque at the field level — Rust does not introspect the map
+    /// contents, it just round-trips them.
+    AttributionSnapshot {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        surface: String,
+        #[serde(rename = "fileStates")]
+        file_states: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "promptCount")]
+        prompt_count: Option<u64>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "promptCountAtLastCommit"
+        )]
+        prompt_count_at_last_commit: Option<u64>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "permissionPromptCount"
+        )]
+        permission_prompt_count: Option<u64>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "permissionPromptCountAtLastCommit"
+        )]
+        permission_prompt_count_at_last_commit: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "escapeCount")]
+        escape_count: Option<u64>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "escapeCountAtLastCommit"
+        )]
+        escape_count_at_last_commit: Option<u64>,
+    },
+    /// Coordinator vs. normal session mode flag.
+    Mode {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        mode: String,
+    },
+    /// Worktree state snapshot (opaque — Rust only needs to preserve
+    /// the record on resume, not introspect the shape).
+    WorktreeState {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "worktreeSession")]
+        worktree_session: serde_json::Value,
+    },
+}
+
+/// One line in the JSONL transcript. Untagged: the parser picks the first
+/// shape that matches. Order matters — `Message` is tried first (the most
+/// common line by volume), then `Meta` (tagged by `type`), then the
+/// opaque `Unknown` catch-all.
+///
+/// `Unknown` is what keeps forward-compat: a line with an unfamiliar
+/// `type` (e.g. experimental `marble-origami-commit`) survives a
+/// read/resume round-trip instead of being silently dropped or failing
+/// the whole load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum SessionEntry {
+    Message(TranscriptEntry),
+    Meta(MetaEntry),
+    Unknown(serde_json::Value),
 }
 
 /// Session metadata stored in metadata.json alongside the transcript.
@@ -198,6 +436,88 @@ impl Session {
     /// Load all messages from the transcript file.
     pub fn load_messages(&self) -> CcResult<Vec<MessageParam>> {
         load_transcript(&self.transcript_path)
+    }
+
+    /// Load every JSONL entry (messages + meta + unknown) from the
+    /// transcript. Use this when a caller needs tags, PR links,
+    /// file-history snapshots, or any other non-message record — the
+    /// message-only `load_messages` would silently skip them today.
+    pub fn load_transcript_entries(&self) -> CcResult<Vec<SessionEntry>> {
+        load_transcript_entries(&self.transcript_path)
+    }
+
+    /// Append a synthetic user message carrying the canonical interrupt
+    /// marker. `for_tool_use = true` uses the tool-use variant string,
+    /// matching TS `createUserInterruptionMessage`.
+    ///
+    /// Callers: `cc-query` (on cancel), `cc-tui` (Ctrl+C while streaming),
+    /// any future SIGINT handler. Routing all of them through this one
+    /// helper prevents wording drift — TS resume detects interruptions
+    /// by exact string match, so any variant other than the two
+    /// constants above is invisible to the cross-binary resume path.
+    pub fn append_interrupt_marker(&self, for_tool_use: bool) -> CcResult<()> {
+        let text = if for_tool_use {
+            INTERRUPT_MESSAGE_FOR_TOOL_USE
+        } else {
+            INTERRUPT_MESSAGE
+        };
+        self.append(&MessageParam::user(text))
+    }
+
+    /// Append a file-history snapshot as a `{type: "file-history-snapshot"}`
+    /// JSONL line. Mirrors TS `sessionStorage.insertFileHistorySnapshot`.
+    ///
+    /// The entry goes through the same durable append path as message
+    /// turns (fsync-per-append), so a crash after this call is guaranteed
+    /// to preserve the snapshot.
+    pub fn append_file_history_snapshot(
+        &self,
+        snapshot: &FileHistorySnapshot,
+        is_update: bool,
+    ) -> CcResult<()> {
+        let entry = MetaEntry::FileHistorySnapshot {
+            message_id: snapshot.message_id.clone(),
+            snapshot: snapshot.clone(),
+            is_snapshot_update: is_update,
+        };
+        self.append_meta(&entry)
+    }
+
+    /// Append any `MetaEntry` to the transcript as a single JSONL line.
+    /// Public so callers can write tags, PR links, etc. without each
+    /// inventing their own serialisation wrapper.
+    pub fn append_meta(&self, entry: &MetaEntry) -> CcResult<()> {
+        let line = serde_json::to_string(entry).map_err(CcError::Json)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.transcript_path)
+            .map_err(|e| CcError::io(format!("failed to open transcript: {e}")))?;
+        write_line_and_sync(&mut file, &line)
+            .map_err(|e| CcError::io(format!("failed to durably append transcript: {e}")))?;
+        Ok(())
+    }
+
+    /// Return every file-history snapshot in write order. Uses
+    /// `load_transcript_entries` under the hood, so unknown entries do
+    /// not interfere.
+    pub fn file_history_snapshots(&self) -> CcResult<Vec<FileHistorySnapshotMessage>> {
+        let entries = self.load_transcript_entries()?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEntry::Meta(MetaEntry::FileHistorySnapshot {
+                    message_id,
+                    snapshot,
+                    is_snapshot_update,
+                }) => Some(FileHistorySnapshotMessage {
+                    message_id,
+                    snapshot,
+                    is_snapshot_update,
+                }),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Path to the transcript file.
@@ -353,6 +673,38 @@ fn load_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
     }
 
     Ok(messages)
+}
+
+/// Load every JSONL entry — messages, meta, and unknown — from the
+/// transcript. Shares the malformed-line tolerance of `load_transcript`
+/// (a crashed process may leave a partial trailing line; we skip those
+/// with a WARN log rather than aborting resume).
+fn load_transcript_entries(path: &Path) -> CcResult<Vec<SessionEntry>> {
+    let file = File::open(path)
+        .map_err(|e| CcError::io(format!("failed to open transcript {}: {e}", path.display())))?;
+
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line
+            .map_err(|e| CcError::io(format!("failed to read transcript line {line_num}: {e}")))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SessionEntry>(&line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::warn!(
+                    "skipping malformed transcript line {} in {}: {e}",
+                    line_num + 1,
+                    path.display()
+                );
+            }
+        }
+    }
+
+    Ok(entries)
 }
 
 /// Look for a TypeScript-version session file at
@@ -885,5 +1237,269 @@ mod tests {
         drop(f);
         let contents = fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "durable\n");
+    }
+
+    // ---------------------------------------------------------------
+    // fix-session-resume-integrity §1: JSONL entry union round-trip.
+    // ---------------------------------------------------------------
+
+    /// Meta entries round-trip losslessly: serialise → parse → reserialise
+    /// must reproduce the original JSON value (key order aside).
+    #[test]
+    fn meta_entry_tag_roundtrip() {
+        let line = r#"{"type":"tag","sessionId":"abc","tag":"demo"}"#;
+        let entry: SessionEntry = serde_json::from_str(line).expect("parse tag entry");
+        match &entry {
+            SessionEntry::Meta(MetaEntry::Tag { session_id, tag }) => {
+                assert_eq!(session_id, "abc");
+                assert_eq!(tag, "demo");
+            }
+            other => panic!("expected Meta::Tag, got {other:?}"),
+        }
+        let reser: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        let orig: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(reser, orig, "tag entry must survive a roundtrip");
+    }
+
+    #[test]
+    fn meta_entry_pr_link_roundtrip() {
+        let line = r#"{"type":"pr-link","sessionId":"s","prNumber":42,"prUrl":"https://x/42","prRepository":"o/r","timestamp":"2026-04-23T00:00:00Z"}"#;
+        let entry: SessionEntry = serde_json::from_str(line).unwrap();
+        assert!(matches!(
+            entry,
+            SessionEntry::Meta(MetaEntry::PrLink { pr_number: 42, .. })
+        ));
+    }
+
+    #[test]
+    fn meta_entry_file_history_snapshot_roundtrip() {
+        let mut backups = BTreeMap::new();
+        backups.insert(
+            "/tmp/a.txt".into(),
+            FileHistoryBackup {
+                backup_file_name: Some("a@v1".into()),
+                version: 1,
+                backup_time: "2026-04-23T00:00:00Z".into(),
+            },
+        );
+        let snap = FileHistorySnapshot {
+            message_id: "msg-1".into(),
+            tracked_file_backups: backups,
+            timestamp: "2026-04-23T00:00:00Z".into(),
+        };
+        let entry = SessionEntry::Meta(MetaEntry::FileHistorySnapshot {
+            message_id: snap.message_id.clone(),
+            snapshot: snap.clone(),
+            is_snapshot_update: false,
+        });
+        let line = serde_json::to_string(&entry).unwrap();
+        let parsed: SessionEntry = serde_json::from_str(&line).unwrap();
+        assert_eq!(entry, parsed, "FileHistorySnapshot must survive a roundtrip");
+        // And it deserialises into the right variant rather than Unknown.
+        assert!(matches!(
+            parsed,
+            SessionEntry::Meta(MetaEntry::FileHistorySnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn meta_entry_summary_roundtrip() {
+        let line = r#"{"type":"summary","leafUuid":"u","summary":"did a thing"}"#;
+        let entry: SessionEntry = serde_json::from_str(line).unwrap();
+        assert!(matches!(entry, SessionEntry::Meta(MetaEntry::Summary { .. })));
+    }
+
+    #[test]
+    fn meta_entry_mode_and_worktree_state_roundtrip() {
+        let mode_line = r#"{"type":"mode","sessionId":"s","mode":"coordinator"}"#;
+        let mode: SessionEntry = serde_json::from_str(mode_line).unwrap();
+        assert!(matches!(mode, SessionEntry::Meta(MetaEntry::Mode { .. })));
+
+        let wt_line = r#"{"type":"worktree-state","sessionId":"s","worktreeSession":{"originalCwd":"/x","worktreePath":"/y","worktreeName":"n","sessionId":"s"}}"#;
+        let wt: SessionEntry = serde_json::from_str(wt_line).unwrap();
+        assert!(matches!(wt, SessionEntry::Meta(MetaEntry::WorktreeState { .. })));
+    }
+
+    #[test]
+    fn meta_entry_agent_names_roundtrip() {
+        for line in [
+            r#"{"type":"agent-name","sessionId":"s","agentName":"Ada"}"#,
+            r##"{"type":"agent-color","sessionId":"s","agentColor":"#fff"}"##,
+            r#"{"type":"agent-setting","sessionId":"s","agentSetting":"researcher"}"#,
+            r#"{"type":"custom-title","sessionId":"s","customTitle":"Ada's session"}"#,
+            r#"{"type":"ai-title","sessionId":"s","aiTitle":"auto"}"#,
+            r#"{"type":"last-prompt","sessionId":"s","lastPrompt":"help"}"#,
+            r#"{"type":"task-summary","sessionId":"s","summary":"x","timestamp":"t"}"#,
+            r#"{"type":"attribution-snapshot","messageId":"m","surface":"cli","fileStates":{}}"#,
+        ] {
+            let entry: SessionEntry = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("failed to parse {line}: {e}"));
+            assert!(
+                matches!(entry, SessionEntry::Meta(_)),
+                "expected Meta for {line}"
+            );
+        }
+    }
+
+    /// Forward-compat: a `type` we have not ported (e.g. experimental
+    /// marble-origami-commit) MUST round-trip through `Unknown` rather
+    /// than fail the parser or silently drop.
+    #[test]
+    fn unknown_type_preserved_in_catchall() {
+        let line = r#"{"type":"marble-origami-commit","sessionId":"s","collapseId":"1234567890123456","summaryUuid":"u","summaryContent":"x","summary":"y","firstArchivedUuid":"a","lastArchivedUuid":"b"}"#;
+        let entry: SessionEntry = serde_json::from_str(line).unwrap();
+        match &entry {
+            SessionEntry::Unknown(value) => {
+                assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("marble-origami-commit"));
+                assert_eq!(value.get("collapseId").and_then(|v| v.as_str()), Some("1234567890123456"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// Back-compat: a plain message entry (no `type`) still parses as
+    /// `SessionEntry::Message` — `TranscriptEntry` is tried first.
+    #[test]
+    fn message_entry_back_compat() {
+        let line = r#"{"message":{"role":"user","content":"hi"},"timestamp":"2026-04-23T00:00:00Z"}"#;
+        let entry: SessionEntry = serde_json::from_str(line).unwrap();
+        assert!(matches!(entry, SessionEntry::Message(_)));
+    }
+
+    #[test]
+    fn load_transcript_entries_mixes_messages_and_meta_and_unknown() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut f = File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"message":{{"role":"user","content":"hi"}},"timestamp":"2026-04-23T00:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(f, r#"{{"type":"tag","sessionId":"s","tag":"demo"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"marble-origami-commit","sessionId":"s","collapseId":"1234567890123456","summaryUuid":"u","summaryContent":"x","summary":"y","firstArchivedUuid":"a","lastArchivedUuid":"b"}}"#
+        )
+        .unwrap();
+        // Truncated tail — must not abort the load.
+        writeln!(f, "{{not json").unwrap();
+
+        let entries = load_transcript_entries(&path).unwrap();
+        assert_eq!(entries.len(), 3, "3 valid entries survive the bad tail");
+        assert!(matches!(entries[0], SessionEntry::Message(_)));
+        assert!(matches!(
+            entries[1],
+            SessionEntry::Meta(MetaEntry::Tag { .. })
+        ));
+        assert!(matches!(entries[2], SessionEntry::Unknown(_)));
+    }
+
+    // ---------------------------------------------------------------
+    // fix-session-resume-integrity §2: interrupt-marker append.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn append_interrupt_marker_persists_canonical_string() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let session = Session {
+            id: "i".into(),
+            transcript_path: path.clone(),
+        };
+        session.append(&MessageParam::user("hi")).unwrap();
+        session.append_interrupt_marker(false).unwrap();
+        let messages = session.load_messages().unwrap();
+        assert_eq!(messages.len(), 2);
+        match &messages[1].content {
+            MessageContent::Text(t) => assert_eq!(t, INTERRUPT_MESSAGE),
+            other => panic!("expected text content, got {other:?}"),
+        }
+        assert_eq!(messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn append_interrupt_marker_for_tool_use_uses_different_literal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let session = Session {
+            id: "i".into(),
+            transcript_path: path,
+        };
+        session.append_interrupt_marker(true).unwrap();
+        let messages = session.load_messages().unwrap();
+        match &messages[0].content {
+            MessageContent::Text(t) => assert_eq!(t, INTERRUPT_MESSAGE_FOR_TOOL_USE),
+            other => panic!("expected text content, got {other:?}"),
+        }
+        assert_ne!(INTERRUPT_MESSAGE, INTERRUPT_MESSAGE_FOR_TOOL_USE);
+    }
+
+    // ---------------------------------------------------------------
+    // fix-session-resume-integrity §3: file-history snapshots.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn file_history_snapshot_append_and_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let session = Session {
+            id: "fh".into(),
+            transcript_path: path,
+        };
+
+        let mut backups_a = BTreeMap::new();
+        backups_a.insert(
+            "/tmp/a.txt".into(),
+            FileHistoryBackup {
+                backup_file_name: Some("a@v1".into()),
+                version: 1,
+                backup_time: "2026-04-23T00:00:00Z".into(),
+            },
+        );
+        let snap_a = FileHistorySnapshot {
+            message_id: "m1".into(),
+            tracked_file_backups: backups_a,
+            timestamp: "2026-04-23T00:00:00Z".into(),
+        };
+
+        let mut backups_b = BTreeMap::new();
+        backups_b.insert(
+            "/tmp/b.txt".into(),
+            FileHistoryBackup {
+                backup_file_name: None,
+                version: 1,
+                backup_time: "2026-04-23T00:01:00Z".into(),
+            },
+        );
+        let snap_b = FileHistorySnapshot {
+            message_id: "m2".into(),
+            tracked_file_backups: backups_b,
+            timestamp: "2026-04-23T00:01:00Z".into(),
+        };
+
+        // Also interleave a message entry to prove the reader filters.
+        session.append(&MessageParam::user("hi")).unwrap();
+        session
+            .append_file_history_snapshot(&snap_a, false)
+            .unwrap();
+        session.append(&MessageParam::assistant("ok")).unwrap();
+        session
+            .append_file_history_snapshot(&snap_b, true)
+            .unwrap();
+
+        let snapshots = session.file_history_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 2, "two snapshots in write order");
+        assert_eq!(snapshots[0].message_id, "m1");
+        assert!(!snapshots[0].is_snapshot_update);
+        assert_eq!(snapshots[0].snapshot, snap_a);
+        assert_eq!(snapshots[1].message_id, "m2");
+        assert!(snapshots[1].is_snapshot_update);
+        assert_eq!(snapshots[1].snapshot, snap_b);
+
+        // Message-only loader still returns exactly the two turns —
+        // snapshots are filtered out, not mistakenly surfaced as messages.
+        let messages = session.load_messages().unwrap();
+        assert_eq!(messages.len(), 2);
     }
 }
