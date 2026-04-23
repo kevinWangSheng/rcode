@@ -219,24 +219,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let headless_user_text: Option<String> = if let Some(p) = &print_text {
         Some(p.clone())
     } else if !interactive_tui {
-        let text = match &cli.message {
-            Some(text) => text.clone(),
-            None => {
-                if atty_is_stdin() && resume_id.is_none() {
-                    return Err("no message provided — use --message or pipe text via stdin".into());
-                }
-                if resume_id.is_some() && cli.message.is_none() {
-                    return Err(
-                        "--resume/--continue without TUI requires --message for the next turn"
-                            .into(),
-                    );
-                }
+        Some(resolve_headless_user_text(
+            resume_id.as_deref(),
+            cli.message.as_deref(),
+            atty_is_stdin(),
+            || {
                 let mut buf = String::new();
                 io::stdin().read_line(&mut buf)?;
-                buf.trim().to_string()
-            }
-        };
-        Some(text)
+                Ok(buf.trim().to_string())
+            },
+        )?)
     } else {
         None
     };
@@ -628,6 +620,53 @@ fn libc_isatty(fd: i32) -> bool {
     unsafe { isatty(fd) != 0 }
 }
 
+/// Headless mode: decide what the next user-turn text should be.
+///
+/// Four cases, each exercised by a unit test:
+///   1. `--message X` → return X (regardless of resume or stdin).
+///   2. No `--message`, stdin is a pipe → read one line from stdin
+///      (works whether or not `--resume` is set — fixes roadmap P0 #19
+///      which used to error out on resume+piped-stdin).
+///   3. No `--message`, stdin is a tty, no `--resume` → error with a
+///      hint to use `--message` or pipe stdin.
+///   4. No `--message`, stdin is a tty, `--resume` is set → error with
+///      a resume-specific hint (tell the user to pass `--message` or
+///      run TUI).
+///
+/// The resumed message history is merged *independently* of this
+/// decision — it flows through `Session::resume` → the `messages`
+/// vector → `engine.run_turn(..., &mut messages, ...)` — so once this
+/// function returns `Ok(user_text)`, the engine sees both the resumed
+/// transcript (`initial_messages`) and the new turn text in one request.
+fn resolve_headless_user_text<F>(
+    resume_id: Option<&str>,
+    cli_message: Option<&str>,
+    is_tty: bool,
+    read_stdin_line: F,
+) -> Result<String, Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> io::Result<String>,
+{
+    if let Some(m) = cli_message {
+        return Ok(m.to_string());
+    }
+    if is_tty {
+        // No piped stdin to fall back on. Distinct messages so operators
+        // can tell "I forgot --message" from "--resume needs a turn".
+        if resume_id.is_some() {
+            return Err(
+                "--resume/--continue in headless mode needs a next-turn message — \
+                pass --message, pipe text via stdin, or run without --no-tui"
+                    .into(),
+            );
+        }
+        return Err("no message provided — use --message or pipe text via stdin".into());
+    }
+    // stdin is piped: read one line. Works for both new and resumed
+    // sessions — the P0 #19 fix.
+    Ok(read_stdin_line()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +758,63 @@ mod tests {
         assert_eq!(blocks.len(), 2, "attribution + static only");
         assert!(blocks[0].cache_control.is_none());
         assert_eq!(cc_scope(&blocks[1]), Some("global"));
+    }
+
+    // ---------------------------------------------------------------
+    // fix-session-resume-integrity §4: resume → headless merge.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resume_with_message_flag_uses_it_directly() {
+        let got = resolve_headless_user_text(Some("sess"), Some("hello"), true, || {
+            panic!("stdin must not be read when --message is set")
+        })
+        .expect("ok");
+        assert_eq!(got, "hello");
+    }
+
+    /// The P0 #19 regression guard: `echo hi | claude --resume X` used to
+    /// error out with "--resume/--continue without TUI requires --message".
+    /// It must now read stdin, same as a fresh session.
+    #[test]
+    fn resume_without_message_reads_stdin_when_piped() {
+        let got = resolve_headless_user_text(Some("sess"), None, false, || {
+            Ok("next turn".into())
+        })
+        .expect("piped stdin should supply the turn text");
+        assert_eq!(got, "next turn");
+    }
+
+    #[test]
+    fn new_session_with_message_flag_works() {
+        let got =
+            resolve_headless_user_text(None, Some("hi"), true, || panic!("stdin unused")).unwrap();
+        assert_eq!(got, "hi");
+    }
+
+    #[test]
+    fn new_session_tty_no_message_errors() {
+        let err = resolve_headless_user_text(None, None, true, || {
+            panic!("stdin must not be read on a tty")
+        })
+        .expect_err("no message on a tty must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--message"),
+            "error should mention --message hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resume_tty_no_message_errors_with_resume_hint() {
+        let err = resolve_headless_user_text(Some("sess"), None, true, || {
+            panic!("stdin must not be read on a tty")
+        })
+        .expect_err("resume on a tty without --message must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--resume") || msg.contains("--continue"),
+            "error should mention resume-specific context, got: {msg}"
+        );
     }
 }
