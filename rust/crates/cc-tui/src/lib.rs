@@ -442,6 +442,14 @@ fn map_key_event(
             // `/` as a regular character (matches M5 scope: picker triggers
             // "when buffer starts with `/`").
             KeyCode::Char('/') if app.input.is_empty() => Some(AppAction::PaletteOpen),
+            // `?` on empty input runs /help (matches the help footer hint).
+            // When the buffer is non-empty, `?` is a normal char.
+            KeyCode::Char('?') if app.input.is_empty() => Some(AppAction::HelpShortcut),
+            // `@` anywhere in the buffer opens the file picker so the
+            // user can attach a path mid-prose without having to
+            // start from scratch. The palette closes on Esc (restore)
+            // or Tab/Enter (insert selected path at cursor).
+            KeyCode::Char('@') => Some(AppAction::FilePaletteOpen),
             KeyCode::Char(c) => Some(AppAction::InsertChar(c)),
             KeyCode::Backspace => Some(AppAction::Backspace),
             KeyCode::Delete => Some(AppAction::DeleteChar),
@@ -460,6 +468,11 @@ fn map_key_event(
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 Some(AppAction::ScrollDown(3))
             }
+            // Bare Up/Down (no modifiers) walk the input-history ring
+            // — bash/zsh convention. Shift+Up/Down above keeps the
+            // transcript-scroll binding.
+            KeyCode::Up => Some(AppAction::HistoryPrev),
+            KeyCode::Down => Some(AppAction::HistoryNext),
             _ => None,
         },
         AppMode::Streaming => match key.code {

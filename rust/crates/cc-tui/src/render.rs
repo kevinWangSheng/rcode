@@ -520,12 +520,23 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let offset = app.input_view_offset.get();
 
     // Inner content: gutter glyph + (sliced buffer or placeholder).
+    //
+    // The gutter reflects the current input "mode prefix": `!` switches
+    // us into bash mode (see Submit arm), so the gutter becomes `$ ` in
+    // cyan to mirror a shell prompt. Otherwise we show the claude-orange
+    // `> ` we use for regular user input.
+    let bash_mode = app.input.starts_with('!');
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
+    let (gutter, gutter_color) = if bash_mode {
+        // Same pink as the Bash tool card so the user sees at a glance
+        // this input will turn into a shell command (AC-V12 palette).
+        ("$ ", theme.bash_pink)
+    } else {
+        ("> ", theme.claude_orange)
+    };
     spans.push(Span::styled(
-        "> ".to_string(),
-        Style::default()
-            .fg(theme.claude_orange)
-            .add_modifier(Modifier::BOLD),
+        gutter.to_string(),
+        Style::default().fg(gutter_color).add_modifier(Modifier::BOLD),
     ));
     if app.input.is_empty() && app.mode == AppMode::Input {
         spans.push(Span::styled(
@@ -691,6 +702,18 @@ fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect, theme:
     };
     frame.render_widget(Clear, area);
 
+    // Entries read differently depending on source: command palette
+    // shows `/name`, file palette shows `@path` (trailing `/` on dirs
+    // is already in the match list from `list_cwd_files`).
+    let prefix = match app.palette_kind {
+        crate::app::PaletteKind::Commands => "/",
+        crate::app::PaletteKind::Files => "@",
+    };
+    let title = match app.palette_kind {
+        crate::app::PaletteKind::Commands => " Commands ",
+        crate::app::PaletteKind::Files => " Files ",
+    };
+
     let mut rows: Vec<Line<'static>> = Vec::with_capacity(n as usize);
     for (i, name) in app.palette_matches.iter().take(n as usize).enumerate() {
         let style = if i == app.palette_selected {
@@ -701,13 +724,13 @@ fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect, theme:
         } else {
             Style::default().fg(theme.text)
         };
-        rows.push(Line::from(Span::styled(format!(" /{name} "), style)));
+        rows.push(Line::from(Span::styled(format!(" {prefix}{name} "), style)));
     }
 
     let para = Paragraph::new(rows).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Commands ")
+            .title(title)
             .style(Style::default().fg(theme.claude_orange)),
     );
     frame.render_widget(para, area);

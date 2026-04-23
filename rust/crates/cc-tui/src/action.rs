@@ -28,6 +28,15 @@ pub enum AppAction {
     CursorHome,
     /// Jump the caret to the end of the input buffer (End).
     CursorEnd,
+    /// Walk one entry back in the input-history ring (Up arrow in
+    /// Input mode with no palette open).
+    HistoryPrev,
+    /// Walk one entry forward in the input-history ring (Down arrow).
+    HistoryNext,
+    /// Shortcut that replaces the input with `/help` and submits it in
+    /// one step. Bound to `?` on empty buffers per the help footer's
+    /// `? for shortcuts` hint.
+    HelpShortcut,
     Submit,
     NewLine,
 
@@ -70,6 +79,10 @@ pub enum AppAction {
     // Slash-command palette (M5 Phase C / AC-V5)
     /// Enter palette mode. Snapshots the current buffer so Esc can restore it.
     PaletteOpen,
+    /// Open the palette in file-picker mode (`@` trigger). Snapshots
+    /// the buffer like `PaletteOpen`, then populates `palette_matches`
+    /// with files from the current working directory.
+    FilePaletteOpen,
     /// Adjust the highlighted row. Positive = down, negative = up.
     PaletteMove(i32),
     /// Replace the input with the highlighted command + trailing space and
@@ -116,26 +129,82 @@ pub struct UpdateContext<'a> {
 
 /// Recompute `palette_matches` + clamp `palette_selected` based on the
 /// current `input` buffer and the available commands. A no-op when the
-/// app is not in palette mode.
+/// app is not in palette mode. Branches on `palette_kind` so the file
+/// picker pulls from `list_cwd_files` while the command palette pulls
+/// from the registry.
 pub fn refresh_palette(app: &mut App, commands: &CommandRegistry) {
     if app.mode != AppMode::CommandPalette {
         return;
     }
-    let filter = palette_filter(&app.input).to_ascii_lowercase();
-    let mut names = commands.names();
-    names.sort();
-    names.dedup();
-    app.palette_matches = names
-        .into_iter()
-        .filter(|n| n.to_ascii_lowercase().starts_with(&filter))
-        .collect();
+    let filter = palette_filter(&app.input, app.palette_kind, app.palette_trigger_at)
+        .to_ascii_lowercase();
+    let mut names: Vec<String> = match app.palette_kind {
+        crate::app::PaletteKind::Commands => {
+            let mut v = commands.names();
+            v.sort();
+            v.dedup();
+            v
+        }
+        crate::app::PaletteKind::Files => list_cwd_files(),
+    };
+    if !filter.is_empty() {
+        names.retain(|n| n.to_ascii_lowercase().contains(&filter));
+    }
+    app.palette_matches = names;
     if app.palette_selected >= app.palette_matches.len() {
         app.palette_selected = app.palette_matches.len().saturating_sub(1);
     }
 }
 
-fn palette_filter(input: &str) -> &str {
-    input.trim_start().strip_prefix('/').unwrap_or("")
+/// List the current working directory as a flat set of file paths,
+/// sorted, with a handful of noisy directories pruned. MVP scope:
+/// one level deep, no recursion. Skips `.git`, `node_modules`,
+/// `target`, `dist`, `.claude/worktrees` so a casual `@` press doesn't
+/// drown the palette in build artefacts.
+fn list_cwd_files() -> Vec<String> {
+    const PRUNE: &[&str] = &["target", "node_modules", "dist", ".claude"];
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip the noise set and any dotfile.
+        if name.starts_with('.') {
+            continue;
+        }
+        if PRUNE.contains(&name.as_str()) {
+            continue;
+        }
+        // Append `/` so directories are visually distinct in the box.
+        let suffix = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => "/",
+            _ => "",
+        };
+        out.push(format!("{name}{suffix}"));
+    }
+    out.sort();
+    out
+}
+
+/// Extract the filter portion of the palette-active input buffer.
+///
+/// For the command palette the filter is whatever follows the leading
+/// `/` (commands never live mid-buffer). For the file palette the
+/// trigger `@` can appear anywhere in the buffer — `palette_trigger_at`
+/// records the byte offset so we slice out the chars typed after it.
+fn palette_filter(
+    input: &str,
+    kind: crate::app::PaletteKind,
+    trigger_at: Option<usize>,
+) -> &str {
+    match kind {
+        crate::app::PaletteKind::Commands => input.trim_start().strip_prefix('/').unwrap_or(""),
+        crate::app::PaletteKind::Files => match trigger_at {
+            Some(at) if at < input.len() && input.as_bytes()[at] == b'@' => &input[at + 1..],
+            _ => "",
+        },
+    }
 }
 
 /// Reply to the pending permission prompt, close the dialog, and restore
@@ -158,6 +227,8 @@ fn close_palette(app: &mut App, replacement: Option<String>) {
     app.palette_original = None;
     app.palette_matches.clear();
     app.palette_selected = 0;
+    app.palette_kind = crate::app::PaletteKind::Commands;
+    app.palette_trigger_at = None;
     if let Some(new_input) = replacement {
         app.set_input(new_input);
     }
@@ -229,11 +300,33 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 app.input_cursor_end();
             }
         }
+        AppAction::HistoryPrev => {
+            if app.mode == AppMode::Input {
+                app.history_prev();
+            }
+        }
+        AppAction::HistoryNext => {
+            if app.mode == AppMode::Input {
+                app.history_next();
+            }
+        }
+        AppAction::HelpShortcut => {
+            if app.mode == AppMode::Input {
+                app.set_input("/help");
+                return update(app, AppAction::Submit, ctx);
+            }
+        }
         AppAction::Submit => {
             let text = app.input.trim().to_string();
             if text.is_empty() {
                 return UpdateResult::Continue;
             }
+            // Record the exact raw buffer (not the trimmed command) so
+            // ↑ recalls what the user actually typed, whitespace and
+            // all. Then reset the browse cursor — the next ↑ should
+            // start from the new tail, not wherever browsing left off.
+            app.push_history_entry(&app.input.clone());
+            app.history_reset();
             app.clear_input();
 
             // Check if it's a slash command
@@ -296,14 +389,31 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                     }
                 }
             } else {
+                // Bash prefix: `!cmd` tells the TUI "treat this as a
+                // shell command". The gutter already swapped to `$ ` in
+                // render_input; here we rewrap the message so the
+                // model reliably dispatches to the Bash tool instead
+                // of treating the literal `!ls` as prose. Full
+                // bypass-the-model execution is deferred — this MVP
+                // keeps all the tool-use plumbing (permission prompts,
+                // output capture) in the normal engine path.
+                let submit_text = if let Some(cmd) = text.strip_prefix('!') {
+                    let cmd = cmd.trim();
+                    format!(
+                        "Run the following shell command via the Bash \
+                         tool and show me the output:\n\n```bash\n{cmd}\n```"
+                    )
+                } else {
+                    text.clone()
+                };
                 // Regular user message
                 if app.mode == AppMode::Streaming {
                     // Queue for after the current turn finishes.
-                    app.queued.push_back(text);
+                    app.queued.push_back(submit_text);
                 } else {
                     app.push_user(text.clone());
                     app.start_stream();
-                    return UpdateResult::SubmitToEngine(text);
+                    return UpdateResult::SubmitToEngine(submit_text);
                 }
             }
         }
@@ -424,6 +534,8 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             if app.mode == AppMode::Input {
                 app.palette_original = Some(app.input.clone());
                 app.mode = AppMode::CommandPalette;
+                app.palette_kind = crate::app::PaletteKind::Commands;
+                app.palette_trigger_at = None;
                 app.palette_selected = 0;
                 // Insert the leading `/` that triggered the palette so the
                 // filter starts at "/" (user sees the char they typed).
@@ -432,6 +544,19 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
                 if !app.input.starts_with('/') {
                     app.input_insert_char('/');
                 }
+                refresh_palette(app, ctx.commands);
+            }
+        }
+        AppAction::FilePaletteOpen => {
+            if app.mode == AppMode::Input {
+                app.palette_original = Some(app.input.clone());
+                app.mode = AppMode::CommandPalette;
+                app.palette_kind = crate::app::PaletteKind::Files;
+                app.palette_selected = 0;
+                // Record the byte offset where `@` lands so Accept can
+                // slice cleanly around it.
+                app.palette_trigger_at = Some(app.input_cursor);
+                app.input_insert_char('@');
                 refresh_palette(app, ctx.commands);
             }
         }
@@ -451,11 +576,35 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             if app.mode != AppMode::CommandPalette {
                 return UpdateResult::Continue;
             }
-            let accepted = app
-                .palette_matches
-                .get(app.palette_selected)
-                .map(|name| format!("/{name} "));
-            close_palette(app, accepted);
+            let Some(selected) = app.palette_matches.get(app.palette_selected).cloned() else {
+                close_palette(app, None);
+                return UpdateResult::Continue;
+            };
+            match app.palette_kind {
+                crate::app::PaletteKind::Commands => {
+                    close_palette(app, Some(format!("/{selected} ")));
+                }
+                crate::app::PaletteKind::Files => {
+                    // File-palette accept: splice the picked path in
+                    // place of `@filter` so surrounding buffer text is
+                    // preserved. Trailing space makes the next token
+                    // land cleanly.
+                    let trigger = app.palette_trigger_at.unwrap_or(0);
+                    let filter_end = app.input_cursor.max(trigger);
+                    let mut new_input = String::new();
+                    new_input.push_str(&app.input[..trigger]);
+                    new_input.push('@');
+                    // Strip trailing "/" directory markers when
+                    // inserting so `src/` becomes `@src` not `@src/`.
+                    let clean = selected.trim_end_matches('/');
+                    new_input.push_str(clean);
+                    new_input.push(' ');
+                    new_input.push_str(&app.input[filter_end..]);
+                    let new_cursor = trigger + 1 + clean.len() + 1;
+                    close_palette(app, Some(new_input));
+                    app.input_cursor = new_cursor.min(app.input.len());
+                }
+            }
         }
         AppAction::PaletteCancel => {
             if app.mode == AppMode::CommandPalette {
@@ -592,6 +741,69 @@ mod tests {
         update(&mut app, AppAction::Backspace, &uctx);
         assert_eq!(app.input, before);
         assert_eq!(app.input_cursor, 0);
+    }
+
+    /// History recall via ↑ / ↓ must walk entries in LIFO order,
+    /// snapshot the in-progress draft on first ↑, and restore it when
+    /// the user walks past the newest entry.
+    #[test]
+    fn history_recall_walks_entries_and_restores_draft() {
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+
+        // Submit "hello" then "world" — history is ["hello", "world"].
+        for c in "hello".chars() {
+            update(&mut app, AppAction::InsertChar(c), &uctx);
+        }
+        update(&mut app, AppAction::Submit, &uctx);
+        app.mode = AppMode::Input; // Submit flipped to Streaming; reset for test.
+        for c in "world".chars() {
+            update(&mut app, AppAction::InsertChar(c), &uctx);
+        }
+        update(&mut app, AppAction::Submit, &uctx);
+        app.mode = AppMode::Input;
+        assert_eq!(app.history.len(), 2);
+
+        // Start typing a draft, then ↑ → newest entry ("world").
+        update(&mut app, AppAction::InsertChar('d'), &uctx);
+        update(&mut app, AppAction::InsertChar('r'), &uctx);
+        assert_eq!(app.input, "dr");
+        update(&mut app, AppAction::HistoryPrev, &uctx);
+        assert_eq!(app.input, "world");
+
+        // ↑ again → older entry ("hello").
+        update(&mut app, AppAction::HistoryPrev, &uctx);
+        assert_eq!(app.input, "hello");
+
+        // ↓ → back to "world".
+        update(&mut app, AppAction::HistoryNext, &uctx);
+        assert_eq!(app.input, "world");
+
+        // ↓ past the newest → restore the pre-browse draft "dr".
+        update(&mut app, AppAction::HistoryNext, &uctx);
+        assert_eq!(app.input, "dr");
+        assert!(app.history_cursor.is_none());
+    }
+
+    /// Adjacent duplicates must collapse so mashing Enter on the same
+    /// command doesn't fill the ring. Empty submits are also dropped.
+    #[test]
+    fn history_collapses_duplicates_and_skips_empty() {
+        let mut app = App::new("s".into(), "m".into());
+        app.push_history_entry("ls");
+        app.push_history_entry("ls");
+        app.push_history_entry("pwd");
+        app.push_history_entry("pwd");
+        app.push_history_entry("");
+        app.push_history_entry("   ");
+        assert_eq!(
+            app.history.iter().cloned().collect::<Vec<_>>(),
+            vec!["ls".to_string(), "pwd".to_string()]
+        );
     }
 
     /// CJK / emoji insertion must keep the caret on UTF-8 char

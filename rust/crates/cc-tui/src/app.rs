@@ -18,6 +18,11 @@ use crate::keybindings::Keybindings;
 /// graceful `Abort` to `ForceQuit`.
 pub const FORCE_QUIT_WINDOW_MS: u64 = 2_000;
 
+/// Maximum number of entries kept in the input-history ring. Older
+/// entries drop off the front when the ring fills. 200 matches the TS
+/// CLI and stays tiny in memory (≈few KiB for typical prompts).
+pub const HISTORY_MAX: usize = 200;
+
 /// One transcript entry. Tool calls and assistant text are flattened into a flat
 /// list so we can render them in order without recovering structure from the
 /// underlying `MessageParam` blocks. This is intentionally a UI-only model;
@@ -56,6 +61,19 @@ pub enum AppMode {
     PermissionPrompt,
     /// Slash command autocomplete palette open.
     CommandPalette,
+}
+
+/// Which source list the palette is showing. Flag sits on `App` and is
+/// read by `refresh_palette`, `close_palette`, and render code so the
+/// palette box can say "Commands" vs "Files" and the Accept action can
+/// either replace the whole buffer (command) or insert at the caret
+/// (file path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteKind {
+    /// `/` palette — slash commands (builtins + user skills).
+    Commands,
+    /// `@` palette — file-picker over the current working directory.
+    Files,
 }
 
 /// State of the permission modal — `Some` means a dialog is currently shown.
@@ -205,6 +223,14 @@ pub struct App {
     /// restore the buffer byte-for-byte without exposing the partial `/`
     /// filter to a reader.
     pub palette_original: Option<String>,
+    /// Which source list the palette is pulling from. Defaults to
+    /// `Commands` but flips to `Files` when `@` opens a file picker.
+    pub palette_kind: PaletteKind,
+    /// Byte-offset inside `input` of the trigger char (`/` or `@`) that
+    /// opened the palette. PaletteAccept uses this for file pickers to
+    /// replace the `@` plus filter text with the selected file path
+    /// without touching the rest of the buffer.
+    pub palette_trigger_at: Option<usize>,
     /// Binary version string surfaced in the welcome banner (`v0.1.0`). Set
     /// by the entry point from `CARGO_PKG_VERSION`; tests construct an App
     /// directly and inherit the cc-tui crate version.
@@ -255,6 +281,19 @@ pub struct App {
     /// CJK / emoji glyph. `Cell` because render takes `&App` but needs
     /// to update the offset as the caret moves.
     pub input_view_offset: Cell<usize>,
+    /// Ring buffer of previously-submitted user messages, newest last.
+    /// Capped at `HISTORY_MAX` to keep memory bounded; adjacent
+    /// duplicates collapse so mashing Enter on the same line doesn't
+    /// fill the ring. Populated exclusively by `push_history_entry`.
+    pub history: VecDeque<String>,
+    /// Current browse position within `history`. `None` = not browsing
+    /// (caret sits in the live input buffer). `Some(i)` = showing
+    /// `history[i]`. Up/Down adjust this; Submit / Esc reset to `None`.
+    pub history_cursor: Option<usize>,
+    /// Snapshot of the user's in-progress draft captured the moment
+    /// history browsing begins. Restored when the user steps past the
+    /// newest history entry so no work is lost to an accidental ↑.
+    pub history_draft: Option<String>,
 }
 
 impl App {
@@ -281,6 +320,8 @@ impl App {
             palette_matches: Vec::new(),
             palette_selected: 0,
             palette_original: None,
+            palette_kind: PaletteKind::Commands,
+            palette_trigger_at: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
             cwd: default_cwd_display(),
             git_branch: None,
@@ -289,7 +330,74 @@ impl App {
             welcome_banner: None,
             input_cursor: 0,
             input_view_offset: Cell::new(0),
+            history: VecDeque::with_capacity(HISTORY_MAX),
+            history_cursor: None,
+            history_draft: None,
         }
+    }
+
+    /// Record a just-submitted input line into the ring. Empty lines
+    /// and exact duplicates of the newest entry are dropped so history
+    /// tracks *distinct* commands the user actually ran.
+    pub fn push_history_entry(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history.back().map(String::as_str) == Some(line) {
+            return;
+        }
+        if self.history.len() >= HISTORY_MAX {
+            self.history.pop_front();
+        }
+        self.history.push_back(line.to_string());
+    }
+
+    /// Step one entry further back in history (Up arrow). First press
+    /// snapshots the in-progress draft; subsequent presses walk toward
+    /// the oldest entry. No-op when the history is empty.
+    pub fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let new_cursor = match self.history_cursor {
+            None => {
+                self.history_draft = Some(self.input.clone());
+                self.history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(new_cursor);
+        let entry = self.history[new_cursor].clone();
+        self.set_input(entry);
+    }
+
+    /// Step one entry forward in history (Down arrow). When the user
+    /// walks past the newest entry, restore the pre-browse draft and
+    /// leave browsing mode.
+    pub fn history_next(&mut self) {
+        let Some(cursor) = self.history_cursor else {
+            return;
+        };
+        if cursor + 1 >= self.history.len() {
+            // Past the newest entry → back to the live draft.
+            self.history_cursor = None;
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.set_input(draft);
+            return;
+        }
+        let new_cursor = cursor + 1;
+        self.history_cursor = Some(new_cursor);
+        let entry = self.history[new_cursor].clone();
+        self.set_input(entry);
+    }
+
+    /// End a history-browse session without changing `input` — used
+    /// when focus shifts elsewhere (palette open, Esc, Submit).
+    pub fn history_reset(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
     }
 
     /// Stash the rendered welcome banner so `render_transcript` paints
