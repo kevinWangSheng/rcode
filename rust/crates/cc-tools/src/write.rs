@@ -3,6 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
+use crate::file_history::{project_relative_path, MAX_SNAPSHOT_BYTES};
 use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct WriteTool;
@@ -37,7 +38,7 @@ impl Tool for WriteTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
@@ -53,6 +54,38 @@ impl Tool for WriteTool {
                     format!("failed to create dirs for {file_path}: {e}"),
                 )
             })?;
+        }
+
+        // File-history snapshot: if the target pre-exists, read its
+        // current bytes and persist them via the session sink BEFORE the
+        // atomic write. Matches TS `fileHistoryTrackEdit` semantics
+        // (backup only covers files that already existed) and the
+        // orphan-snapshot rule in
+        // openspec `fix-file-history-snapshot-producers` §Open Questions.
+        let file_existed = path.exists();
+        if file_existed {
+            let prior = tokio::fs::read(path).await.map_err(|e| {
+                CcError::tool(
+                    "tool",
+                    format!("failed to snapshot pre-write contents of {file_path}: {e}"),
+                )
+            })?;
+            if prior.len() > MAX_SNAPSHOT_BYTES {
+                tracing::warn!(
+                    path = %file_path,
+                    size = prior.len(),
+                    threshold = MAX_SNAPSHOT_BYTES,
+                    "file-history snapshot exceeds threshold; persisting anyway"
+                );
+            }
+            let relpath = project_relative_path(path);
+            let message_id = ctx.message_id.clone().unwrap_or_default();
+            ctx.session.append_file_history_snapshot_for_path(
+                &relpath,
+                &message_id,
+                &prior,
+                false,
+            )?;
         }
 
         // Capture the existing file mode (if any) so we can preserve it
@@ -124,7 +157,32 @@ impl Tool for WriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    /// Build a `ToolContext` whose session sink is a real
+    /// `cc_session::Session` rooted inside `session_dir`. Used by the
+    /// file-history regression tests; returns the concrete Session too
+    /// so assertions can call `session.file_history_snapshots()` and
+    /// `session.read_backup(...)`.
+    fn ctx_with_real_session(
+        session_dir: &std::path::Path,
+        message_id: Option<&str>,
+    ) -> (ToolContext, Arc<cc_session::Session>) {
+        // Lay out the session as `{dir}/<session-id>/transcript.jsonl`
+        // so `session_dir()` has a parent to hang the backup dir off.
+        let id = "test-write";
+        let sdir = session_dir.join(id);
+        std::fs::create_dir_all(&sdir).unwrap();
+        let transcript = sdir.join("transcript.jsonl");
+        let session = Arc::new(cc_session::Session::from_parts(id.into(), transcript));
+        let ctx = ToolContext {
+            session: session.clone() as Arc<dyn cc_core::SessionSink>,
+            cancel: CancellationToken::new(),
+            message_id: message_id.map(str::to_owned),
+        };
+        (ctx, session)
+    }
 
     #[tokio::test]
     async fn write_creates_file() {
@@ -239,6 +297,86 @@ mod tests {
             mode & 0o111,
             0,
             "new file must not acquire exec bits: {mode:o}"
+        );
+    }
+
+    // ── File-history snapshot producers (openspec
+    // `fix-file-history-snapshot-producers` §4) ──────────────────────────
+
+    #[tokio::test]
+    async fn write_overwrite_appends_snapshot() {
+        // A Write against an existing file MUST persist the pre-write
+        // bytes via the session sink, so resume can restore the file to
+        // its pre-edit state.
+        let work = tempfile::tempdir().unwrap();
+        let session_root = tempfile::tempdir().unwrap();
+        let file = work.path().join("foo.txt");
+        std::fs::write(&file, "old").unwrap();
+
+        let (ctx, session) = ctx_with_real_session(session_root.path(), Some("msg-overwrite"));
+
+        let tool = WriteTool;
+        let result = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "content": "new"}),
+                &ctx,
+            )
+            .await
+            .expect("Write must succeed");
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+
+        let snaps = session.file_history_snapshots().unwrap();
+        assert_eq!(snaps.len(), 1, "exactly one snapshot for one overwrite");
+        let snap = &snaps[0];
+        assert_eq!(snap.message_id, "msg-overwrite");
+        assert!(
+            !snap.is_snapshot_update,
+            "overwrite snapshot must not be a refinement"
+        );
+        assert_eq!(
+            snap.snapshot.tracked_file_backups.len(),
+            1,
+            "exactly one tracked backup entry"
+        );
+        let (relpath, backup) = snap.snapshot.tracked_file_backups.iter().next().unwrap();
+        let backup_name = backup
+            .backup_file_name
+            .clone()
+            .expect("overwrite backup must reference a sidecar");
+        let bytes = session.read_backup(&backup_name).unwrap();
+        assert_eq!(
+            bytes, b"old",
+            "sidecar must hold the pre-write bytes for {relpath}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_new_file_does_not_snapshot() {
+        // Target path does NOT exist. The Write must succeed but MUST NOT
+        // emit a snapshot — matches TS which only snapshots pre-existing
+        // files.
+        let work = tempfile::tempdir().unwrap();
+        let session_root = tempfile::tempdir().unwrap();
+        let file = work.path().join("new.txt");
+
+        let (ctx, session) = ctx_with_real_session(session_root.path(), Some("msg-new"));
+
+        let tool = WriteTool;
+        let result = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "content": "hi"}),
+                &ctx,
+            )
+            .await
+            .expect("Write must succeed");
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
+
+        let snaps = session.file_history_snapshots().unwrap();
+        assert!(
+            snaps.is_empty(),
+            "net-new file must not emit a snapshot, got {snaps:?}"
         );
     }
 }
