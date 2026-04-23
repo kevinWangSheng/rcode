@@ -356,9 +356,16 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
                             if let Err(e) =
                                 engine.run_turn(text, |_| {}, messages, &child_cancel).await
                             {
-                                // Send the error to the TUI (TurnComplete was not
-                                // sent by the engine in this error path).
-                                let _ = tx.send(CoreEvent::Error(e.to_string())).await;
+                                // Suppress user-initiated cancellation noise:
+                                // the abort path on the TUI side already painted
+                                // the `[aborted]` marker on the partial assistant
+                                // text, so surfacing an extra `ⓘ Error:
+                                // Cancelled` line is just noise that confuses
+                                // "I pressed Ctrl+C" with "the network broke".
+                                // All other errors still surface as before.
+                                if !matches!(e, cc_core::CcError::Cancelled) {
+                                    let _ = tx.send(CoreEvent::Error(e.to_string())).await;
+                                }
                             }
                             // On success the engine already sent TurnComplete.
                         });

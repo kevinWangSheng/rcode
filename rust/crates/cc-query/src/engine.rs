@@ -222,12 +222,52 @@ impl QueryEngine {
             if cancel.is_cancelled() && !text_buf.is_empty() {
                 let mut interrupted_content = message.content.clone();
                 interrupted_content.push(ContentBlock::text("\n[Interrupted by user]"));
+
+                // The Anthropic API requires every `tool_use` block to be
+                // followed in the next user message by a matching
+                // `tool_result` block — otherwise the next request 400s
+                // with `tool_use ids were found without tool_result blocks`.
+                // When the user cancels mid-stream the model may have
+                // already emitted one or more `tool_use` headers without
+                // the engine getting a chance to execute them, so we
+                // synthesize stub `tool_result` blocks that mark each
+                // interrupted call as `is_error: true`. This keeps the
+                // saved transcript replayable without losing the abort
+                // signal: the next turn's request body is well-formed,
+                // and the assistant sees that those tool calls were
+                // cancelled by the user.
+                let interrupted_tool_results: Vec<ContentBlock> = interrupted_content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse(tu) => {
+                            Some(ContentBlock::ToolResult(ToolResultBlock {
+                                tool_use_id: tu.id.clone(),
+                                content: Some(serde_json::Value::String(
+                                    "[Interrupted by user]".to_string(),
+                                )),
+                                is_error: Some(true),
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
                 let partial_msg = MessageParam {
                     role: Role::Assistant,
                     content: MessageContent::Blocks(interrupted_content),
                 };
                 self.session.append(&partial_msg)?;
                 messages.push(partial_msg);
+
+                if !interrupted_tool_results.is_empty() {
+                    let result_msg = MessageParam {
+                        role: Role::User,
+                        content: MessageContent::Blocks(interrupted_tool_results),
+                    };
+                    self.session.append(&result_msg)?;
+                    messages.push(result_msg);
+                }
+
                 return Err(CcError::Cancelled);
             }
 
