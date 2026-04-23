@@ -104,15 +104,14 @@
       whose content starts with `"Hook requested async rewake:"`
       and contains the marker. Contrast with a Block test whose
       content lacks the prefix.
-- [ ] 5.3 `engine::tests::additional_contexts_are_cleared_on
+- [x] 5.3 `engine::tests::additional_contexts_are_cleared_on
       _cancel` — populate `pending_additional_contexts` manually,
       force a cancellation inside `run_turn`, assert the vector
       is empty after the error return.
-      (Deferred: triggering the cancel branch needs a mock
-      `ApiClient::stream_message`; the engine's test surface only
-      drives `drain_stream` directly. The clear is in place at
-      `engine.rs:183` and `:272`; verify by inspection until a
-      stream-mock harness lands.)
+      (Unblocked + landed by `fix-engine-stream-mock-harness` §5.1:
+      the test lives in `cc-query/src/engine.rs` under the same
+      name and uses `test_support::scripted_stream` to drive the
+      cancel branch end-to-end.)
 
 ## 6. Spec updates
 
