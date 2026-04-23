@@ -246,6 +246,7 @@ impl QueryEngine {
                                     "[Interrupted by user]".to_string(),
                                 )),
                                 is_error: Some(true),
+                                cache_control: None,
                             }))
                         }
                         _ => None,
@@ -444,6 +445,7 @@ impl QueryEngine {
                                 tool_use_id: tu.id.clone(),
                                 content: Some(Value::String(result.content.clone())),
                                 is_error: if result.is_error { Some(true) } else { None },
+                                cache_control: None,
                             };
 
                             // Emit ToolEnd
@@ -617,6 +619,7 @@ impl QueryEngine {
             tool_use_id: tu.id.clone(),
             content: Some(Value::String(result.content.clone())),
             is_error: if result.is_error { Some(true) } else { None },
+            cache_control: None,
         };
 
         // Emit ToolEnd
@@ -696,6 +699,7 @@ fn tool_result_error(tool_use_id: &str, message: impl Into<String>) -> ToolResul
         tool_use_id: tool_use_id.to_string(),
         content: Some(Value::String(message.into())),
         is_error: Some(true),
+        cache_control: None,
     }
 }
 
@@ -767,6 +771,7 @@ where
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    cache_control: None,
                 };
                 events_tx.map(|tx| tx.send(AppEvent::StreamToolUse(tu)))
             }
@@ -799,6 +804,7 @@ pub(crate) fn synthesize_bad_tool_input_result(id: &str, name: &str, raw: &str) 
              Raw fragment (truncated): {raw}"
         ))),
         is_error: Some(true),
+        cache_control: None,
     }
 }
 
@@ -886,6 +892,7 @@ fn strip_images(msg: &MessageParam) -> MessageParam {
                             tool_use_id: tr.tool_use_id.clone(),
                             content,
                             is_error: tr.is_error,
+                            cache_control: tr.cache_control.clone(),
                         }))
                     }
                     other => Some(other.clone()),
@@ -988,6 +995,7 @@ mod tests {
             id: "tu_1".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command": "rm -rf /"}),
+            cache_control: None,
         };
         let cancel = CancellationToken::new();
         let result = fire_permission_request(&hooks, "sess-1", &tu, &cancel).await;
@@ -1009,6 +1017,7 @@ mod tests {
             id: "tu_1".into(),
             name: "Bash".into(),
             input: serde_json::json!({}),
+            cache_control: None,
         };
         let cancel = CancellationToken::new();
         let result = fire_permission_request(&hooks, "sess-1", &tu, &cancel).await;
@@ -1031,6 +1040,7 @@ mod tests {
             id: "tu_1".into(),
             name: "Bash".into(),
             input: serde_json::json!({}),
+            cache_control: None,
         };
         let cancel = CancellationToken::new();
         fire_permission_denied(&hooks, "sess-abc", &tu, "policy-deny", &cancel).await;
@@ -1057,11 +1067,13 @@ mod tests {
             id: "tu_1".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command": "echo ok"}),
+            cache_control: None,
         };
         let result = ToolResultBlock {
             tool_use_id: "tu_1".into(),
             content: Some(serde_json::Value::String("ok".into())),
             is_error: None,
+            cache_control: None,
         };
         let cancel = CancellationToken::new();
         run_post_tool_hook(&hooks, "sess-1", &tu, &result, &cancel).await;
@@ -1088,11 +1100,13 @@ mod tests {
             id: "tu_1".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command": "false"}),
+            cache_control: None,
         };
         let result = ToolResultBlock {
             tool_use_id: "tu_1".into(),
             content: Some(serde_json::Value::String("boom".into())),
             is_error: Some(true),
+            cache_control: None,
         };
         let cancel = CancellationToken::new();
         run_post_tool_hook(&hooks, "sess-1", &tu, &result, &cancel).await;
@@ -1116,6 +1130,7 @@ mod tests {
                 media_type: "image/png".into(),
                 data: "abc123".into(),
             },
+            cache_control: None,
         });
         let text_block = ContentBlock::text("hello");
 
@@ -1149,6 +1164,7 @@ mod tests {
                     {"type": "text", "text": "description"}
                 ])),
                 is_error: None,
+                cache_control: None,
             })]),
         });
 
@@ -1448,16 +1464,19 @@ mod tests {
             id: "id_good_1".into(),
             name: "Bash".into(),
             input: serde_json::json!({"command":"echo hi"}),
+            cache_control: None,
         };
         let tu_bad = ToolUseBlock {
             id: "id_bad".into(),
             name: "Edit".into(),
             input: serde_json::Value::Object(Default::default()),
+            cache_control: None,
         };
         let tu_good_2 = ToolUseBlock {
             id: "id_good_2".into(),
             name: "Read".into(),
             input: serde_json::json!({"file_path":"/x"}),
+            cache_control: None,
         };
         let original = vec![tu_good_1.clone(), tu_bad.clone(), tu_good_2.clone()];
 
@@ -1466,11 +1485,13 @@ mod tests {
                 tool_use_id: "id_good_2".into(),
                 content: Some(serde_json::Value::String("read ok".into())),
                 is_error: Some(false),
+                cache_control: None,
             },
             ToolResultBlock {
                 tool_use_id: "id_good_1".into(),
                 content: Some(serde_json::Value::String("hi".into())),
                 is_error: Some(false),
+                cache_control: None,
             },
         ];
         let bad = vec![(

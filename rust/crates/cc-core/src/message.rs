@@ -139,6 +139,14 @@ pub struct ToolUseBlock {
     pub id: String,
     pub name: String,
     pub input: Value,
+    /// Prompt-cache breakpoint marker. The Anthropic API accepts
+    /// `cache_control` on any user/assistant content block; in practice
+    /// callers only tag the *last* block of the most recent message to
+    /// pin a cache window on the turn-by-turn prefix (see TS
+    /// `addCacheBreakpoints` in `services/api/claude.ts`). Skipped on the
+    /// wire when `None` so existing fixtures do not regress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +156,9 @@ pub struct ToolResultBlock {
     pub content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
+    /// Prompt-cache breakpoint marker; see [`ToolUseBlock::cache_control`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +176,9 @@ pub struct RedactedThinkingBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageBlock {
     pub source: ImageSource,
+    /// Prompt-cache breakpoint marker; see [`ToolUseBlock::cache_control`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +217,67 @@ impl ContentBlock {
             ContentBlock::Text(b) => Some(&b.text),
             _ => None,
         }
+    }
+
+    /// Attach a prompt-cache breakpoint to whichever variant supports one.
+    ///
+    /// In TS the breakpoint is placed on "the last block of the last
+    /// message" in a request (see `services/api/claude.ts::addCacheBreakpoints`,
+    /// which splats `{cache_control}` onto the trailing block regardless of
+    /// its concrete type). `Thinking` and `RedactedThinking` are explicitly
+    /// excluded in the TS reference and remain excluded here. `Unknown` is a
+    /// forward-compat placeholder that carries no structured fields, so it
+    /// can't accept a breakpoint either.
+    ///
+    /// Returns `self` so this can be chained at construction sites:
+    /// ```ignore
+    /// ContentBlock::text("hi").with_cache_control(CacheControl::ephemeral_unscoped())
+    /// ```
+    #[must_use]
+    pub fn with_cache_control(mut self, cache: CacheControl) -> Self {
+        match &mut self {
+            ContentBlock::Text(b) => b.cache_control = Some(cache),
+            ContentBlock::ToolUse(b) => b.cache_control = Some(cache),
+            ContentBlock::ToolResult(b) => b.cache_control = Some(cache),
+            ContentBlock::Image(b) => b.cache_control = Some(cache),
+            ContentBlock::Thinking(_)
+            | ContentBlock::RedactedThinking(_)
+            | ContentBlock::Unknown => {}
+        }
+        self
+    }
+}
+
+// ── Thinking Config ────────────────────────────────────────────
+
+/// Extended-thinking configuration for `POST /v1/messages`.
+///
+/// Mirrors the TS `ThinkingConfig` union in `src/utils/thinking.ts` and
+/// the Anthropic SDK's `BetaThinkingConfigParam`:
+///
+/// - `Adaptive` → the server picks an internal budget per turn.
+/// - `Enabled { budget_tokens }` → explicit budget; callers must ensure
+///   `budget_tokens < max_tokens` (the TS wrapper clamps to
+///   `max_tokens - 1`).
+/// - `Disabled` → explicit opt-out (needed on models that default-on).
+///
+/// Serialized as a serde-tagged struct variant so the wire shape is
+/// `{"type":"enabled","budget_tokens":1024}` etc., matching the Anthropic
+/// API and round-tripping cleanly against the TS client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    Adaptive,
+    Enabled { budget_tokens: u32 },
+    Disabled,
+}
+
+impl ThinkingConfig {
+    /// Convenience constructor for an explicit thinking budget. Matches
+    /// TS `sideQuery.ts:172-177` where the wrapper builds
+    /// `{type: "enabled", budget_tokens: min(thinking, max_tokens - 1)}`.
+    pub fn enabled(budget_tokens: u32) -> Self {
+        ThinkingConfig::Enabled { budget_tokens }
     }
 }
 
@@ -398,5 +473,142 @@ mod tests {
             serde_json::to_string(&StopReason::ToolUse).unwrap(),
             "\"tool_use\""
         );
+    }
+
+    // ── cache_control on content blocks ─────────────────────────
+    //
+    // TS `services/api/claude.ts::addCacheBreakpoints` tags the trailing
+    // content block of the most recent message with
+    // `{cache_control: {type: "ephemeral"}}` regardless of block type
+    // (text / tool_use / tool_result / image). The Rust equivalent has to
+    // round-trip the field on every block type that could be "last", and
+    // MUST omit the field when unset so existing fixtures (e.g. the
+    // system-block wire snapshots in `cc/src/main.rs`) do not regress.
+
+    #[test]
+    fn text_block_cache_control_absent_when_unset() {
+        let b = ContentBlock::text("hi");
+        let json = serde_json::to_string(&b).unwrap();
+        assert_eq!(json, r#"{"type":"text","text":"hi"}"#);
+    }
+
+    #[test]
+    fn text_block_cache_control_emitted_on_wire() {
+        let b =
+            ContentBlock::text("hi").with_cache_control(CacheControl::ephemeral_unscoped());
+        let json = serde_json::to_string(&b).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}"#
+        );
+    }
+
+    #[test]
+    fn tool_use_block_cache_control_emitted_on_wire() {
+        let b = ContentBlock::ToolUse(ToolUseBlock {
+            id: "tu1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "echo hi"}),
+            cache_control: None,
+        })
+        .with_cache_control(CacheControl::ephemeral_unscoped());
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(
+            json["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn tool_result_block_cache_control_emitted_on_wire() {
+        let b = ContentBlock::ToolResult(ToolResultBlock {
+            tool_use_id: "tu1".into(),
+            content: Some(serde_json::Value::String("ok".into())),
+            is_error: None,
+            cache_control: None,
+        })
+        .with_cache_control(CacheControl::ephemeral_unscoped());
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(
+            json["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn image_block_cache_control_emitted_on_wire() {
+        let b = ContentBlock::Image(ImageBlock {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAA".into(),
+            },
+            cache_control: None,
+        })
+        .with_cache_control(CacheControl::ephemeral_unscoped());
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(
+            json["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn thinking_block_ignores_with_cache_control() {
+        // Parity with TS: thinking / redacted_thinking are never tagged.
+        let b = ContentBlock::Thinking(ThinkingBlock {
+            thinking: "reasoning".into(),
+            signature: None,
+        })
+        .with_cache_control(CacheControl::ephemeral_unscoped());
+        let json = serde_json::to_value(&b).unwrap();
+        assert!(
+            json.get("cache_control").is_none(),
+            "thinking blocks must not carry cache_control"
+        );
+    }
+
+    // ── thinking config ─────────────────────────────────────────
+
+    #[test]
+    fn thinking_enabled_serializes_with_budget() {
+        let t = ThinkingConfig::enabled(1024);
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, r#"{"type":"enabled","budget_tokens":1024}"#);
+    }
+
+    #[test]
+    fn thinking_disabled_serializes_without_budget() {
+        let t = ThinkingConfig::Disabled;
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, r#"{"type":"disabled"}"#);
+    }
+
+    #[test]
+    fn thinking_adaptive_serializes_without_budget() {
+        let t = ThinkingConfig::Adaptive;
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, r#"{"type":"adaptive"}"#);
+    }
+
+    #[test]
+    fn thinking_round_trip() {
+        let t = ThinkingConfig::enabled(2048);
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: ThinkingConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, t);
+    }
+
+    #[test]
+    fn tool_use_block_round_trips_cache_control_inbound() {
+        // Defensive: if a server ever echoes cache_control back on a
+        // content block, deserialization must preserve the field.
+        let json = r#"{"type":"tool_use","id":"tu1","name":"Bash","input":{},"cache_control":{"type":"ephemeral"}}"#;
+        let parsed: ContentBlock = serde_json::from_str(json).unwrap();
+        if let ContentBlock::ToolUse(tu) = parsed {
+            assert!(tu.cache_control.is_some());
+            assert_eq!(tu.cache_control.unwrap().kind, "ephemeral");
+        } else {
+            panic!("expected ToolUse variant");
+        }
     }
 }

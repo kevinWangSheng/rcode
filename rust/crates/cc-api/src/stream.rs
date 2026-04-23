@@ -276,6 +276,7 @@ impl StreamAccumulator {
                         id,
                         name,
                         input,
+                        cache_control: None,
                     }));
                 }
             }
@@ -355,6 +356,7 @@ impl StreamAccumulator {
                                 id,
                                 name,
                                 input,
+                                cache_control: None,
                             }));
                         }
                         Err(_) => {
@@ -363,6 +365,7 @@ impl StreamAccumulator {
                                 id,
                                 name,
                                 input: Value::Object(Default::default()),
+                                cache_control: None,
                             }));
                         }
                     }
