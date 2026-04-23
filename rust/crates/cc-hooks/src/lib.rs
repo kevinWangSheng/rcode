@@ -1297,4 +1297,117 @@ mod tests {
             elapsed
         );
     }
+
+    #[tokio::test]
+    async fn exit_code_2_with_async_rewake_yields_rewake_outcome() {
+        // exit 2 + `async_rewake: true` lifts the outcome from Block to
+        // AsyncRewake. The captured stdout becomes the rewake message; the
+        // legacy `blocked` / `block_message` fields stay populated so the
+        // current consumer (which still treats rewake like Block until the
+        // task-notification queue lands) keeps working.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'please rewake now' && exit 2", "unsafe_shell": true, "async_rewake": true}]}]
+        }"#,
+        )
+        .unwrap();
+        let runner = HookRunner::new(&settings, reqwest::Client::new());
+        let input = test_input("PreToolUse");
+        let cancel = CancellationToken::new();
+        let result = runner.run("PreToolUse", &input, &cancel).await;
+        assert_eq!(
+            result.async_rewake.as_deref(),
+            Some("please rewake now"),
+            "async_rewake field should carry the captured stdout"
+        );
+        assert!(result.blocked, "rewake still blocks until queue lands");
+        assert_eq!(result.block_message.as_deref(), Some("please rewake now"));
+    }
+
+    #[test]
+    fn plugin_option_env_key_matches_ts_rules() {
+        // TS regex: `key.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()`.
+        // Each non-alphanumeric/underscore byte becomes `_`; result is then
+        // uppercased and prefixed with `CLAUDE_PLUGIN_OPTION_`.
+        // The unicode case `fo/ø` collapses both `/` and the two UTF-8 bytes
+        // of `ø` to `_` (Rust iterates chars; we replace any non-ASCII char).
+        let cases: &[(&str, &str)] = &[
+            ("foo", "CLAUDE_PLUGIN_OPTION_FOO"),
+            ("foo-bar", "CLAUDE_PLUGIN_OPTION_FOO_BAR"),
+            ("foo.bar", "CLAUDE_PLUGIN_OPTION_FOO_BAR"),
+            ("foo bar", "CLAUDE_PLUGIN_OPTION_FOO_BAR"),
+            ("Foo_BAR", "CLAUDE_PLUGIN_OPTION_FOO_BAR"),
+            ("123foo", "CLAUDE_PLUGIN_OPTION_123FOO"),
+            ("foo123", "CLAUDE_PLUGIN_OPTION_FOO123"),
+            ("fo/ø", "CLAUDE_PLUGIN_OPTION_FO__"),
+            ("", "CLAUDE_PLUGIN_OPTION_"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                plugin_option_env_key(input),
+                *expected,
+                "plugin_option_env_key({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_context_env_pairs_full() {
+        let mut opts = HashMap::new();
+        opts.insert("alpha".into(), "one".into());
+        opts.insert("beta".into(), "two".into());
+        let ctx = HookContext {
+            project_dir: Some(PathBuf::from("/proj")),
+            plugin_root: Some(PathBuf::from("/plugin/src")),
+            plugin_data: Some(PathBuf::from("/plugin/data")),
+            plugin_options: opts,
+        };
+        let pairs = ctx.env_pairs();
+        // Fixed-key triple comes first in spec order, then plugin options
+        // sorted lexicographically (alpha, beta).
+        assert_eq!(
+            pairs,
+            vec![
+                ("CLAUDE_PROJECT_DIR".to_string(), "/proj".to_string()),
+                ("CLAUDE_PLUGIN_ROOT".to_string(), "/plugin/src".to_string()),
+                ("CLAUDE_PLUGIN_DATA".to_string(), "/plugin/data".to_string()),
+                ("CLAUDE_PLUGIN_OPTION_ALPHA".to_string(), "one".to_string()),
+                ("CLAUDE_PLUGIN_OPTION_BETA".to_string(), "two".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_context_env_pairs_empty_omits_keys() {
+        let ctx = HookContext::default();
+        assert!(ctx.env_pairs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hook_child_sees_plugin_env_vars() {
+        // End-to-end: the runner must export CLAUDE_PROJECT_DIR and
+        // CLAUDE_PLUGIN_OPTION_FOO into the child process. The hook prints
+        // them back through `additional_context`; we assert the captured
+        // string round-trips both values.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "SubagentStart": [{"hooks": [{"type": "command", "command": "printf '{\"hook_specific_output\":{\"additional_context\":\"%s|%s\"}}' \"$CLAUDE_PROJECT_DIR\" \"$CLAUDE_PLUGIN_OPTION_FOO\"", "unsafe_shell": true}]}]
+        }"#,
+        )
+        .unwrap();
+        let mut opts = HashMap::new();
+        opts.insert("foo".into(), "bar".into());
+        let ctx = HookContext {
+            project_dir: Some(PathBuf::from("/tmp/p")),
+            plugin_root: None,
+            plugin_data: None,
+            plugin_options: opts,
+        };
+        let runner = HookRunner::new(&settings, reqwest::Client::new()).with_context(ctx);
+        let input = test_input("SubagentStart");
+        let cancel = CancellationToken::new();
+        let result = runner.run("SubagentStart", &input, &cancel).await;
+        assert!(!result.blocked);
+        assert_eq!(result.additional_contexts, vec!["/tmp/p|bar".to_string()]);
+    }
 }

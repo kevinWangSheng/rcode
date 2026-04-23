@@ -71,6 +71,12 @@ pub struct QueryEngine {
     events_tx: Option<mpsc::Sender<AppEvent>>,
     /// Set to `true` when auto-compact fires inside the most recent `run_turn`.
     compacted_last_turn: bool,
+    /// Contexts collected from PreToolUse hooks that must flow into the next
+    /// API call as synthetic `MessageParam::user` entries. Drained at the top
+    /// of each `run_turn` loop iteration so the strings are part of the
+    /// `messages.clone()` snapshot the API request is built from.
+    /// Mirrors TS `hooks.ts:2783-2788`.
+    pending_additional_contexts: Vec<String>,
 }
 
 /// Construction bundle for `QueryEngine::new`.
@@ -113,6 +119,7 @@ impl QueryEngine {
             usage: UsageTracker::default(),
             events_tx: None,
             compacted_last_turn: false,
+            pending_additional_contexts: Vec::new(),
         }
     }
 
@@ -130,6 +137,14 @@ impl QueryEngine {
 
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Test-only accessor for the buffered PreToolUse contexts. Production
+    /// code reads/writes via the `run_turn` drain; tests use this to assert
+    /// the wiring without spinning up a full API mock.
+    #[cfg(test)]
+    pub(crate) fn pending_additional_contexts(&self) -> &[String] {
+        &self.pending_additional_contexts
     }
 
     /// Read-only access to the cumulative usage tracker.
@@ -180,10 +195,21 @@ impl QueryEngine {
         loop {
             turns += 1;
             if turns > MAX_TURNS {
+                self.pending_additional_contexts.clear();
                 return Err(CcError::Other(format!("exceeded max turns ({MAX_TURNS})")));
             }
 
             debug!("query turn {turns}, messages={}", messages.len());
+
+            // Drain any additional_context strings collected by PreToolUse
+            // hooks in earlier iterations and inject them as user messages
+            // BEFORE building the request so they're part of `messages.clone()`.
+            // TS parity: `hooks.ts:2783-2788`.
+            for ctx in self.pending_additional_contexts.drain(..) {
+                let ctx_msg = MessageParam::user(ctx);
+                self.session.append(&ctx_msg)?;
+                messages.push(ctx_msg);
+            }
 
             // 3. Build API request
             let mut req = CreateMessageRequest::new(&self.options.model, messages.clone())
@@ -269,6 +295,7 @@ impl QueryEngine {
                     messages.push(result_msg);
                 }
 
+                self.pending_additional_contexts.clear();
                 return Err(CcError::Cancelled);
             }
 
@@ -505,6 +532,28 @@ impl QueryEngine {
         // --- PreToolUse hook ---
         let hook_input = HookInput::base(self.session.id.clone(), "PreToolUse").with_tool(tu);
         let hook_result = self.hooks.run("PreToolUse", &hook_input, cancel).await;
+
+        // Carry any additional_context strings into the next API call. Done
+        // BEFORE the block / async-rewake checks so a halting hook that also
+        // emitted context doesn't lose the information — the next user-driven
+        // turn (after the tool_result error) will still receive it. TS parity:
+        // `hooks.ts:2783-2788`.
+        self.pending_additional_contexts
+            .extend(hook_result.additional_contexts.iter().cloned());
+
+        // AsyncRewake takes precedence over the plain Block path so it can be
+        // routed differently once the task-notification queue lands. For now
+        // it surfaces as a tool_result error with a distinguishing prefix.
+        // TS parity: `hooks.ts:1843-1875`.
+        if let Some(rewake_msg) = hook_result.async_rewake.clone() {
+            // TODO(batch-G task-notification-queue): replace this early
+            // return with a queued re-entry once the infra lands.
+            return Err(tool_result_error(
+                &tu.id,
+                format!("Hook requested async rewake: {rewake_msg}"),
+            ));
+        }
+
         if hook_result.blocked {
             let msg = hook_result
                 .block_message
@@ -1602,5 +1651,142 @@ mod tests {
         assert_eq!(blocks[0]["type"], "tool_result");
         assert_eq!(blocks[0]["tool_use_id"], "tu_broken");
         assert_eq!(blocks[0]["is_error"], true);
+    }
+
+    // ---- PreToolUse consumer wiring tests (fix-hook-correctness-wiring) ----
+    //
+    // These exercise `check_tool_permissions` directly so we can assert the
+    // additional_contexts / async_rewake plumbing without booting a mock API.
+    // The ApiClient inside the engine is never actually called.
+
+    use crate::prompter::StdinPrompter;
+    use cc_api::AuthCredential;
+    use cc_core::hook::HooksSettings;
+
+    fn build_test_engine(hooks: HookRunner) -> QueryEngine {
+        let api = ApiClient::new(
+            reqwest::Client::new(),
+            AuthCredential::ApiKey("sk-test".into()),
+        );
+        QueryEngine::new(QueryEngineConfig {
+            api,
+            tools: Arc::new(ToolRegistry::new()),
+            permissions: PermissionEngine::default(),
+            hooks: Arc::new(hooks),
+            session: Session::new().expect("session"),
+            system_blocks: Vec::new(),
+            options: QueryOptions {
+                bypass_permissions: true,
+                ..QueryOptions::default()
+            },
+            prompter: Arc::new(StdinPrompter::new(true)),
+        })
+    }
+
+    fn bash_tool_use() -> ToolUseBlock {
+        ToolUseBlock {
+            id: "tu_consumer".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "echo hi"}),
+            cache_control: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pretooluse_additional_contexts_buffered_for_next_turn() {
+        // PreToolUse hook returns a structured response with
+        // `additional_context`. Even though the hook does not block, the
+        // engine must capture the context into `pending_additional_contexts`
+        // so the next `run_turn` iteration injects it as a user message.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf '{\"hook_specific_output\":{\"additional_context\":\"context-from-pre-tool-use\"}}'", "unsafe_shell": true}]}]
+        }"#,
+        )
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let mut engine = build_test_engine(hooks);
+        let cancel = CancellationToken::new();
+        let tu = bash_tool_use();
+        // The non-blocking hook lets check_tool_permissions return Ok; we
+        // care about the side-effect on the buffer, not the tool that came
+        // back. Tool resolution may still fail (Bash tool isn't registered),
+        // so accept either branch and assert only on the buffer state.
+        let _ = engine.check_tool_permissions(&tu, &cancel).await;
+        assert_eq!(
+            engine.pending_additional_contexts(),
+            &["context-from-pre-tool-use".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn async_rewake_surfaces_as_distinct_tool_result_error() {
+        // exit 2 + async_rewake: true should produce a tool_result error
+        // whose content is prefixed with "Hook requested async rewake:" so
+        // it's distinguishable from a plain Block (which uses "Blocked by
+        // hook:"). The captured stdout becomes the rewake message.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'wake-up-marker' && exit 2", "unsafe_shell": true, "async_rewake": true}]}]
+        }"#,
+        )
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let mut engine = build_test_engine(hooks);
+        let cancel = CancellationToken::new();
+        let tu = bash_tool_use();
+        let err = match engine.check_tool_permissions(&tu, &cancel).await {
+            Ok(_) => panic!("async_rewake should short-circuit with an error block"),
+            Err(e) => e,
+        };
+        assert_eq!(err.tool_use_id, "tu_consumer");
+        assert_eq!(err.is_error, Some(true));
+        let body = err
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            body.starts_with("Hook requested async rewake:"),
+            "expected rewake prefix, got {body:?}"
+        );
+        assert!(
+            body.contains("wake-up-marker"),
+            "rewake message must include captured stdout, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_hook_uses_blocked_prefix_not_rewake_prefix() {
+        // Plain `exit 2` (without async_rewake) must keep the historical
+        // "Blocked by hook:" wording — the contrast against the rewake test
+        // is what locks the two paths in as distinguishable.
+        let settings: HooksSettings = serde_json::from_str(
+            r#"{
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "printf 'no go' && exit 2", "unsafe_shell": true}]}]
+        }"#,
+        )
+        .unwrap();
+        let hooks = HookRunner::new(&settings, reqwest::Client::new());
+        let mut engine = build_test_engine(hooks);
+        let cancel = CancellationToken::new();
+        let tu = bash_tool_use();
+        let err = match engine.check_tool_permissions(&tu, &cancel).await {
+            Ok(_) => panic!("block hook should short-circuit"),
+            Err(e) => e,
+        };
+        let body = err
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            body.starts_with("Blocked by hook:"),
+            "expected block prefix, got {body:?}"
+        );
+        assert!(
+            !body.contains("async rewake"),
+            "block path must not mention async rewake, got {body:?}"
+        );
     }
 }

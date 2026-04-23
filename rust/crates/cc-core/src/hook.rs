@@ -128,7 +128,7 @@ pub struct HookConfig {
     pub once: bool,
     #[serde(rename = "async", default)]
     pub is_async: bool,
-    #[serde(default)]
+    #[serde(default, alias = "asyncRewake")]
     pub async_rewake: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
@@ -370,5 +370,15 @@ mod tests {
         assert_eq!(config.kind, HookKind::Http);
         assert_eq!(config.timeout, 30);
         assert_eq!(config.url.as_deref(), Some("https://example.com/hook"));
+    }
+
+    #[test]
+    fn async_rewake_parses_both_snake_and_camel() {
+        let snake = r#"{"command": "echo", "async_rewake": true}"#;
+        let camel = r#"{"command": "echo", "asyncRewake": true}"#;
+        let from_snake: HookConfig = serde_json::from_str(snake).unwrap();
+        let from_camel: HookConfig = serde_json::from_str(camel).unwrap();
+        assert!(from_snake.async_rewake);
+        assert!(from_camel.async_rewake);
     }
 }
