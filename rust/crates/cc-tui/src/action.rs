@@ -248,11 +248,21 @@ fn restore_after_permission(app: &mut App) -> AppMode {
     }
 }
 
+/// Does the current mode allow editing the input buffer? True for
+/// Input / CommandPalette / Streaming (queued-reply composition);
+/// false for PermissionPrompt where keystrokes route to y/a/n.
+fn can_edit_input(mode: AppMode) -> bool {
+    matches!(
+        mode,
+        AppMode::Input | AppMode::CommandPalette | AppMode::Streaming
+    )
+}
+
 /// Apply an action to the app state.
 pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateResult {
     match action {
         AppAction::InsertChar(c) => {
-            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+            if can_edit_input(app.mode) {
                 app.input_insert_char(c);
                 if app.mode == AppMode::CommandPalette {
                     refresh_palette(app, ctx.commands);
@@ -260,7 +270,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             }
         }
         AppAction::Backspace => {
-            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+            if can_edit_input(app.mode) {
                 app.input_backspace();
                 if app.mode == AppMode::CommandPalette {
                     // Backspacing the leading `/` cancels the palette so the
@@ -274,7 +284,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             }
         }
         AppAction::DeleteChar => {
-            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+            if can_edit_input(app.mode) {
                 app.input_delete();
                 if app.mode == AppMode::CommandPalette {
                     refresh_palette(app, ctx.commands);
@@ -282,7 +292,7 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             }
         }
         AppAction::CursorMove(delta) => {
-            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+            if can_edit_input(app.mode) {
                 match delta {
                     d if d < 0 => app.input_cursor_left(),
                     d if d > 0 => app.input_cursor_right(),
@@ -291,22 +301,22 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             }
         }
         AppAction::CursorHome => {
-            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+            if can_edit_input(app.mode) {
                 app.input_cursor_home();
             }
         }
         AppAction::CursorEnd => {
-            if app.mode == AppMode::Input || app.mode == AppMode::CommandPalette {
+            if can_edit_input(app.mode) {
                 app.input_cursor_end();
             }
         }
         AppAction::HistoryPrev => {
-            if app.mode == AppMode::Input {
+            if app.mode == AppMode::Input || app.mode == AppMode::Streaming {
                 app.history_prev();
             }
         }
         AppAction::HistoryNext => {
-            if app.mode == AppMode::Input {
+            if app.mode == AppMode::Input || app.mode == AppMode::Streaming {
                 app.history_next();
             }
         }
@@ -787,6 +797,47 @@ mod tests {
         update(&mut app, AppAction::HistoryNext, &uctx);
         assert_eq!(app.input, "dr");
         assert!(app.history_cursor.is_none());
+    }
+
+    /// User reported "can't type while the AI is streaming" 2026-04-23.
+    /// Typing during Streaming mode must still mutate `input` so the
+    /// queue indicator can show the follow-up message building up, and
+    /// Submit while Streaming must queue that text into `app.queued`
+    /// rather than drop it.
+    #[test]
+    fn can_edit_and_queue_during_streaming() {
+        let mut app = App::new("s".into(), "m".into());
+        app.start_stream();
+        assert_eq!(app.mode, AppMode::Streaming);
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+
+        // Type mid-stream.
+        for c in "queued".chars() {
+            update(&mut app, AppAction::InsertChar(c), &uctx);
+        }
+        assert_eq!(app.input, "queued");
+
+        // Left-arrow must move the caret even while streaming.
+        update(&mut app, AppAction::CursorMove(-1), &uctx);
+        assert_eq!(app.input_cursor, "queue".len());
+
+        // Backspace at the caret position trims the `e` before `d`.
+        update(&mut app, AppAction::Backspace, &uctx);
+        assert_eq!(app.input, "queud");
+
+        // Submit while Streaming queues into app.queued instead of
+        // sending to the engine (that branch keeps the current turn
+        // running).
+        update(&mut app, AppAction::CursorEnd, &uctx);
+        let result = update(&mut app, AppAction::Submit, &uctx);
+        assert!(matches!(result, UpdateResult::Continue));
+        assert_eq!(app.queued.len(), 1, "submit during stream must enqueue");
+        assert!(app.queued[0].contains("queud"));
+        assert!(app.input.is_empty());
     }
 
     /// Adjacent duplicates must collapse so mashing Enter on the same

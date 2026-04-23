@@ -476,8 +476,35 @@ fn map_key_event(
             _ => None,
         },
         AppMode::Streaming => match key.code {
+            // Composing-during-stream is explicitly supported: users
+            // can type a follow-up message while the model is still
+            // replying and press Enter to queue it. The queue indicator
+            // `(+N queued)` in the spinner row already surfaces this.
+            // Dropping every char in Streaming mode made the input box
+            // feel frozen and locked the user out of the natural
+            // "read → think → reply" cadence.
+            KeyCode::Char(c) => Some(AppAction::InsertChar(c)),
+            KeyCode::Backspace => Some(AppAction::Backspace),
+            KeyCode::Delete => Some(AppAction::DeleteChar),
+            KeyCode::Left => Some(AppAction::CursorMove(-1)),
+            KeyCode::Right => Some(AppAction::CursorMove(1)),
+            KeyCode::Home => Some(AppAction::CursorHome),
+            KeyCode::End => Some(AppAction::CursorEnd),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(AppAction::NewLine)
+            }
             KeyCode::PageUp => Some(AppAction::ScrollUp(10)),
             KeyCode::PageDown => Some(AppAction::ScrollDown(10)),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(AppAction::ScrollUp(3))
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(AppAction::ScrollDown(3))
+            }
+            // History recall is useful mid-stream — queueing a
+            // rephrase of the previous message is a real workflow.
+            KeyCode::Up => Some(AppAction::HistoryPrev),
+            KeyCode::Down => Some(AppAction::HistoryNext),
             _ => None,
         },
         AppMode::PermissionPrompt => match key.code {
