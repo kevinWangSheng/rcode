@@ -9,7 +9,7 @@ use cc_core::{
 };
 use cc_hooks::{HookInput, HookRunner};
 use cc_permissions::PermissionEngine;
-use cc_session::Session;
+use cc_session::{Session, INTERRUPT_MESSAGE, INTERRUPT_MESSAGE_FOR_TOOL_USE};
 use cc_tools::ToolResult;
 use serde_json::Value;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::cache_breakpoint::tag_last_block_for_caching;
 use crate::tool_registry::ToolRegistry;
 
 /// Maximum turns in a single `run_conversation` call.
@@ -31,6 +32,10 @@ pub struct QueryOptions {
     pub non_interactive: bool,
     /// Bypass all permission checks.
     pub bypass_permissions: bool,
+    /// Extended-thinking setting forwarded to every `CreateMessageRequest`
+    /// as the `thinking` field. `None` means "omit the field entirely"
+    /// (server default; matches the pre-wiring behaviour byte-for-byte).
+    pub thinking: Option<cc_core::ThinkingConfig>,
 }
 
 impl Default for QueryOptions {
@@ -40,6 +45,7 @@ impl Default for QueryOptions {
             max_tokens: 8192,
             non_interactive: false,
             bypass_permissions: false,
+            thinking: None,
         }
     }
 }
@@ -58,6 +64,15 @@ impl Default for QueryOptions {
 /// The engine itself does not construct `SystemBlock`s; it forwards them as
 /// received. If the agent-runner memory path ever grows a block-emission
 /// site here, use `CacheControl::ephemeral_org()` for memory content.
+///
+/// ## Message-level cache-breakpoint contract
+///
+/// `run_turn` tags the **trailing block of the trailing message** of every
+/// outgoing `CreateMessageRequest` with `CacheControl::ephemeral_unscoped()`
+/// via [`crate::cache_breakpoint::tag_last_block_for_caching`]. Callers
+/// MUST NOT pre-tag message blocks themselves — double-tagging is benign
+/// but misleading, and the engine's tag is always the authoritative cut.
+/// TS parity: `services/api/claude.ts::addCacheBreakpoints`.
 pub struct QueryEngine {
     api: ApiClient,
     tools: Arc<ToolRegistry>,
@@ -211,6 +226,15 @@ impl QueryEngine {
                 messages.push(ctx_msg);
             }
 
+            // Turn-level prompt-cache breakpoint: tag the trailing block of
+            // the trailing message with `ephemeral` so everything up to
+            // (but not including) the cut participates in cache reads on
+            // the next turn. TS parity: `services/api/claude.ts::
+            // addCacheBreakpoints`. Idempotent across loop iterations
+            // (earlier tags live on those older messages; only the newest
+            // message picks up a fresh tag every turn).
+            tag_last_block_for_caching(messages);
+
             // 3. Build API request
             let mut req = CreateMessageRequest::new(&self.options.model, messages.clone())
                 .with_max_tokens(self.options.max_tokens);
@@ -220,6 +244,9 @@ impl QueryEngine {
             }
             if !tool_defs.is_empty() {
                 req = req.with_tools(tool_defs.clone());
+            }
+            if let Some(cfg) = &self.options.thinking {
+                req = req.with_thinking(cfg.clone());
             }
 
             // 4. Stream response.
@@ -245,9 +272,13 @@ impl QueryEngine {
 
             // §4 contract: if streaming was interrupted (cancel fired), save partial
             // text with interrupt marker before propagating cancellation.
+            //
+            // The marker wording comes from `cc_session::INTERRUPT_MESSAGE`, which
+            // mirrors TS `utils/messages.ts::INTERRUPT_MESSAGE` byte-for-byte so
+            // the resumed transcript parses identically under either runtime.
             if cancel.is_cancelled() && !text_buf.is_empty() {
                 let mut interrupted_content = message.content.clone();
-                interrupted_content.push(ContentBlock::text("\n[Interrupted by user]"));
+                interrupted_content.push(ContentBlock::text(format!("\n{INTERRUPT_MESSAGE}")));
 
                 // The Anthropic API requires every `tool_use` block to be
                 // followed in the next user message by a matching
@@ -269,7 +300,7 @@ impl QueryEngine {
                             Some(ContentBlock::ToolResult(ToolResultBlock {
                                 tool_use_id: tu.id.clone(),
                                 content: Some(serde_json::Value::String(
-                                    "[Interrupted by user]".to_string(),
+                                    INTERRUPT_MESSAGE_FOR_TOOL_USE.to_string(),
                                 )),
                                 is_error: Some(true),
                                 cache_control: None,
@@ -286,7 +317,8 @@ impl QueryEngine {
                 self.session.append(&partial_msg)?;
                 messages.push(partial_msg);
 
-                if !interrupted_tool_results.is_empty() {
+                let had_tool_use = !interrupted_tool_results.is_empty();
+                if had_tool_use {
                     let result_msg = MessageParam {
                         role: Role::User,
                         content: MessageContent::Blocks(interrupted_tool_results),
@@ -294,6 +326,14 @@ impl QueryEngine {
                     self.session.append(&result_msg)?;
                     messages.push(result_msg);
                 }
+
+                // Canonical resume-detection entry: a standalone user message
+                // carrying `INTERRUPT_MESSAGE` (or the tool-use variant). TS
+                // resume logic keys off this entry to decide whether to prompt
+                // for continuation. Write it AFTER the content blocks above so
+                // a concurrent reader can't see a marker without the content
+                // it refers to. Parity: TS `utils/messages.ts:` interrupt path.
+                self.session.append_interrupt_marker(had_tool_use)?;
 
                 self.pending_additional_contexts.clear();
                 return Err(CcError::Cancelled);
@@ -1753,6 +1793,117 @@ mod tests {
         assert!(
             body.contains("wake-up-marker"),
             "rewake message must include captured stdout, got {body:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_omitted_when_options_unset() {
+        // Default QueryOptions has `thinking = None`. The builder is only
+        // called when the option is `Some(..)`, so the wire body has no
+        // `thinking` key — matching today's behaviour byte-for-byte.
+        let options = QueryOptions::default();
+        let req = CreateMessageRequest::new(&options.model, Vec::<MessageParam>::new())
+            .with_max_tokens(options.max_tokens);
+        let req = if let Some(cfg) = &options.thinking {
+            req.with_thinking(cfg.clone())
+        } else {
+            req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("thinking").is_none());
+    }
+
+    #[test]
+    fn thinking_enabled_budget_flows_to_request() {
+        let options = QueryOptions {
+            thinking: Some(cc_core::ThinkingConfig::Enabled {
+                budget_tokens: 2048,
+            }),
+            ..QueryOptions::default()
+        };
+        let mut req = CreateMessageRequest::new(&options.model, Vec::<MessageParam>::new())
+            .with_max_tokens(options.max_tokens);
+        if let Some(cfg) = &options.thinking {
+            req = req.with_thinking(cfg.clone());
+        }
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048})
+        );
+    }
+
+    #[test]
+    fn thinking_adaptive_flows_to_request() {
+        let options = QueryOptions {
+            thinking: Some(cc_core::ThinkingConfig::Adaptive),
+            ..QueryOptions::default()
+        };
+        let mut req = CreateMessageRequest::new(&options.model, Vec::<MessageParam>::new())
+            .with_max_tokens(options.max_tokens);
+        if let Some(cfg) = &options.thinking {
+            req = req.with_thinking(cfg.clone());
+        }
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["thinking"], serde_json::json!({"type": "adaptive"}));
+    }
+
+    #[test]
+    fn request_body_carries_ephemeral_on_last_block() {
+        // Integration test for the cache-breakpoint wiring: drive the same
+        // `tag_last_block_for_caching(messages)` + `CreateMessageRequest::
+        // new(..., messages.clone())` pipeline that `run_turn` uses, then
+        // serialise and assert the wire shape. This sidesteps the missing
+        // mock-API harness while still exercising the serde boundary.
+        use crate::cache_breakpoint::tag_last_block_for_caching;
+        use cc_core::{ContentBlock, MessageContent, Role, ToolUseBlock};
+
+        let mut messages = vec![
+            MessageParam {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::text("earlier")]),
+            },
+            MessageParam {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::text("prose"),
+                    ContentBlock::ToolUse(ToolUseBlock {
+                        id: "tu_x".into(),
+                        name: "Bash".into(),
+                        input: serde_json::json!({"command":"echo ok"}),
+                        cache_control: None,
+                    }),
+                ]),
+            },
+        ];
+
+        tag_last_block_for_caching(&mut messages);
+        let req =
+            CreateMessageRequest::new("claude-opus-4-7", messages.clone()).with_max_tokens(1024);
+        let json = serde_json::to_value(&req).expect("serialize");
+
+        let msgs = json["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 2);
+
+        // Earlier message's block must not carry cache_control.
+        let earlier_content = msgs[0]["content"].as_array().expect("blocks");
+        assert!(
+            earlier_content[0].get("cache_control").is_none(),
+            "earlier block should not be tagged, got {earlier_content:?}"
+        );
+
+        // Last message's blocks: leading text untouched, trailing tool_use
+        // carries the breakpoint.
+        let last_content = msgs[1]["content"].as_array().expect("blocks");
+        assert_eq!(last_content.len(), 2);
+        assert!(
+            last_content[0].get("cache_control").is_none(),
+            "leading block of last message should not be tagged"
+        );
+        assert_eq!(
+            last_content[1]["cache_control"]["type"],
+            serde_json::json!("ephemeral"),
+            "trailing block must carry ephemeral breakpoint, got {last_content:?}"
         );
     }
 

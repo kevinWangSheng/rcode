@@ -112,6 +112,20 @@ mod tests {
     }
 
     #[test]
+    fn with_thinking_emits_adaptive_shape_on_wire() {
+        // TS adaptive mode: server picks the budget per turn. Wire shape is
+        // `{"type":"adaptive"}` with no budget_tokens key.
+        let req = CreateMessageRequest::new("claude-opus-4-7", vec![])
+            .with_thinking(ThinkingConfig::Adaptive);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert!(
+            json["thinking"].get("budget_tokens").is_none(),
+            "adaptive mode must not carry budget_tokens"
+        );
+    }
+
+    #[test]
     fn last_content_block_cache_control_reaches_wire() {
         // Ground-truth wire shape for P0 #1: when a caller tags the last
         // content block with `cache_control`, the serialized request body
@@ -121,8 +135,7 @@ mod tests {
             role: Role::User,
             content: cc_core::MessageContent::Blocks(vec![
                 ContentBlock::text("context"),
-                ContentBlock::text("latest")
-                    .with_cache_control(CacheControl::ephemeral_unscoped()),
+                ContentBlock::text("latest").with_cache_control(CacheControl::ephemeral_unscoped()),
             ]),
         };
         let req = CreateMessageRequest::new("claude-opus-4-7", vec![user_msg]);

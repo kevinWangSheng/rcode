@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use cc_api::{ApiClient, AuthCredential};
 use cc_auth::{ensure_fresh_credentials, Credentials};
 use cc_config::{load_settings, resolve_model};
-use cc_core::{MessageParam, SystemBlock};
+use cc_core::{MessageParam, SystemBlock, ThinkingConfig};
 use cc_hooks::{HookContext, HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
@@ -63,6 +63,14 @@ struct Cli {
     /// Maximum tokens in the response.
     #[arg(long, default_value_t = 8192)]
     max_tokens: u32,
+
+    /// Extended-thinking budget. Pass a positive integer (>= 1024 tokens,
+    /// Anthropic API minimum) to enable with that budget, `adaptive` to let
+    /// the server pick a budget per turn, or `off` / `disabled` / `0` to
+    /// explicitly disable. Omit to leave the field off the wire (server
+    /// default).
+    #[arg(long, value_name = "BUDGET|adaptive|off")]
+    thinking: Option<String>,
 
     /// Bypass all permission checks (accept everything).
     #[arg(long)]
@@ -189,7 +197,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         project_dir: std::env::current_dir().ok(),
         ..Default::default()
     };
-    let hook_runner = Arc::new(HookRunner::new(&hooks_config, http.clone()).with_context(hook_context));
+    let hook_runner =
+        Arc::new(HookRunner::new(&hooks_config, http.clone()).with_context(hook_context));
 
     // Fire SessionStart hook (§4 contract: trigger='resume' when resuming)
     {
@@ -270,11 +279,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Build query options
     let non_interactive = cli.non_interactive || !atty_is_stdin();
+    let thinking = match &cli.thinking {
+        Some(raw) => Some(parse_thinking(raw, cli.max_tokens)?),
+        None => None,
+    };
     let options = QueryOptions {
         model: model.clone(),
         max_tokens: cli.max_tokens,
         non_interactive,
         bypass_permissions: cli.bypass_permissions,
+        thinking: thinking.clone(),
     };
 
     // Build API client
@@ -364,6 +378,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_tokens: cli.max_tokens,
             non_interactive: true,
             bypass_permissions: cli.bypass_permissions,
+            thinking: thinking.clone(),
         };
 
         let stdout = io::stdout();
@@ -627,6 +642,46 @@ fn libc_isatty(fd: i32) -> bool {
     unsafe { isatty(fd) != 0 }
 }
 
+/// Parse the `--thinking` CLI argument into a `ThinkingConfig`.
+///
+/// Accepted forms:
+///   - `adaptive` → `ThinkingConfig::Adaptive` (server picks budget per turn)
+///   - `off` | `disabled` | `0` → `ThinkingConfig::Disabled`
+///   - positive integer >= 1024 → `Enabled { budget_tokens }`,
+///     clamped to `max_tokens - 1` when the budget would meet or exceed
+///     `max_tokens` (matches TS `sideQuery.ts:172-177`). Emits a
+///     `tracing::warn!` when clamping fires.
+///   - anything else → `Err(message)` with a readable hint.
+fn parse_thinking(raw: &str, max_tokens: u32) -> Result<ThinkingConfig, String> {
+    let trimmed = raw.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "adaptive" => return Ok(ThinkingConfig::Adaptive),
+        "off" | "disabled" => return Ok(ThinkingConfig::Disabled),
+        _ => {}
+    }
+    let budget: u32 = trimmed.parse().map_err(|_| {
+        format!("--thinking: expected integer, 'adaptive', or 'off', got {trimmed:?}")
+    })?;
+    if budget == 0 {
+        return Ok(ThinkingConfig::Disabled);
+    }
+    if budget < 1024 {
+        return Err(format!(
+            "--thinking: budget_tokens must be >= 1024 (Anthropic API minimum), got {budget}"
+        ));
+    }
+    let clamped = if budget >= max_tokens {
+        let c = max_tokens.saturating_sub(1).max(1024);
+        tracing::warn!("--thinking={budget} >= --max-tokens={max_tokens}; clamping budget to {c}");
+        c
+    } else {
+        budget
+    };
+    Ok(ThinkingConfig::Enabled {
+        budget_tokens: clamped,
+    })
+}
+
 /// Headless mode: decide what the next user-turn text should be.
 ///
 /// Four cases, each exercised by a unit test:
@@ -785,10 +840,8 @@ mod tests {
     /// It must now read stdin, same as a fresh session.
     #[test]
     fn resume_without_message_reads_stdin_when_piped() {
-        let got = resolve_headless_user_text(Some("sess"), None, false, || {
-            Ok("next turn".into())
-        })
-        .expect("piped stdin should supply the turn text");
+        let got = resolve_headless_user_text(Some("sess"), None, false, || Ok("next turn".into()))
+            .expect("piped stdin should supply the turn text");
         assert_eq!(got, "next turn");
     }
 
@@ -823,5 +876,54 @@ mod tests {
             msg.contains("--resume") || msg.contains("--continue"),
             "error should mention resume-specific context, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_thinking_flag_variants() {
+        assert!(matches!(
+            parse_thinking("adaptive", 8192).unwrap(),
+            ThinkingConfig::Adaptive
+        ));
+        assert!(matches!(
+            parse_thinking("ADAPTIVE", 8192).unwrap(),
+            ThinkingConfig::Adaptive
+        ));
+        assert!(matches!(
+            parse_thinking("off", 8192).unwrap(),
+            ThinkingConfig::Disabled
+        ));
+        assert!(matches!(
+            parse_thinking("disabled", 8192).unwrap(),
+            ThinkingConfig::Disabled
+        ));
+        assert!(matches!(
+            parse_thinking("0", 8192).unwrap(),
+            ThinkingConfig::Disabled
+        ));
+        assert!(matches!(
+            parse_thinking("2048", 8192).unwrap(),
+            ThinkingConfig::Enabled {
+                budget_tokens: 2048
+            }
+        ));
+        // Sub-minimum: explicit error with hint.
+        let err = parse_thinking("512", 8192).unwrap_err();
+        assert!(err.contains("1024"), "error should mention minimum: {err}");
+        // Unparseable: readable error.
+        let err = parse_thinking("abc", 8192).unwrap_err();
+        assert!(
+            err.contains("integer"),
+            "error should mention expected forms: {err}"
+        );
+        // Clamp when budget >= max_tokens.
+        let got = parse_thinking("10000", 8192).unwrap();
+        if let ThinkingConfig::Enabled { budget_tokens } = got {
+            assert!(
+                (1024..8192).contains(&budget_tokens),
+                "clamp must stay within [1024, max_tokens), got {budget_tokens}"
+            );
+        } else {
+            panic!("expected Enabled after clamp");
+        }
     }
 }

@@ -110,6 +110,7 @@ async fn print_mode_streams_text_through_bridge() {
         max_tokens: 64,
         non_interactive: true,
         bypass_permissions: true,
+        thinking: None,
     };
 
     let mut streamed = String::new();

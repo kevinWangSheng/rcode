@@ -1,4 +1,5 @@
 pub mod agent_runner;
+pub mod cache_breakpoint;
 pub mod engine;
 pub mod permission_prompt;
 pub mod prompter;

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use cc_api::ApiClient;
-use cc_core::{MessageParam, PermissionPrompter, SystemBlock};
+use cc_core::{MessageParam, PermissionPrompter, SystemBlock, ThinkingConfig};
 use cc_hooks::HookRunner;
 use cc_permissions::PermissionEngine;
 use cc_query::{QueryEngine, QueryEngineConfig, QueryOptions, StdinPrompter, ToolRegistry};
@@ -35,6 +35,9 @@ pub struct BridgeRequest {
     pub non_interactive: bool,
     /// When true, all permission checks are skipped.
     pub bypass_permissions: bool,
+    /// Extended-thinking setting forwarded to every API request. `None`
+    /// omits the field (server default).
+    pub thinking: Option<ThinkingConfig>,
 }
 
 /// Response from a single bridge run.
@@ -74,6 +77,7 @@ where
         max_tokens,
         non_interactive,
         bypass_permissions,
+        thinking,
     } = req;
 
     let options = QueryOptions {
@@ -81,6 +85,7 @@ where
         max_tokens,
         non_interactive,
         bypass_permissions,
+        thinking,
     };
 
     let registry: ToolRegistry = tools.into();
