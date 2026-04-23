@@ -92,6 +92,16 @@ pub struct QueryEngine {
     /// `messages.clone()` snapshot the API request is built from.
     /// Mirrors TS `hooks.ts:2783-2788`.
     pending_additional_contexts: Vec<String>,
+
+    /// Test-only scripted stream producer. When `Some(_)`, `run_turn` uses
+    /// the closure to obtain the per-iteration `StreamEvent` receiver
+    /// instead of calling `self.api.stream_message(..)`. Gated under
+    /// `#[cfg(test)]` so release builds are byte-identical to pre-change.
+    ///
+    /// See `test_support::scripted_stream` for the common helper and
+    /// `test_support::QueryEngine::with_stream_override` for the setter.
+    #[cfg(test)]
+    stream_override: Option<test_support::StreamOverrideFn>,
 }
 
 /// Construction bundle for `QueryEngine::new`.
@@ -135,6 +145,8 @@ impl QueryEngine {
             events_tx: None,
             compacted_last_turn: false,
             pending_additional_contexts: Vec::new(),
+            #[cfg(test)]
+            stream_override: None,
         }
     }
 
@@ -260,6 +272,22 @@ impl QueryEngine {
             let mut text_buf = String::new();
             let mut tool_use_blocks: Vec<ToolUseBlock> = Vec::new();
 
+            // Acquire the per-turn `StreamEvent` receiver.
+            //
+            // In test builds, if a scripted stream override is installed,
+            // use it instead of the live API so run_turn-level regressions
+            // can drive the full turn loop without a network call. The
+            // `#[cfg]` gates ensure release builds compile to the same code
+            // as before this change — no field, no branch, no cost.
+            // See `test_support::scripted_stream` and
+            // `test_support::QueryEngine::with_stream_override`.
+            #[cfg(test)]
+            let rx = if let Some(f) = &self.stream_override {
+                f(&req, cancel)
+            } else {
+                self.api.stream_message(req, cancel).await?
+            };
+            #[cfg(not(test))]
             let rx = self.api.stream_message(req, cancel).await?;
             let (message, usage, bad_tool_inputs) = drain_stream(
                 rx,
@@ -1011,6 +1039,106 @@ fn strip_images_from_value(v: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(filtered)
         }
         other => other.clone(),
+    }
+}
+
+/// Test-only scaffolding for driving `QueryEngine::run_turn` end-to-end
+/// without a live API. See `openspec/changes/fix-engine-stream-mock-harness`
+/// for the capability contract.
+///
+/// The module is `#[cfg(test)]`-gated so release builds contain neither
+/// the `stream_override` field nor the branch that reads it. Tests inside
+/// `cc-query` import `super::test_support::*` to get `scripted_stream`
+/// plus the `with_stream_override` builder. Nothing here is meant to be
+/// reachable from other crates — if cross-crate test reuse becomes a
+/// need, promote to a `test-support` cargo feature.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Closure type stored on `QueryEngine::stream_override`. Produces a
+    /// fresh `mpsc::Receiver<CcResult<StreamEvent>>` on every invocation;
+    /// each receiver stands in for what `ApiClient::stream_message` would
+    /// have returned for that turn.
+    pub(crate) type StreamOverrideFn = std::sync::Arc<
+        dyn Fn(&CreateMessageRequest, &CancellationToken) -> mpsc::Receiver<CcResult<StreamEvent>>
+            + Send
+            + Sync,
+    >;
+
+    impl QueryEngine {
+        /// Install a scripted stream producer. The closure is invoked
+        /// once per `run_turn` iteration in place of
+        /// `ApiClient::stream_message(..)`. Only available in test builds.
+        pub(crate) fn with_stream_override<F>(mut self, f: F) -> Self
+        where
+            F: Fn(
+                    &CreateMessageRequest,
+                    &CancellationToken,
+                ) -> mpsc::Receiver<CcResult<StreamEvent>>
+                + Send
+                + Sync
+                + 'static,
+        {
+            self.stream_override = Some(std::sync::Arc::new(f));
+            self
+        }
+    }
+
+    /// Ship a canned `Vec` of events as a closure compatible with
+    /// `with_stream_override`. Each invocation produces a fresh
+    /// pre-loaded receiver — safe to call multiple times across turns.
+    ///
+    /// Error fidelity: `CcError` is not `Clone` (it wraps non-Clone
+    /// `std::io::Error` and `serde_json::Error`), so scripted
+    /// `Err(..)` entries are degraded to
+    /// `Err(CcError::Other("scripted-stream error"))`. Tests that need
+    /// a specific error variant SHOULD use `with_stream_override`
+    /// directly with a stateful closure that constructs the error
+    /// per-call.
+    ///
+    /// Events are pre-pushed into the channel synchronously before the
+    /// receiver is returned (the channel capacity matches `events.len()`
+    /// so the sends never block), which sidesteps the scheduler race
+    /// that a spawn-and-send variant would have on a pre-cancelled
+    /// token.
+    pub(crate) fn scripted_stream(
+        events: Vec<CcResult<StreamEvent>>,
+    ) -> impl Fn(&CreateMessageRequest, &CancellationToken) -> mpsc::Receiver<CcResult<StreamEvent>>
+           + Send
+           + Sync
+           + 'static {
+        // Rebuild the script once into a form that can be cloned into
+        // each receiver without losing ordering.
+        let script: std::sync::Arc<Vec<CcResult<StreamEvent>>> = std::sync::Arc::new(
+            events
+                .into_iter()
+                .map(|ev| match ev {
+                    Ok(e) => Ok(e),
+                    Err(_) => Err(CcError::Other("scripted-stream error".into())),
+                })
+                .collect(),
+        );
+        move |_req, _cancel| {
+            let capacity = script.len().max(1);
+            let (tx, rx) = mpsc::channel(capacity);
+            for ev in script.iter() {
+                // Re-wrap each event so every receiver gets its own
+                // `CcResult<StreamEvent>` (StreamEvent is Clone; errors
+                // were already degraded above).
+                let cloned: CcResult<StreamEvent> = match ev {
+                    Ok(e) => Ok(e.clone()),
+                    Err(_) => Err(CcError::Other("scripted-stream error".into())),
+                };
+                // Channel is sized to fit the whole script, so
+                // `try_send` cannot hit a Full error. A Closed error
+                // is impossible too since we just created the rx.
+                let _ = tx.try_send(cloned);
+            }
+            // Dropping `tx` at end of scope closes the channel so the
+            // consumer sees `None` after the script is drained.
+            rx
+        }
     }
 }
 
@@ -1939,5 +2067,164 @@ mod tests {
             !body.contains("async rewake"),
             "block path must not mention async rewake, got {body:?}"
         );
+    }
+
+    // ---- Engine stream-mock harness (fix-engine-stream-mock-harness) ----
+    //
+    // These tests exercise the test-only `with_stream_override` +
+    // `scripted_stream` plumbing that lets run_turn-level regressions
+    // drive the full turn loop without a live API. The `#[cfg(test)]`
+    // gates ensure release builds are unaffected.
+
+    fn content_block_stop(index: u32) -> StreamEvent {
+        StreamEvent::ContentBlockStop { index }
+    }
+
+    fn message_stop_event() -> StreamEvent {
+        StreamEvent::MessageStop
+    }
+
+    fn message_delta_end_turn() -> StreamEvent {
+        StreamEvent::MessageDelta {
+            delta: cc_api::MessageDeltaData {
+                stop_reason: Some(cc_core::StopReason::EndTurn),
+                stop_sequence: None,
+            },
+            usage: cc_api::MessageDeltaUsage { output_tokens: 1 },
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_override_drives_full_turn() {
+        // §4.1 smoke test: build an engine with a scripted stream that
+        // walks the full well-formed sequence (MessageStart +
+        // ContentBlockStart/Delta/Stop + MessageDelta(end_turn) +
+        // MessageStop) and confirm `run_turn` returns the delta text.
+        //
+        // This is the "does the override plumbing actually reach
+        // drain_stream" proof — nothing more.
+        use super::test_support::scripted_stream;
+        let hooks = HookRunner::new(&HooksSettings::default(), reqwest::Client::new());
+        let engine = build_test_engine(hooks).with_stream_override(scripted_stream(vec![
+            Ok(message_start_event("msg_ok")),
+            Ok(content_block_start_text(0)),
+            Ok(text_delta_event("hi")),
+            Ok(content_block_stop(0)),
+            Ok(message_delta_end_turn()),
+            Ok(message_stop_event()),
+        ]));
+        let mut engine = engine;
+        let cancel = CancellationToken::new();
+        let mut messages = Vec::new();
+        let final_text = engine
+            .run_turn("hello", |_| {}, &mut messages, &cancel)
+            .await
+            .expect("run_turn should succeed");
+        assert_eq!(final_text, "hi");
+        // No pending contexts should linger after a clean turn.
+        assert!(engine.pending_additional_contexts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_override_respects_cancel() {
+        // §4.2 smoke test: cancel the token before `run_turn`, script a
+        // MessageStart + one text delta. `drain_stream` itself doesn't
+        // poll the cancel token inside its recv loop, so the cancel
+        // branch in `run_turn` only trips when `text_buf` is non-empty.
+        // We therefore script at least one delta so the partial-save
+        // path fires and we get the expected `CcError::Cancelled`.
+        //
+        // (The stronger "cancel during drain_stream recv" contract is
+        // already covered by drain_stream's own tests — this one is
+        // about the harness not hanging.)
+        use super::test_support::scripted_stream;
+        let hooks = HookRunner::new(&HooksSettings::default(), reqwest::Client::new());
+        let mut engine = build_test_engine(hooks).with_stream_override(scripted_stream(vec![
+            Ok(message_start_event("msg_cancel")),
+            Ok(content_block_start_text(0)),
+            Ok(text_delta_event("partial")),
+            Ok(content_block_stop(0)),
+            Ok(message_stop_event()),
+        ]));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut messages = Vec::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            engine.run_turn("hello", |_| {}, &mut messages, &cancel),
+        )
+        .await
+        .expect("run_turn must not hang under the harness");
+        assert!(
+            matches!(result, Err(CcError::Cancelled)),
+            "expected Err(Cancelled), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn additional_contexts_are_cleared_on_cancel() {
+        // §5.1 smoke / unblock of fix-hook-correctness-wiring §5.3.
+        //
+        // Prior to this harness the cancel branch in `run_turn` was
+        // unreachable from tests (only the drain_stream path was
+        // directly exercisable). Now we can populate
+        // `pending_additional_contexts` manually, drive one cancelled
+        // turn, and assert the buffer is drained by the cancel branch
+        // at engine.rs:~338.
+        use super::test_support::scripted_stream;
+        let hooks = HookRunner::new(&HooksSettings::default(), reqwest::Client::new());
+        let mut engine = build_test_engine(hooks).with_stream_override(scripted_stream(vec![
+            Ok(message_start_event("msg_clear")),
+            Ok(content_block_start_text(0)),
+            Ok(text_delta_event("partial")),
+            Ok(content_block_stop(0)),
+            Ok(message_stop_event()),
+        ]));
+        // Seed the buffer with a context as if a PreToolUse hook had
+        // produced one on a previous iteration.
+        engine
+            .pending_additional_contexts
+            .push("stale-context".into());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut messages = Vec::new();
+        let result = engine
+            .run_turn("hello", |_| {}, &mut messages, &cancel)
+            .await;
+        assert!(matches!(result, Err(CcError::Cancelled)));
+        assert!(
+            engine.pending_additional_contexts().is_empty(),
+            "cancel branch must clear pending contexts, found {:?}",
+            engine.pending_additional_contexts()
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_stream_produces_independent_receivers() {
+        // Spec scenario: a `scripted_stream(vec![Ok(MessageStart)])`
+        // closure SHALL yield a fresh, independent receiver on each
+        // invocation. Guard against accidental shared-state
+        // regressions (e.g. a single channel reused across calls).
+        use super::test_support::scripted_stream;
+        let producer = scripted_stream(vec![Ok(message_start_event("msg_multi"))]);
+        let req = CreateMessageRequest::new("claude-test", Vec::<MessageParam>::new());
+        let cancel = CancellationToken::new();
+        let mut rx1 = producer(&req, &cancel);
+        let mut rx2 = producer(&req, &cancel);
+        let e1 = rx1
+            .recv()
+            .await
+            .expect("rx1 yields its MessageStart")
+            .expect("Ok event");
+        let e2 = rx2
+            .recv()
+            .await
+            .expect("rx2 yields its MessageStart")
+            .expect("Ok event");
+        assert!(matches!(e1, StreamEvent::MessageStart { .. }));
+        assert!(matches!(e2, StreamEvent::MessageStart { .. }));
+        // Both receivers should be drained after their single event.
+        assert!(rx1.recv().await.is_none());
+        assert!(rx2.recv().await.is_none());
     }
 }
