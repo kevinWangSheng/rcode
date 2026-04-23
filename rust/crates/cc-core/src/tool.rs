@@ -76,6 +76,31 @@ pub trait SessionSink: Send + Sync {
         snapshot: &FileHistorySnapshot,
         is_update: bool,
     ) -> CcResult<()>;
+
+    /// High-level helper used by `Edit` / `Write` to persist the pre-
+    /// mutation bytes of a file they're about to rewrite. Writes the bytes
+    /// into a per-session sidecar (matches TS
+    /// `{configDir}/file-history/{sessionId}/{hash}@v{n}`) and appends a
+    /// `FileHistorySnapshot` JSONL entry that references it by
+    /// `backup_file_name`.
+    ///
+    /// `relpath` SHOULD be project-relative when possible; the TS path-
+    /// shortening helper already lives in `cc_session` and is reused here.
+    /// `message_id` MUST be the assistant-turn id that produced this
+    /// tool_use; an empty string is permitted only for isolated tool
+    /// tests where no message is in flight.
+    ///
+    /// Default impl returns `Ok(())` so implementers that don't manage an
+    /// on-disk session (e.g. `NoopSessionSink`) silently succeed.
+    fn append_file_history_snapshot_for_path(
+        &self,
+        _relpath: &str,
+        _message_id: &str,
+        _prior_bytes: &[u8],
+        _is_update: bool,
+    ) -> CcResult<()> {
+        Ok(())
+    }
 }
 
 /// Runtime dependencies a tool needs beyond its `input` JSON.

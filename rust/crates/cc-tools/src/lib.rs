@@ -6,6 +6,7 @@ pub mod enter_plan_mode;
 pub mod enter_worktree;
 pub mod exit_plan_mode;
 pub mod exit_worktree;
+pub mod file_history;
 pub mod glob_tool;
 pub mod grep;
 pub mod read;

@@ -26,3 +26,4 @@ libc = "0.2"
 
 [dev-dependencies]
 tracing-test = "0.2"
+cc-session.workspace = true

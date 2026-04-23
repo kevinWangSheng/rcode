@@ -1857,6 +1857,14 @@ mod tests {
     use cc_core::hook::HooksSettings;
 
     fn build_test_engine(hooks: HookRunner) -> QueryEngine {
+        build_test_engine_with_session(hooks, Arc::new(Session::new().expect("session")))
+    }
+
+    /// Same as `build_test_engine` but lets the caller supply the
+    /// session. Cancel-path tests use this to root the session in a
+    /// tempdir and inspect the resulting JSONL afterwards, without
+    /// polluting the developer's real `~/.claude/sessions`.
+    fn build_test_engine_with_session(hooks: HookRunner, session: Arc<Session>) -> QueryEngine {
         let api = ApiClient::new(
             reqwest::Client::new(),
             AuthCredential::ApiKey("sk-test".into()),
@@ -1866,7 +1874,7 @@ mod tests {
             tools: Arc::new(ToolRegistry::new()),
             permissions: PermissionEngine::default(),
             hooks: Arc::new(hooks),
-            session: Arc::new(Session::new().expect("session")),
+            session,
             system_blocks: Vec::new(),
             options: QueryOptions {
                 bypass_permissions: true,
@@ -2251,5 +2259,208 @@ mod tests {
         // Both receivers should be drained after their single event.
         assert!(rx1.recv().await.is_none());
         assert!(rx2.recv().await.is_none());
+    }
+
+    // ── Cancel-path regression tests (openspec
+    // `fix-file-history-snapshot-producers` §5). These lock in the
+    // interrupt-marker wiring that `fix-session-resume-wiring` §1
+    // landed without regression coverage. Driven by the stream-mock
+    // harness from `fix-engine-stream-mock-harness` (commit 7552b28).
+
+    /// Build a `Session` rooted under a tempdir so the cancel-path
+    /// tests can read the JSONL transcript afterwards without
+    /// touching `~/.claude/sessions`.
+    fn session_in_tempdir(dir: &std::path::Path) -> Arc<Session> {
+        let id = "cancel-test";
+        let sdir = dir.join(id);
+        std::fs::create_dir_all(&sdir).unwrap();
+        let transcript = sdir.join("transcript.jsonl");
+        Arc::new(Session::from_parts(id.into(), transcript))
+    }
+
+    /// Read every JSONL line from `path` as raw strings. The engine
+    /// writes a mix of `MessageParam` turns and `MetaEntry` records,
+    /// so the cancel-path assertions match on substring rather than
+    /// full structural parsing — substring matches are robust against
+    /// additive schema changes (new optional fields) while still
+    /// pinning the exact marker text.
+    fn read_jsonl_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn content_block_start_tool_use_cancel(index: u32, id: &str, name: &str) -> StreamEvent {
+        StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockStartData::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_during_tool_use_appends_canonical_markers() {
+        // Scenario (from spec file-history-snapshot-producers §cc-query
+        // cancel path): a scripted stream yields MessageStart + a text
+        // delta + a tool_use block; the cancel token is set before
+        // `run_turn` enters its streaming loop. The cancel branch MUST
+        // emit all three canonical marker records into the session JSONL:
+        //   (1) assistant message whose last text block ends in
+        //       `INTERRUPT_MESSAGE`,
+        //   (2) synthetic tool_result stub with
+        //       `INTERRUPT_MESSAGE_FOR_TOOL_USE`,
+        //   (3) standalone canonical interrupt-marker entry.
+        use super::test_support::scripted_stream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in_tempdir(dir.path());
+        let transcript = session.transcript_path().to_path_buf();
+
+        let hooks = HookRunner::new(&HooksSettings::default(), reqwest::Client::new());
+        let mut engine = build_test_engine_with_session(hooks, session).with_stream_override(
+            scripted_stream(vec![
+                Ok(message_start_event("msg_cancel_tu")),
+                // A text block so `text_buf` ends up non-empty —
+                // without it the cancel branch at engine.rs:310 is a
+                // no-op. Matches the real cancel shape: model is
+                // speaking + a tool_use is mid-emission.
+                Ok(content_block_start_text(0)),
+                Ok(text_delta_event("thinking...")),
+                Ok(content_block_stop(0)),
+                Ok(content_block_start_tool_use_cancel(1, "tu_cancel", "Bash")),
+                Ok(content_block_stop(1)),
+                Ok(message_stop_event()),
+            ]),
+        );
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut messages = Vec::new();
+        let result = engine
+            .run_turn("hello", |_| {}, &mut messages, &cancel)
+            .await;
+        assert!(
+            matches!(result, Err(CcError::Cancelled)),
+            "expected Err(Cancelled), got {result:?}"
+        );
+
+        let lines = read_jsonl_lines(&transcript);
+        assert!(
+            !lines.is_empty(),
+            "cancel path must append at least the three marker records"
+        );
+
+        // (1) Partial assistant message carrying INTERRUPT_MESSAGE as
+        //     the trailing text block content.
+        let has_partial_assistant = lines.iter().any(|l| {
+            l.contains("\\\"role\\\":\\\"assistant\\\"") // nested-escaped fallback
+                || (l.contains("\"role\":\"assistant\"") && l.contains(INTERRUPT_MESSAGE))
+        });
+        assert!(
+            has_partial_assistant,
+            "no assistant message with INTERRUPT_MESSAGE found; lines = {lines:#?}"
+        );
+
+        // (2) Synthetic tool_result with INTERRUPT_MESSAGE_FOR_TOOL_USE.
+        let has_tool_result_stub = lines
+            .iter()
+            .any(|l| l.contains(INTERRUPT_MESSAGE_FOR_TOOL_USE));
+        assert!(
+            has_tool_result_stub,
+            "no synthetic tool_result containing INTERRUPT_MESSAGE_FOR_TOOL_USE found; lines = {lines:#?}"
+        );
+
+        // (3) Standalone canonical marker. `append_interrupt_marker(true)`
+        //     writes a MessageParam user message whose text is exactly
+        //     `INTERRUPT_MESSAGE_FOR_TOOL_USE`. There must be at least
+        //     one user-role line carrying that literal.
+        let user_marker_count = lines
+            .iter()
+            .filter(|l| {
+                l.contains("\"role\":\"user\"") && l.contains(INTERRUPT_MESSAGE_FOR_TOOL_USE)
+            })
+            .count();
+        assert!(
+            user_marker_count >= 1,
+            "expected at least one user-role line carrying INTERRUPT_MESSAGE_FOR_TOOL_USE; \
+             lines = {lines:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_without_tool_use_appends_plain_marker() {
+        // Scenario: script yields MessageStart + text delta only;
+        // cancel is set before run_turn. The cancel branch must emit:
+        //   (1) assistant message whose trailing text block contains
+        //       `INTERRUPT_MESSAGE` (plain variant — no tool_use seen),
+        //   (2) standalone canonical marker (plain variant),
+        //   (3) NO synthetic tool_result stub.
+        use super::test_support::scripted_stream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in_tempdir(dir.path());
+        let transcript = session.transcript_path().to_path_buf();
+
+        let hooks = HookRunner::new(&HooksSettings::default(), reqwest::Client::new());
+        let mut engine = build_test_engine_with_session(hooks, session).with_stream_override(
+            scripted_stream(vec![
+                Ok(message_start_event("msg_cancel_plain")),
+                Ok(content_block_start_text(0)),
+                Ok(text_delta_event("partial")),
+                Ok(content_block_stop(0)),
+                Ok(message_stop_event()),
+            ]),
+        );
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut messages = Vec::new();
+        let result = engine
+            .run_turn("hello", |_| {}, &mut messages, &cancel)
+            .await;
+        assert!(
+            matches!(result, Err(CcError::Cancelled)),
+            "expected Err(Cancelled), got {result:?}"
+        );
+
+        let lines = read_jsonl_lines(&transcript);
+        assert!(
+            !lines.is_empty(),
+            "cancel path must append assistant + standalone marker"
+        );
+
+        // (1) Assistant partial with INTERRUPT_MESSAGE.
+        let has_partial_assistant = lines
+            .iter()
+            .any(|l| l.contains("\"role\":\"assistant\"") && l.contains(INTERRUPT_MESSAGE));
+        assert!(
+            has_partial_assistant,
+            "no assistant message with INTERRUPT_MESSAGE found; lines = {lines:#?}"
+        );
+
+        // (2) No synthetic tool_result stub.
+        let has_tool_result_stub = lines
+            .iter()
+            .any(|l| l.contains(INTERRUPT_MESSAGE_FOR_TOOL_USE));
+        assert!(
+            !has_tool_result_stub,
+            "plain cancel path must NOT emit a tool-use variant marker; lines = {lines:#?}"
+        );
+
+        // (3) Standalone plain marker: a user-role line whose content
+        // is INTERRUPT_MESSAGE (NOT the tool-use variant).
+        let user_marker_count = lines
+            .iter()
+            .filter(|l| l.contains("\"role\":\"user\"") && l.contains(INTERRUPT_MESSAGE))
+            .count();
+        assert!(
+            user_marker_count >= 1,
+            "expected at least one user-role line carrying INTERRUPT_MESSAGE; lines = {lines:#?}"
+        );
     }
 }

@@ -307,6 +307,22 @@ impl Session {
         })
     }
 
+    /// Build a `Session` from explicit parts. Intended for tests that
+    /// want a fully-isolated transcript under a tempdir — the
+    /// production path uses `Session::new` / `Session::resume` which
+    /// also creates the parent dir under `~/.claude/sessions/<id>/`.
+    ///
+    /// The caller is responsible for ensuring `transcript_path.parent()`
+    /// exists before appending messages. `cc-session`'s own fixtures
+    /// construct `Session { id, transcript_path }` directly; this
+    /// constructor exposes the same affordance to downstream crates.
+    pub fn from_parts(id: String, transcript_path: PathBuf) -> Self {
+        Session {
+            id,
+            transcript_path,
+        }
+    }
+
     /// Resume an existing session by ID. Looks first in the Rust layout
     /// (`~/.claude/sessions/<id>/transcript.jsonl`); if missing, falls back to
     /// the TypeScript-version layout under `~/.claude/projects/<slug>/<id>.jsonl`
@@ -504,6 +520,114 @@ impl Session {
         self.transcript_path.parent()
     }
 
+    /// Directory holding file-history backup sidecars for this session.
+    /// Matches TS `{configDir}/file-history/{sessionId}/`; the Rust
+    /// layout nests it inside the per-session directory so a session dir
+    /// is self-contained and survives a prune of the root without
+    /// losing its backups.
+    pub fn backup_dir(&self) -> CcResult<PathBuf> {
+        let dir = self
+            .session_dir()
+            .ok_or_else(|| CcError::io("no session directory for backups"))?;
+        Ok(dir.join("file-history"))
+    }
+
+    /// Append a file-history snapshot entry that records the pre-
+    /// mutation bytes of `relpath`. The bytes are persisted to a
+    /// content-addressable sidecar (`{backup_dir}/{sha256(relpath)[0..16]}@v1`)
+    /// so the JSONL stays small — this matches TS's out-of-band backup
+    /// layout where the JSONL only carries a pointer (`backupFileName`).
+    ///
+    /// `message_id` is stamped onto the emitted `FileHistorySnapshot`;
+    /// pass the assistant-turn id that produced the tool_use (or an
+    /// empty string in isolated tool tests with no active turn).
+    /// `is_update` selects the `isSnapshotUpdate` flag on the JSONL
+    /// wrapper. Producers that don't track per-turn refinement pass
+    /// `false`.
+    pub fn append_file_history_snapshot_for_path(
+        &self,
+        relpath: &str,
+        message_id: &str,
+        prior_bytes: &[u8],
+        is_update: bool,
+    ) -> CcResult<()> {
+        use sha2::{Digest, Sha256};
+
+        let backup_dir = self.backup_dir()?;
+        fs::create_dir_all(&backup_dir).map_err(|e| {
+            CcError::io(format!(
+                "failed to create backup dir {}: {e}",
+                backup_dir.display()
+            ))
+        })?;
+
+        // Content-addressable name so two successful edits of the same
+        // relpath share a backup slot. `@v1` keeps the naming compatible
+        // with TS `{hash}@v{n}` even though the Rust producer currently
+        // emits v1 only (per-turn version bookkeeping is deferred — see
+        // openspec `fix-file-history-snapshot-producers` §5).
+        let hash = Sha256::digest(relpath.as_bytes());
+        let hex = hash
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let backup_file_name = format!("{hex}@v1");
+        let backup_path = backup_dir.join(&backup_file_name);
+
+        // Atomic sidecar write: tempfile + rename. Same rationale as the
+        // transcript append — a SIGKILL mid-write must never leave a
+        // truncated backup on disk.
+        let tmp = tempfile::NamedTempFile::new_in(&backup_dir).map_err(|e| {
+            CcError::io(format!(
+                "failed to create backup tempfile in {}: {e}",
+                backup_dir.display()
+            ))
+        })?;
+        {
+            let mut file = tmp.as_file();
+            file.write_all(prior_bytes)
+                .map_err(|e| CcError::io(format!("failed to write backup: {e}")))?;
+            file.flush()
+                .map_err(|e| CcError::io(format!("failed to flush backup: {e}")))?;
+            file.sync_all()
+                .map_err(|e| CcError::io(format!("failed to fsync backup: {e}")))?;
+        }
+        tmp.persist(&backup_path).map_err(|e| {
+            CcError::io(format!(
+                "failed to persist backup to {}: {e}",
+                backup_path.display()
+            ))
+        })?;
+
+        let now = Utc::now().to_rfc3339();
+        let mut tracked = std::collections::BTreeMap::new();
+        tracked.insert(
+            relpath.to_string(),
+            FileHistoryBackup {
+                backup_file_name: Some(backup_file_name),
+                version: 1,
+                backup_time: now.clone(),
+            },
+        );
+        let snap = FileHistorySnapshot {
+            message_id: message_id.to_string(),
+            tracked_file_backups: tracked,
+            timestamp: now,
+        };
+        self.append_file_history_snapshot(&snap, is_update)
+    }
+
+    /// Read back the bytes of a backup by `backup_file_name` (the same
+    /// string that appears on `FileHistoryBackup`). Used by tests and by
+    /// any future rewind implementation; returns `CcError::Io` when the
+    /// sidecar is missing.
+    pub fn read_backup(&self, backup_file_name: &str) -> CcResult<Vec<u8>> {
+        let path = self.backup_dir()?.join(backup_file_name);
+        fs::read(&path)
+            .map_err(|e| CcError::io(format!("failed to read backup {}: {e}", path.display())))
+    }
+
     /// Write session metadata alongside the transcript.
     ///
     /// Atomically persisted via a same-directory `NamedTempFile` +
@@ -619,6 +743,22 @@ impl cc_core::SessionSink for Session {
     ) -> CcResult<()> {
         Session::append_file_history_snapshot(self, snapshot, is_update)
     }
+
+    fn append_file_history_snapshot_for_path(
+        &self,
+        relpath: &str,
+        message_id: &str,
+        prior_bytes: &[u8],
+        is_update: bool,
+    ) -> CcResult<()> {
+        Session::append_file_history_snapshot_for_path(
+            self,
+            relpath,
+            message_id,
+            prior_bytes,
+            is_update,
+        )
+    }
 }
 
 fn sessions_root() -> CcResult<PathBuf> {
@@ -672,9 +812,22 @@ fn load_transcript(path: &Path) -> CcResult<Vec<MessageParam>> {
 /// transcript. Shares the malformed-line tolerance of `load_transcript`
 /// (a crashed process may leave a partial trailing line; we skip those
 /// with a WARN log rather than aborting resume).
+///
+/// A missing transcript file is treated as an empty list, matching TS
+/// `readLog` which returns `[]` for a fresh session before any append
+/// has landed. Callers that need "session has data" should check the
+/// returned vector instead of relying on I/O errors.
 fn load_transcript_entries(path: &Path) -> CcResult<Vec<SessionEntry>> {
-    let file = File::open(path)
-        .map_err(|e| CcError::io(format!("failed to open transcript {}: {e}", path.display())))?;
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(CcError::io(format!(
+                "failed to open transcript {}: {e}",
+                path.display()
+            )))
+        }
+    };
 
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
