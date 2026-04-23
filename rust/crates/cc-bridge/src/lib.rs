@@ -96,7 +96,7 @@ where
         tools: Arc::new(registry),
         permissions,
         hooks,
-        session,
+        session: Arc::new(session),
         system_blocks,
         options,
         prompter,

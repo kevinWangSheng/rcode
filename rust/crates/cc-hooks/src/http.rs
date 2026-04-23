@@ -40,16 +40,10 @@ pub enum HeaderPrepError {
     },
     /// Referenced `${FOO}` / `$FOO` but `FOO` is unset in the provided env.
     #[error("env var ${name} referenced in header {field} is unset")]
-    UnsetEnvVar {
-        field: &'static str,
-        name: String,
-    },
+    UnsetEnvVar { field: &'static str, name: String },
     /// Referenced `${FOO}` but `FOO` is not in the allowlist.
     #[error("env var ${name} referenced in header {field} is not in the allowlist")]
-    DisallowedEnvVar {
-        field: &'static str,
-        name: String,
-    },
+    DisallowedEnvVar { field: &'static str, name: String },
 }
 
 /// Reject if the string contains any CR, LF, or NUL byte.
@@ -200,7 +194,10 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -223,9 +220,10 @@ mod tests {
     fn interpolate_disallowed_env_var() {
         let e = env(&[("SECRET", "xyz")]);
         let allow: Vec<String> = vec!["PUBLIC".into()];
-        let err =
-            interpolate("value", "Bearer $SECRET", &e, Some(&allow)).unwrap_err();
-        assert!(matches!(err, HeaderPrepError::DisallowedEnvVar { ref name, .. } if name == "SECRET"));
+        let err = interpolate("value", "Bearer $SECRET", &e, Some(&allow)).unwrap_err();
+        assert!(
+            matches!(err, HeaderPrepError::DisallowedEnvVar { ref name, .. } if name == "SECRET")
+        );
     }
 
     #[test]
@@ -257,7 +255,10 @@ mod tests {
         let err = prepare_header("X-Auth", "$INJ", &e, None).unwrap_err();
         assert!(matches!(
             err,
-            HeaderPrepError::ControlByte { field: "value", byte: b'\r' }
+            HeaderPrepError::ControlByte {
+                field: "value",
+                byte: b'\r'
+            }
         ));
     }
 
@@ -267,7 +268,10 @@ mod tests {
         let err = prepare_header("X-Auth", "$INJ", &e, None).unwrap_err();
         assert!(matches!(
             err,
-            HeaderPrepError::ControlByte { field: "value", byte: b'\n' }
+            HeaderPrepError::ControlByte {
+                field: "value",
+                byte: b'\n'
+            }
         ));
     }
 
@@ -277,7 +281,10 @@ mod tests {
         let err = prepare_header("X-Auth", "$INJ", &e, None).unwrap_err();
         assert!(matches!(
             err,
-            HeaderPrepError::ControlByte { field: "value", byte: 0 }
+            HeaderPrepError::ControlByte {
+                field: "value",
+                byte: 0
+            }
         ));
     }
 

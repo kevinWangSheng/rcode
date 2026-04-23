@@ -5,10 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
 use crate::todo::TodoList;
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct TaskListTool {
     pub list: Arc<Mutex<TodoList>>,
@@ -34,7 +33,7 @@ impl Tool for TaskListTool {
         .unwrap()
     }
 
-    async fn execute(&self, _input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let guard = self.list.lock().unwrap();
         let tasks = guard.list();
 
@@ -69,16 +68,17 @@ mod tests {
     use super::*;
     use crate::task_create::TaskCreateTool;
     use crate::task_update::TaskUpdateTool;
+    use tokio_util::sync::CancellationToken;
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
     async fn empty_list_returns_no_tasks() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let tool = TaskListTool { list };
-        let r = tool.execute(json!({}), &cancel()).await.unwrap();
+        let r = tool.execute(json!({}), &ctx()).await.unwrap();
         assert!(!r.is_error);
         assert!(r.content.contains("No tasks"));
     }
@@ -88,21 +88,21 @@ mod tests {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
         create
-            .execute(json!({"subject": "T1", "description": ""}), &cancel())
+            .execute(json!({"subject": "T1", "description": ""}), &ctx())
             .await
             .unwrap();
         create
-            .execute(json!({"subject": "T2", "description": ""}), &cancel())
+            .execute(json!({"subject": "T2", "description": ""}), &ctx())
             .await
             .unwrap();
         let update = TaskUpdateTool { list: list.clone() };
         update
-            .execute(json!({"taskId": "1", "status": "deleted"}), &cancel())
+            .execute(json!({"taskId": "1", "status": "deleted"}), &ctx())
             .await
             .unwrap();
 
         let list_tool = TaskListTool { list };
-        let r = list_tool.execute(json!({}), &cancel()).await.unwrap();
+        let r = list_tool.execute(json!({}), &ctx()).await.unwrap();
         assert!(!r.is_error);
         let arr: Vec<Value> = serde_json::from_str(&r.content).unwrap();
         assert_eq!(arr.len(), 1);
@@ -114,24 +114,24 @@ mod tests {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
         create
-            .execute(json!({"subject": "T1", "description": ""}), &cancel())
+            .execute(json!({"subject": "T1", "description": ""}), &ctx())
             .await
             .unwrap();
         create
-            .execute(json!({"subject": "T2", "description": ""}), &cancel())
+            .execute(json!({"subject": "T2", "description": ""}), &ctx())
             .await
             .unwrap();
         let update = TaskUpdateTool { list: list.clone() };
         update
             .execute(
                 json!({"taskId": "2", "owner": "bob", "addBlockedBy": ["1"]}),
-                &cancel(),
+                &ctx(),
             )
             .await
             .unwrap();
 
         let list_tool = TaskListTool { list };
-        let r = list_tool.execute(json!({}), &cancel()).await.unwrap();
+        let r = list_tool.execute(json!({}), &ctx()).await.unwrap();
         let arr: Vec<Value> = serde_json::from_str(&r.content).unwrap();
         let t2 = arr.iter().find(|t| t["id"] == "2").unwrap();
         assert_eq!(t2["owner"], "bob");
@@ -143,17 +143,17 @@ mod tests {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
         create
-            .execute(json!({"subject": "T", "description": ""}), &cancel())
+            .execute(json!({"subject": "T", "description": ""}), &ctx())
             .await
             .unwrap();
         let update = TaskUpdateTool { list: list.clone() };
         update
-            .execute(json!({"taskId": "1", "status": "in_progress"}), &cancel())
+            .execute(json!({"taskId": "1", "status": "in_progress"}), &ctx())
             .await
             .unwrap();
 
         let list_tool = TaskListTool { list };
-        let r = list_tool.execute(json!({}), &cancel()).await.unwrap();
+        let r = list_tool.execute(json!({}), &ctx()).await.unwrap();
         let arr: Vec<Value> = serde_json::from_str(&r.content).unwrap();
         assert_eq!(arr[0]["status"], "in_progress");
     }

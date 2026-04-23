@@ -4,8 +4,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::SystemTime;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
-use tokio_util::sync::CancellationToken;
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct EditTool;
 
@@ -57,7 +56,7 @@ impl Tool for EditTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
@@ -229,11 +228,11 @@ mod tests {
         std::fs::write(&file, "hello world").unwrap();
 
         let tool = EditTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let r = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "old_string": "world", "new_string": "rust"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -252,11 +251,11 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tool = EditTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let r = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "old_string": "echo a", "new_string": "echo b"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -281,17 +280,17 @@ mod tests {
         let file_b = file.clone();
         let tool_a = EditTool;
         let tool_b = EditTool;
-        let cancel = CancellationToken::new();
-        let cancel2 = cancel.clone();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let ctx2 = ctx.clone();
 
         let (ra, rb) = tokio::join!(
             tool_a.execute(
                 json!({"file_path": file_a.to_string_lossy(), "old_string": "aaa", "new_string": "AAA"}),
-                &cancel,
+                &ctx,
             ),
             tool_b.execute(
                 json!({"file_path": file_b.to_string_lossy(), "old_string": "bbb", "new_string": "BBB"}),
-                &cancel2,
+                &ctx2,
             ),
         );
         // Both execute through to their own tempfile + persist. Success is
@@ -311,11 +310,11 @@ mod tests {
     #[tokio::test]
     async fn edit_missing_file_returns_error() {
         let tool = EditTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let r = tool
             .execute(
                 json!({"file_path": "/nonexistent/xyz.txt", "old_string": "a", "new_string": "b"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -367,7 +366,7 @@ mod tests {
         });
 
         let tool = EditTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let r = tool
             .execute(
                 json!({
@@ -375,7 +374,7 @@ mod tests {
                     "old_string": "v1-content",
                     "new_string": "v3-edit-should-not-land",
                 }),
-                &cancel,
+                &ctx,
             )
             .await
             .expect("execute should return, not panic");
@@ -424,7 +423,7 @@ mod tests {
         let _guard = PauseGuard;
 
         let tool = EditTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let mut saw_lost_update = false;
         for i in 0..5 {
             // Re-seed so each iteration starts from the same pre-image.
@@ -445,7 +444,7 @@ mod tests {
                         "old_string": "alpha-original-content",
                         "new_string": "alpha-NEW",
                     }),
-                    &cancel,
+                    &ctx,
                 )
                 .await;
             writer.await.unwrap();

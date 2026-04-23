@@ -51,13 +51,11 @@ impl PermissionPrompter for StdinPrompter {
         // AskUserQuestion dialog; until then this keeps the engine
         // unblocked.
         if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
-            return Ok(
-                "User cannot be reached interactively in this TUI session; \
+            return Ok("User cannot be reached interactively in this TUI session; \
                  a dedicated AskUserQuestion dialog has not been wired up yet. \
                  Please proceed with reasonable defaults or ask the question as \
                  regular assistant text so the user can answer in the prompt box."
-                    .to_string(),
-            );
+                .to_string());
         }
 
         // Print question and options to stderr

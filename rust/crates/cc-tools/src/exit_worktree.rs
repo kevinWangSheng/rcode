@@ -1,11 +1,9 @@
 //! ExitWorktreeTool — removes the current git worktree and returns to the original directory.
 
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
-
-use crate::{Tool, ToolInputSchema, ToolResult};
 
 pub struct ExitWorktreeTool;
 
@@ -34,7 +32,7 @@ impl Tool for ExitWorktreeTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let delete_branch = input
             .get("delete_branch")
             .and_then(Value::as_bool)
@@ -54,7 +52,7 @@ impl Tool for ExitWorktreeTool {
             _ => return Ok(ToolResult::error("failed to list git worktrees")),
         };
 
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return Ok(ToolResult::error("cancelled"));
         }
 

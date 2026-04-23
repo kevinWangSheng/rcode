@@ -997,10 +997,7 @@ fn assert_palette_closed(app: &App) {
         "palette_matches must be cleared: {:?}",
         app.palette_matches
     );
-    assert_eq!(
-        app.palette_selected, 0,
-        "palette_selected must reset to 0"
-    );
+    assert_eq!(app.palette_selected, 0, "palette_selected must reset to 0");
     assert!(
         app.palette_original.is_none(),
         "palette_original must be cleared"
@@ -1052,10 +1049,7 @@ fn palette_closes_after_compact_command() {
     submit_from_palette(&mut app, &uctx, "compact");
     assert_palette_closed(&app);
     assert!(
-        matches!(
-            app.transcript.last(),
-            Some(TranscriptItem::CompactBoundary)
-        ),
+        matches!(app.transcript.last(), Some(TranscriptItem::CompactBoundary)),
         "compact must push a CompactBoundary"
     );
 }
@@ -1119,11 +1113,7 @@ fn user_message_still_enters_streaming() {
 /// Helper: render `app` to an 80x24 TestBackend and return (caret_x,
 /// caret_y, row_at_input_line). Input row on 80x24 is y=20 (transcript
 /// 18 + spinner 1 + input top border → content at 19+1=20).
-fn render_and_probe(
-    app: &App,
-    w: u16,
-    h: u16,
-) -> (u16, u16, String) {
+fn render_and_probe(app: &App, w: u16, h: u16) -> (u16, u16, String) {
     use cc_tui::render;
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::Terminal;

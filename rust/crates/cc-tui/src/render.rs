@@ -510,7 +510,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     };
 
     let gutter_cells: u16 = 2; // "> "
-    // Content cells available for the buffer: total - 2 borders - gutter.
+                               // Content cells available for the buffer: total - 2 borders - gutter.
     let inner_width = area.width.saturating_sub(2).saturating_sub(gutter_cells);
 
     // Reflow the viewport offset so the caret stays inside the window
@@ -536,7 +536,9 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     };
     spans.push(Span::styled(
         gutter.to_string(),
-        Style::default().fg(gutter_color).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(gutter_color)
+            .add_modifier(Modifier::BOLD),
     ));
     if app.input.is_empty() && app.mode == AppMode::Input {
         spans.push(Span::styled(

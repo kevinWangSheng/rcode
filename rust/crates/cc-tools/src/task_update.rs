@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
 use crate::todo::{TodoList, TodoStatus};
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct TaskUpdateTool {
     pub list: Arc<Mutex<TodoList>>,
@@ -87,7 +86,7 @@ impl Tool for TaskUpdateTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let task_id = match input.get("taskId").and_then(Value::as_str) {
             Some(s) => s.to_string(),
             None => return Ok(ToolResult::error("missing required field: taskId")),
@@ -193,13 +192,14 @@ impl Tool for TaskUpdateTool {
 mod tests {
     use super::*;
     use crate::task_create::TaskCreateTool;
+    use tokio_util::sync::CancellationToken;
 
     fn make_list() -> Arc<Mutex<TodoList>> {
         Arc::new(Mutex::new(TodoList::new()))
     }
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
@@ -207,13 +207,13 @@ mod tests {
         let list = make_list();
         let create = TaskCreateTool { list: list.clone() };
         create
-            .execute(json!({"subject": "T", "description": ""}), &cancel())
+            .execute(json!({"subject": "T", "description": ""}), &ctx())
             .await
             .unwrap();
 
         let update = TaskUpdateTool { list: list.clone() };
         let r = update
-            .execute(json!({"taskId": "1", "status": "in_progress"}), &cancel())
+            .execute(json!({"taskId": "1", "status": "in_progress"}), &ctx())
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -228,7 +228,7 @@ mod tests {
         let list = make_list();
         let create = TaskCreateTool { list: list.clone() };
         create
-            .execute(json!({"subject": "Old", "description": ""}), &cancel())
+            .execute(json!({"subject": "Old", "description": ""}), &ctx())
             .await
             .unwrap();
 
@@ -236,7 +236,7 @@ mod tests {
         update
             .execute(
                 json!({"taskId": "1", "owner": "alice", "subject": "New"}),
-                &cancel(),
+                &ctx(),
             )
             .await
             .unwrap();
@@ -252,7 +252,7 @@ mod tests {
         let list = make_list();
         let update = TaskUpdateTool { list };
         let r = update
-            .execute(json!({"taskId": "99", "status": "completed"}), &cancel())
+            .execute(json!({"taskId": "99", "status": "completed"}), &ctx())
             .await
             .unwrap();
         assert!(r.is_error);
@@ -263,7 +263,7 @@ mod tests {
         let list = make_list();
         let update = TaskUpdateTool { list };
         let r = update
-            .execute(json!({"status": "completed"}), &cancel())
+            .execute(json!({"status": "completed"}), &ctx())
             .await
             .unwrap();
         assert!(r.is_error);
@@ -274,17 +274,17 @@ mod tests {
         let list = make_list();
         let create = TaskCreateTool { list: list.clone() };
         create
-            .execute(json!({"subject": "T1", "description": ""}), &cancel())
+            .execute(json!({"subject": "T1", "description": ""}), &ctx())
             .await
             .unwrap();
         create
-            .execute(json!({"subject": "T2", "description": ""}), &cancel())
+            .execute(json!({"subject": "T2", "description": ""}), &ctx())
             .await
             .unwrap();
 
         let update = TaskUpdateTool { list: list.clone() };
         update
-            .execute(json!({"taskId": "2", "addBlockedBy": ["1"]}), &cancel())
+            .execute(json!({"taskId": "2", "addBlockedBy": ["1"]}), &ctx())
             .await
             .unwrap();
 

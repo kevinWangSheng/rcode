@@ -6,14 +6,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 use async_trait::async_trait;
 use cc_agents::TeammateDirectory;
 use cc_core::task::TaskId;
 use cc_core::{CcResult, SubAgentRunner};
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
-
-use crate::{Tool, ToolInputSchema, ToolResult};
 
 pub struct TeamCreateTool {
     /// Injected at startup via the same pattern as AgentTool.
@@ -55,7 +53,7 @@ impl Tool for TeamCreateTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let runner = match &self.runner {
             Some(r) => r.clone(),
             None => {
@@ -101,7 +99,7 @@ impl Tool for TeamCreateTool {
         // Spawn the teammate as a background task
         let name_clone = name.clone();
         let directory_clone = self.directory.clone();
-        let cancel_clone = cancel.clone();
+        let cancel_clone = ctx.cancel.clone();
 
         tokio::spawn(async move {
             // Run initial turn
@@ -144,6 +142,7 @@ impl Tool for TeamCreateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn returns_error_when_runner_not_wired() {
@@ -154,7 +153,7 @@ mod tests {
         let r = tool
             .execute(
                 json!({"name": "test", "prompt": "do something"}),
-                &CancellationToken::new(),
+                &ToolContext::for_test_bare(CancellationToken::new()),
             )
             .await
             .unwrap();

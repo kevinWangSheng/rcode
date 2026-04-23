@@ -6,8 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
-use tokio_util::sync::CancellationToken;
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 const MAX_RESULTS: usize = 250;
 /// How often to check the cancel token inside a per-file line loop. Every 512
@@ -63,7 +62,7 @@ impl Tool for GrepTool {
         true
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let pattern_str = input["pattern"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;
@@ -105,7 +104,7 @@ impl Tool for GrepTool {
             // MAX_RESULTS, but "bounded to 250" is not the same as "bounded
             // in time" — a huge repo with a narrow regex can still chew
             // through tens of thousands of files before hitting the cap.
-            if cancel.is_cancelled() {
+            if ctx.cancel.is_cancelled() {
                 return Err(CcError::tool("tool", "Grep cancelled"));
             }
             let path = entry.path();
@@ -138,7 +137,7 @@ impl Tool for GrepTool {
                     for (idx, line) in (&mut reader).lines().map_while(Result::ok).enumerate() {
                         // Cancel check inside the per-file loop — a 10 GB log
                         // would otherwise run to EOF even after Ctrl+C.
-                        if idx % CANCEL_CHECK_INTERVAL == 0 && cancel.is_cancelled() {
+                        if idx % CANCEL_CHECK_INTERVAL == 0 && ctx.cancel.is_cancelled() {
                             return Err(CcError::tool("tool", "Grep cancelled"));
                         }
                         if re.is_match(&line) {
@@ -155,7 +154,7 @@ impl Tool for GrepTool {
                 }
                 "content" => {
                     for (line_num, line) in reader.lines().map_while(Result::ok).enumerate() {
-                        if line_num % CANCEL_CHECK_INTERVAL == 0 && cancel.is_cancelled() {
+                        if line_num % CANCEL_CHECK_INTERVAL == 0 && ctx.cancel.is_cancelled() {
                             return Err(CcError::tool("tool", "Grep cancelled"));
                         }
                         if re.is_match(&line) {
@@ -169,7 +168,7 @@ impl Tool for GrepTool {
                 "count" => {
                     let mut count = 0usize;
                     for (idx, line) in reader.lines().map_while(Result::ok).enumerate() {
-                        if idx % CANCEL_CHECK_INTERVAL == 0 && cancel.is_cancelled() {
+                        if idx % CANCEL_CHECK_INTERVAL == 0 && ctx.cancel.is_cancelled() {
                             return Err(CcError::tool("tool", "Grep cancelled"));
                         }
                         if re.is_match(&line) {
@@ -207,6 +206,7 @@ impl Tool for GrepTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn grep_honors_cancel_token_mid_walk() {
@@ -215,10 +215,11 @@ mod tests {
         // any non-empty directory works; the cancel check short-circuits
         // before the first file is processed.
         let tool = GrepTool;
-        let cancel = CancellationToken::new();
-        cancel.cancel();
+        let token = CancellationToken::new();
+        token.cancel();
+        let ctx = ToolContext::for_test_bare(token);
         let result = tool
-            .execute(json!({"pattern": "zzz", "path": "."}), &cancel)
+            .execute(json!({"pattern": "zzz", "path": "."}), &ctx)
             .await;
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
         assert!(result.unwrap_err().to_string().contains("cancelled"));
@@ -239,15 +240,16 @@ mod tests {
         std::fs::write(&file, &contents).unwrap();
 
         let tool = GrepTool;
-        let cancel = CancellationToken::new();
+        let token = CancellationToken::new();
         // Pre-cancel — the outer walk check fires on the first file, but the
         // key point is the inner loop also observes cancellation now.
-        cancel.cancel();
+        token.cancel();
+        let ctx = ToolContext::for_test_bare(token);
 
         let result = tool
             .execute(
                 json!({"pattern": "nomatch", "path": file.to_string_lossy(), "output_mode": "content"}),
-                &cancel,
+                &ctx,
             )
             .await;
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
@@ -270,21 +272,22 @@ mod tests {
         std::fs::write(&file, &contents).unwrap();
 
         let tool = GrepTool;
-        let cancel = CancellationToken::new();
-        let cancel2 = cancel.clone();
+        let token = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(token.clone());
+        let token2 = token.clone();
 
         // Fire cancel ~20ms in — long enough for the grep walk to enter
         // the per-file loop, short enough that it's still scanning when
         // the flag flips.
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            cancel2.cancel();
+            token2.cancel();
         });
 
         let result = tool
             .execute(
                 json!({"pattern": "zzz-no-match", "path": file.to_string_lossy(), "output_mode": "count"}),
-                &cancel,
+                &ctx,
             )
             .await;
         // Could still race — a tiny file may finish before the 20ms cancel.
@@ -297,9 +300,9 @@ mod tests {
     #[tokio::test]
     async fn grep_invalid_regex_errors() {
         let tool = GrepTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let err = tool
-            .execute(json!({"pattern": "["}), &cancel)
+            .execute(json!({"pattern": "["}), &ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("regex"));

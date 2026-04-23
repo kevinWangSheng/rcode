@@ -5,10 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
 use crate::todo::TodoList;
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct TaskGetTool {
     pub list: Arc<Mutex<TodoList>>,
@@ -40,7 +39,7 @@ impl Tool for TaskGetTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let task_id = match input.get("taskId").and_then(Value::as_str) {
             Some(s) => s,
             None => return Ok(ToolResult::error("missing required field: taskId")),
@@ -77,9 +76,10 @@ impl Tool for TaskGetTool {
 mod tests {
     use super::*;
     use crate::task_create::TaskCreateTool;
+    use tokio_util::sync::CancellationToken;
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
@@ -87,7 +87,7 @@ mod tests {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let tool = TaskGetTool { list };
         let r = tool
-            .execute(json!({"taskId": "999"}), &cancel())
+            .execute(json!({"taskId": "999"}), &ctx())
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -101,16 +101,13 @@ mod tests {
         create
             .execute(
                 json!({"subject": "Fix it", "description": "Full description", "activeForm": "Fixing"}),
-                &cancel(),
+                &ctx(),
             )
             .await
             .unwrap();
 
         let tool = TaskGetTool { list };
-        let r = tool
-            .execute(json!({"taskId": "1"}), &cancel())
-            .await
-            .unwrap();
+        let r = tool.execute(json!({"taskId": "1"}), &ctx()).await.unwrap();
         assert!(!r.is_error);
         let v: Value = serde_json::from_str(&r.content).unwrap();
         let task = &v["task"];
@@ -125,7 +122,7 @@ mod tests {
     async fn missing_task_id_returns_error() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let tool = TaskGetTool { list };
-        let r = tool.execute(json!({}), &cancel()).await.unwrap();
+        let r = tool.execute(json!({}), &ctx()).await.unwrap();
         assert!(r.is_error);
     }
 
@@ -134,14 +131,11 @@ mod tests {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let create = TaskCreateTool { list: list.clone() };
         create
-            .execute(json!({"subject": "T", "description": ""}), &cancel())
+            .execute(json!({"subject": "T", "description": ""}), &ctx())
             .await
             .unwrap();
         let tool = TaskGetTool { list };
-        let r = tool
-            .execute(json!({"taskId": "1"}), &cancel())
-            .await
-            .unwrap();
+        let r = tool.execute(json!({"taskId": "1"}), &ctx()).await.unwrap();
         let v: Value = serde_json::from_str(&r.content).unwrap();
         assert!(v["task"]["blocks"].is_array());
         assert!(v["task"]["blockedBy"].is_array());

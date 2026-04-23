@@ -5,10 +5,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
 use crate::todo::TodoList;
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct TaskCreateTool {
     pub list: Arc<Mutex<TodoList>>,
@@ -53,7 +52,7 @@ impl Tool for TaskCreateTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let subject = match input.get("subject").and_then(Value::as_str) {
             Some(s) => s.to_string(),
             None => return Ok(ToolResult::error("missing required field: subject")),
@@ -92,6 +91,7 @@ impl Tool for TaskCreateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     fn make_tool() -> TaskCreateTool {
         TaskCreateTool {
@@ -99,8 +99,8 @@ mod tests {
         }
     }
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
@@ -109,7 +109,7 @@ mod tests {
         let result = tool
             .execute(
                 json!({"subject": "Fix bug", "description": "Fix the login bug"}),
-                &cancel(),
+                &ctx(),
             )
             .await
             .unwrap();
@@ -122,7 +122,7 @@ mod tests {
     async fn missing_subject_returns_error() {
         let tool = make_tool();
         let result = tool
-            .execute(json!({"description": "no subject"}), &cancel())
+            .execute(json!({"description": "no subject"}), &ctx())
             .await
             .unwrap();
         assert!(result.is_error);
@@ -133,11 +133,11 @@ mod tests {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let tool = TaskCreateTool { list: list.clone() };
         let r1 = tool
-            .execute(json!({"subject": "T1", "description": ""}), &cancel())
+            .execute(json!({"subject": "T1", "description": ""}), &ctx())
             .await
             .unwrap();
         let r2 = tool
-            .execute(json!({"subject": "T2", "description": ""}), &cancel())
+            .execute(json!({"subject": "T2", "description": ""}), &ctx())
             .await
             .unwrap();
         assert!(r1.content.contains("\"id\":\"1\""));
@@ -148,7 +148,7 @@ mod tests {
     async fn task_is_pending_by_default() {
         let list = Arc::new(Mutex::new(TodoList::new()));
         let tool = TaskCreateTool { list: list.clone() };
-        tool.execute(json!({"subject": "T", "description": ""}), &cancel())
+        tool.execute(json!({"subject": "T", "description": ""}), &ctx())
             .await
             .unwrap();
         let guard = list.lock().unwrap();

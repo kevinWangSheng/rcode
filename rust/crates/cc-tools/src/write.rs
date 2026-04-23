@@ -3,8 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
-use tokio_util::sync::CancellationToken;
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct WriteTool;
 
@@ -38,7 +37,7 @@ impl Tool for WriteTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
@@ -133,11 +132,11 @@ mod tests {
         let file = dir.path().join("new.txt");
 
         let tool = WriteTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "content": "hello world"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -151,11 +150,11 @@ mod tests {
         let file = dir.path().join("a").join("b").join("c.txt");
 
         let tool = WriteTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "content": "deep"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -170,11 +169,11 @@ mod tests {
         std::fs::write(&file, "old content").unwrap();
 
         let tool = WriteTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "content": "new content"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -194,11 +193,11 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let tool = WriteTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "content": "#!/bin/sh\necho new\n"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -221,11 +220,11 @@ mod tests {
         let file = dir.path().join("fresh.txt");
 
         let tool = WriteTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "content": "hello"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();

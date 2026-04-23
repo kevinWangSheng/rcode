@@ -3,12 +3,10 @@
 //! Creates a new git worktree from the current repo, generates a random name
 //! if none is provided, and returns the worktree path and branch.
 
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
-
-use crate::{Tool, ToolInputSchema, ToolResult};
 
 pub struct EnterWorktreeTool;
 
@@ -58,7 +56,7 @@ impl Tool for EnterWorktreeTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let name_opt = input.get("name").and_then(Value::as_str);
 
         // Validate name if provided
@@ -94,7 +92,7 @@ impl Tool for EnterWorktreeTool {
         let worktree_path = worktrees_dir.join(&slug);
 
         // Check cancellation
-        if cancel.is_cancelled() {
+        if ctx.cancel.is_cancelled() {
             return Ok(ToolResult::error("cancelled"));
         }
 

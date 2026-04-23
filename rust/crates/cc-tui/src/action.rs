@@ -142,8 +142,8 @@ pub fn refresh_palette(app: &mut App, commands: &CommandRegistry) {
     if app.mode != AppMode::CommandPalette {
         return;
     }
-    let filter = palette_filter(&app.input, app.palette_kind, app.palette_trigger_at)
-        .to_ascii_lowercase();
+    let filter =
+        palette_filter(&app.input, app.palette_kind, app.palette_trigger_at).to_ascii_lowercase();
     let mut names: Vec<String> = match app.palette_kind {
         crate::app::PaletteKind::Commands => {
             let mut v = commands.names();
@@ -199,11 +199,7 @@ fn list_cwd_files() -> Vec<String> {
 /// `/` (commands never live mid-buffer). For the file palette the
 /// trigger `@` can appear anywhere in the buffer — `palette_trigger_at`
 /// records the byte offset so we slice out the chars typed after it.
-fn palette_filter(
-    input: &str,
-    kind: crate::app::PaletteKind,
-    trigger_at: Option<usize>,
-) -> &str {
+fn palette_filter(input: &str, kind: crate::app::PaletteKind, trigger_at: Option<usize>) -> &str {
     match kind {
         crate::app::PaletteKind::Commands => input.trim_start().strip_prefix('/').unwrap_or(""),
         crate::app::PaletteKind::Files => match trigger_at {

@@ -5,12 +5,10 @@
 
 use std::sync::Arc;
 
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 use async_trait::async_trait;
 use cc_core::{CcResult, SubAgentRunner};
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
-
-use crate::{Tool, ToolInputSchema, ToolResult};
 
 pub struct AgentTool {
     /// Injected by main.rs; None means sub-agents are not available in this build.
@@ -52,7 +50,7 @@ impl Tool for AgentTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let runner = match &self.runner {
             Some(r) => r.clone(),
             None => {
@@ -72,7 +70,10 @@ impl Tool for AgentTool {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        match runner.run(system, prompt, Vec::new(), cancel.clone()).await {
+        match runner
+            .run(system, prompt, Vec::new(), ctx.cancel.clone())
+            .await
+        {
             Ok(result) => Ok(ToolResult::ok(result)),
             Err(e) => Ok(ToolResult::error(format!("sub-agent failed: {e}"))),
         }
@@ -82,9 +83,10 @@ impl Tool for AgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
@@ -93,7 +95,7 @@ mod tests {
         let r = tool
             .execute(
                 json!({"prompt": "do something", "description": "test"}),
-                &cancel(),
+                &ctx(),
             )
             .await
             .unwrap();
@@ -105,7 +107,7 @@ mod tests {
     async fn missing_prompt_returns_error() {
         let tool = AgentTool { runner: None };
         let r = tool
-            .execute(json!({"description": "test"}), &cancel())
+            .execute(json!({"description": "test"}), &ctx())
             .await
             .unwrap();
         // When runner is None, the None check fires first

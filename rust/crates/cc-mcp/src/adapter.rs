@@ -5,10 +5,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cc_core::{CcResult, ToolInputSchema};
-use cc_tools::{Tool, ToolResult};
+use cc_tools::{Tool, ToolContext, ToolResult};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 
 use crate::transport::McpTransport;
 use crate::{McpClient, McpHttpClient};
@@ -62,13 +61,13 @@ impl Tool for McpToolAdapter {
         })
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let result = self
             .transport
             .request(
                 "tools/call",
                 Some(json!({ "name": self.inner_name, "arguments": input })),
-                cancel,
+                &ctx.cancel,
             )
             .await;
 

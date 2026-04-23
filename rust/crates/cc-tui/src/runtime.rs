@@ -499,7 +499,8 @@ mod viewport_tests {
         use ratatui::Terminal;
 
         let mut app = App::new("s".into(), "m".into());
-        app.transcript.push(TranscriptItem::UserMessage("hi".into()));
+        app.transcript
+            .push(TranscriptItem::UserMessage("hi".into()));
         // Simulate an in-flight permission prompt — mode is what the
         // real handler flips to when PermissionRequest arrives.
         app.mode = AppMode::PermissionPrompt;

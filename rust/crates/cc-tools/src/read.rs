@@ -3,8 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
-use tokio_util::sync::CancellationToken;
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 const MAX_LINES_DEFAULT: usize = 2000;
 /// Hard cap on file size to prevent OOM when a user accidentally points
@@ -54,7 +53,7 @@ impl Tool for ReadTool {
         true
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
@@ -131,7 +130,7 @@ impl Tool for ReadTool {
         let mut bounded = file.take(read_limit);
         let read_result = tokio::select! {
             r = bounded.read_to_end(&mut buf) => r,
-            _ = cancel.cancelled() => {
+            _ = ctx.cancel.cancelled() => {
                 return Err(CcError::tool("tool", "Read cancelled"));
             }
         };
@@ -179,9 +178,9 @@ mod tests {
         std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
 
         let tool = ReadTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"file_path": file.to_string_lossy()}), &cancel)
+            .execute(json!({"file_path": file.to_string_lossy()}), &ctx)
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -193,9 +192,9 @@ mod tests {
     #[tokio::test]
     async fn read_not_found() {
         let tool = ReadTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"file_path": "/nonexistent/file.txt"}), &cancel)
+            .execute(json!({"file_path": "/nonexistent/file.txt"}), &ctx)
             .await
             .unwrap();
         assert!(result.is_error);
@@ -209,11 +208,11 @@ mod tests {
         std::fs::write(&file, "a\nb\nc\nd\ne\n").unwrap();
 
         let tool = ReadTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(
                 json!({"file_path": file.to_string_lossy(), "offset": 2, "limit": 2}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -233,9 +232,9 @@ mod tests {
         f.set_len(MAX_FILE_BYTES + 1).unwrap();
 
         let tool = ReadTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"file_path": file.to_string_lossy()}), &cancel)
+            .execute(json!({"file_path": file.to_string_lossy()}), &ctx)
             .await
             .unwrap();
         assert!(result.is_error, "oversize file must be rejected");
@@ -257,11 +256,12 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
 
         let tool = ReadTool;
-        let cancel = CancellationToken::new();
-        cancel.cancel(); // pre-cancel
+        let token = CancellationToken::new();
+        token.cancel(); // pre-cancel
+        let ctx = ToolContext::for_test_bare(token);
 
         let result = tool
-            .execute(json!({"file_path": file.to_string_lossy()}), &cancel)
+            .execute(json!({"file_path": file.to_string_lossy()}), &ctx)
             .await;
         // Either cancel branch wins before the read finishes, OR the
         // read completes first because it's tiny. Both are acceptable —
@@ -290,9 +290,9 @@ mod tests {
             std::fs::write(&file, &bytes).unwrap();
 
             let tool = ReadTool;
-            let cancel = CancellationToken::new();
+            let ctx = ToolContext::for_test_bare(CancellationToken::new());
             let result = tool
-                .execute(json!({"file_path": file.to_string_lossy()}), &cancel)
+                .execute(json!({"file_path": file.to_string_lossy()}), &ctx)
                 .await
                 .unwrap();
             assert!(!result.is_error, "size {size}: {}", result.content);
@@ -352,10 +352,10 @@ mod tests {
         });
 
         let tool = ReadTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         for _ in 0..50 {
             let result = tool
-                .execute(json!({"file_path": link.to_string_lossy()}), &cancel)
+                .execute(json!({"file_path": link.to_string_lossy()}), &ctx)
                 .await;
             // Acceptable outcomes:
             //   - Ok with is_error=false (happy path)

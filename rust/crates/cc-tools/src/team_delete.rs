@@ -10,9 +10,8 @@ use async_trait::async_trait;
 use cc_agents::TeammateDirectory;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct TeamDeleteTool {
     pub directory: Arc<Mutex<TeammateDirectory>>,
@@ -44,7 +43,7 @@ impl Tool for TeamDeleteTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let name = match input.get("name").and_then(Value::as_str) {
             Some(n) => n.to_string(),
             None => return Ok(ToolResult::error("missing required field: name")),
@@ -72,6 +71,7 @@ impl Tool for TeamDeleteTool {
 mod tests {
     use super::*;
     use cc_core::task::TaskId;
+    use tokio_util::sync::CancellationToken;
 
     fn make_tool() -> TeamDeleteTool {
         let dir = Arc::new(Mutex::new(TeammateDirectory::new()));
@@ -87,7 +87,10 @@ mod tests {
     async fn removes_existing_teammate() {
         let tool = make_tool();
         let r = tool
-            .execute(json!({"name": "worker"}), &CancellationToken::new())
+            .execute(
+                json!({"name": "worker"}),
+                &ToolContext::for_test_bare(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -98,7 +101,10 @@ mod tests {
     async fn missing_teammate_returns_error() {
         let tool = make_tool();
         let r = tool
-            .execute(json!({"name": "nobody"}), &CancellationToken::new())
+            .execute(
+                json!({"name": "nobody"}),
+                &ToolContext::for_test_bare(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert!(r.is_error);
