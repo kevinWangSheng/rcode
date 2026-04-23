@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
-use tokio_util::sync::CancellationToken;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 /// A single item in the TodoWrite list.
 #[derive(Debug, Clone)]
@@ -123,7 +122,7 @@ impl Tool for TodoWriteTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let todos_arr = match input.get("todos").and_then(Value::as_array) {
             Some(a) => a.clone(),
             None => return Ok(ToolResult::error("missing required field: todos")),
@@ -181,6 +180,7 @@ impl Tool for TodoWriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     fn make_tool() -> TodoWriteTool {
         TodoWriteTool {
@@ -199,7 +199,7 @@ mod tests {
                         {"id": "2", "content": "Fix bug", "status": "in_progress", "priority": "medium"}
                     ]
                 }),
-                &CancellationToken::new(),
+                &ToolContext::for_test_bare(CancellationToken::new()),
             )
             .await
             .unwrap();
@@ -214,7 +214,10 @@ mod tests {
     async fn missing_todos_returns_error() {
         let tool = make_tool();
         let r = tool
-            .execute(json!({}), &CancellationToken::new())
+            .execute(
+                json!({}),
+                &ToolContext::for_test_bare(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert!(r.is_error);

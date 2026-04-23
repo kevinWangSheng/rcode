@@ -5,7 +5,7 @@ use cc_api::{
 use cc_core::{
     AppEvent, CcError, CcResult, ContentBlock, Message, MessageContent, MessageParam,
     PermissionBehavior, PermissionPrompter, PromptDecision, Role, StopReason, SystemBlock,
-    ToolResultBlock, ToolUseBlock, Usage,
+    ToolContext, ToolResultBlock, ToolUseBlock, Usage,
 };
 use cc_hooks::{HookInput, HookRunner};
 use cc_permissions::PermissionEngine;
@@ -78,7 +78,7 @@ pub struct QueryEngine {
     tools: Arc<ToolRegistry>,
     permissions: PermissionEngine,
     hooks: Arc<HookRunner>,
-    session: Session,
+    session: Arc<Session>,
     system_blocks: Vec<SystemBlock>,
     options: QueryOptions,
     prompter: Arc<dyn PermissionPrompter>,
@@ -104,7 +104,10 @@ pub struct QueryEngineConfig {
     pub tools: Arc<ToolRegistry>,
     pub permissions: PermissionEngine,
     pub hooks: Arc<HookRunner>,
-    pub session: Session,
+    /// Session wrapped in an `Arc` so `ToolContext::session` clones can
+    /// drive the `SessionSink` trait from inside tool dispatches
+    /// concurrently with the engine's own append calls.
+    pub session: Arc<Session>,
     pub system_blocks: Vec<SystemBlock>,
     pub options: QueryOptions,
     pub prompter: Arc<dyn PermissionPrompter>,
@@ -389,7 +392,8 @@ impl QueryEngine {
                     let valid_results = if valid_blocks.is_empty() {
                         Vec::new()
                     } else {
-                        self.execute_tools(&valid_blocks, cancel).await?
+                        self.execute_tools(&valid_blocks, &message.id, cancel)
+                            .await?
                     };
                     let tool_results =
                         merge_tool_results(&tool_use_blocks, valid_results, &bad_tool_inputs);
@@ -454,9 +458,15 @@ impl QueryEngine {
 
     /// Execute a batch of tool_use blocks, returning tool_result blocks.
     /// Read-only tools run concurrently; mutating tools run sequentially (§4.3).
+    ///
+    /// `assistant_msg_id` is the id of the assistant turn that emitted
+    /// these `tool_use` blocks; it's threaded into every per-tool
+    /// `ToolContext` as `message_id`. Follow-ups that need per-edit
+    /// file-history snapshots read it back off the ctx.
     async fn execute_tools(
         &mut self,
         tool_use_blocks: &[ToolUseBlock],
+        assistant_msg_id: &str,
         cancel: &CancellationToken,
     ) -> CcResult<Vec<ToolResultBlock>> {
         // Partition into read-only and mutating
@@ -481,6 +491,8 @@ impl QueryEngine {
                 let events_tx = self.events_tx.clone();
                 let hooks = Arc::clone(&self.hooks);
                 let session_id = self.session.id.clone();
+                let session = Arc::clone(&self.session);
+                let msg_id = assistant_msg_id.to_string();
                 let futures: Vec<_> = authorized
                     .into_iter()
                     .map(|(tu, tool)| {
@@ -488,6 +500,8 @@ impl QueryEngine {
                         let events_tx = events_tx.clone();
                         let hooks = Arc::clone(&hooks);
                         let session_id = session_id.clone();
+                        let session = Arc::clone(&session);
+                        let msg_id = msg_id.clone();
                         let tu = tu.clone();
                         async move {
                             // Emit ToolStart
@@ -500,8 +514,13 @@ impl QueryEngine {
                                     .await;
                             }
 
+                            let ctx = ToolContext {
+                                session: session as Arc<dyn cc_core::SessionSink>,
+                                cancel: cancel.clone(),
+                                message_id: Some(msg_id),
+                            };
                             let result: ToolResult = match tool
-                                .execute(tu.input.clone(), &cancel)
+                                .execute(tu.input.clone(), &ctx)
                                 .await
                             {
                                 Ok(r) => r,
@@ -545,7 +564,7 @@ impl QueryEngine {
 
         // Run mutating tools sequentially
         for tu in &mutating {
-            results.push(self.execute_one_tool(tu, cancel).await);
+            results.push(self.execute_one_tool(tu, assistant_msg_id, cancel).await);
         }
 
         // Re-sort to match original tool_use order
@@ -682,6 +701,7 @@ impl QueryEngine {
     async fn execute_one_tool(
         &mut self,
         tu: &ToolUseBlock,
+        assistant_msg_id: &str,
         cancel: &CancellationToken,
     ) -> ToolResultBlock {
         debug!("tool_use: {}", tu.name);
@@ -699,7 +719,12 @@ impl QueryEngine {
         .await;
 
         let child_cancel = cancel.child_token();
-        let result: ToolResult = match tool.execute(tu.input.clone(), &child_cancel).await {
+        let ctx = ToolContext {
+            session: Arc::clone(&self.session) as Arc<dyn cc_core::SessionSink>,
+            cancel: child_cancel.clone(),
+            message_id: Some(assistant_msg_id.to_string()),
+        };
+        let result: ToolResult = match tool.execute(tu.input.clone(), &ctx).await {
             Ok(r) => r,
             Err(e) => ToolResult::error(format!("Tool execution error: {e}")),
         };
@@ -1713,7 +1738,7 @@ mod tests {
             tools: Arc::new(ToolRegistry::new()),
             permissions: PermissionEngine::default(),
             hooks: Arc::new(hooks),
-            session: Session::new().expect("session"),
+            session: Arc::new(Session::new().expect("session")),
             system_blocks: Vec::new(),
             options: QueryOptions {
                 bypass_permissions: true,

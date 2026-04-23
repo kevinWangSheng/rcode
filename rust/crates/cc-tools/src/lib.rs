@@ -27,7 +27,7 @@ pub mod web_search;
 pub mod write;
 
 // Re-export cc-core's Tool trait and ToolResult for use by tool implementations.
-pub use cc_core::tool::{Tool, ToolResult};
+pub use cc_core::tool::{SessionSink, Tool, ToolContext, ToolResult};
 pub use cc_core::{ToolDefinition, ToolInputSchema};
 pub use todo::TodoList;
 pub use todo_write::TodoWriteList;

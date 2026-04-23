@@ -6,9 +6,8 @@ use async_trait::async_trait;
 use cc_agents::TaskRegistry;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct TaskOutputTool {
     pub registry: Arc<Mutex<TaskRegistry>>,
@@ -40,7 +39,7 @@ impl Tool for TaskOutputTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let task_id_str = match input.get("task_id").and_then(Value::as_str) {
             Some(s) => s.to_string(),
             None => return Ok(ToolResult::error("missing required field: task_id")),
@@ -75,13 +74,14 @@ mod tests {
     use super::*;
     use cc_agents::TaskOutput;
     use cc_core::task::TaskKind;
+    use tokio_util::sync::CancellationToken;
 
     fn make_registry() -> Arc<Mutex<TaskRegistry>> {
         Arc::new(Mutex::new(TaskRegistry::new(10)))
     }
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
@@ -102,7 +102,7 @@ mod tests {
 
         let tool = TaskOutputTool { registry };
         let r = tool
-            .execute(json!({"task_id": task_id.0}), &cancel())
+            .execute(json!({"task_id": task_id.0}), &ctx())
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -115,7 +115,7 @@ mod tests {
         let registry = make_registry();
         let tool = TaskOutputTool { registry };
         let r = tool
-            .execute(json!({"task_id": "unknown"}), &cancel())
+            .execute(json!({"task_id": "unknown"}), &ctx())
             .await
             .unwrap();
         assert!(r.is_error);
@@ -125,7 +125,7 @@ mod tests {
     async fn missing_task_id_returns_error() {
         let registry = make_registry();
         let tool = TaskOutputTool { registry };
-        let r = tool.execute(json!({}), &cancel()).await.unwrap();
+        let r = tool.execute(json!({}), &ctx()).await.unwrap();
         assert!(r.is_error);
     }
 }

@@ -10,9 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cc_core::{CcResult, PermissionPrompter};
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct AskUserQuestionTool {
     /// Wired at startup by main.rs; used to ask the user a question.
@@ -52,7 +51,7 @@ impl Tool for AskUserQuestionTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let question = match input.get("question").and_then(Value::as_str) {
             Some(q) => q.to_string(),
             None => return Ok(ToolResult::error("missing required field: question")),
@@ -70,7 +69,7 @@ impl Tool for AskUserQuestionTool {
 
         let answer = self
             .prompter
-            .ask_question(&question, &options, cancel)
+            .ask_question(&question, &options, &ctx.cancel)
             .await?;
 
         let result = json!({
@@ -85,6 +84,7 @@ impl Tool for AskUserQuestionTool {
 mod tests {
     use super::*;
     use cc_core::{CcResult, PromptDecision};
+    use tokio_util::sync::CancellationToken;
 
     struct AlwaysAnswer(String);
 
@@ -115,8 +115,8 @@ mod tests {
         }
     }
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
@@ -125,7 +125,7 @@ mod tests {
         let r = t
             .execute(
                 json!({"question": "Which language?", "options": ["Rust", "TypeScript"]}),
-                &cancel(),
+                &ctx(),
             )
             .await
             .unwrap();
@@ -136,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn missing_question_returns_error() {
         let t = tool("yes");
-        let r = t.execute(json!({}), &cancel()).await.unwrap();
+        let r = t.execute(json!({}), &ctx()).await.unwrap();
         assert!(r.is_error);
     }
 }

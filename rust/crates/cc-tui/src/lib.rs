@@ -264,8 +264,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     if app.is_empty_session() {
         let banner_width = term_size.0;
         let tip_seed = app.session_started.elapsed().as_secs() / 30;
-        let lines =
-            crate::welcome::render_welcome(banner_width, &app.version, &app.cwd, tip_seed);
+        let lines = crate::welcome::render_welcome(banner_width, &app.version, &app.cwd, tip_seed);
         match viewport_kind {
             ViewportKind::Inline => {
                 let n = lines.len() as u16;

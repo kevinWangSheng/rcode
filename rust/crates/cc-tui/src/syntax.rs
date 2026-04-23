@@ -60,10 +60,7 @@ impl FenceHighlighter {
             .inner
             .highlight_line(line, syntax_set())
             .unwrap_or_default();
-        let border = Span::styled(
-            "│ ".to_string(),
-            Style::default().fg(Color::DarkGray),
-        );
+        let border = Span::styled("│ ".to_string(), Style::default().fg(Color::DarkGray));
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(ranges.len() + 1);
         spans.push(border);
         for (style, text) in ranges {

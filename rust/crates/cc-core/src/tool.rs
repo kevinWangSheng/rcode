@@ -1,7 +1,9 @@
 use crate::error::CcResult;
+use crate::file_history::FileHistorySnapshot;
 use crate::message::CacheControl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Result of executing a tool.
@@ -54,6 +56,89 @@ pub struct ToolDefinition {
     pub cache_control: Option<CacheControl>,
 }
 
+/// Session-side append hooks that tools invoke through `ToolContext::session`.
+///
+/// Kept as a narrow trait so `cc-core` can define the contract without
+/// depending on `cc-session` (which already depends on `cc-core`). Extend
+/// only when an actual caller needs a new method — every addition is a
+/// breaking change for the trait's implementers.
+pub trait SessionSink: Send + Sync {
+    /// Append a canonical interrupt-marker user message. `for_tool_use`
+    /// picks the tool-use variant string (matches TS
+    /// `createUserInterruptionMessage`).
+    fn append_interrupt_marker(&self, for_tool_use: bool) -> CcResult<()>;
+
+    /// Append a file-history snapshot as a
+    /// `{type: "file-history-snapshot"}` JSONL entry. Mirrors TS
+    /// `sessionStorage.insertFileHistorySnapshot`.
+    fn append_file_history_snapshot(
+        &self,
+        snapshot: &FileHistorySnapshot,
+        is_update: bool,
+    ) -> CcResult<()>;
+}
+
+/// Runtime dependencies a tool needs beyond its `input` JSON.
+///
+/// Passed by reference to every `Tool::execute` call. New fields may be
+/// added additively; do not remove or rename existing fields without a
+/// spec update — external-style consumers (MCP adapter, cc-agents drivers)
+/// construct these as well.
+#[derive(Clone)]
+pub struct ToolContext {
+    /// Handle to the caller's session, so tools can append
+    /// side-effect entries (file-history snapshots, interrupt
+    /// markers, etc.).
+    pub session: Arc<dyn SessionSink>,
+
+    /// Cooperative cancellation. Tools should poll
+    /// `ctx.cancel.is_cancelled()` in long-running loops.
+    pub cancel: CancellationToken,
+
+    /// The assistant-turn message id that produced this tool_use.
+    /// Currently populated from `cc-query` dispatch (best-effort);
+    /// `None` in isolated tool tests.
+    pub message_id: Option<String>,
+}
+
+impl ToolContext {
+    /// Construct a bare ctx for tests / call sites that have no real
+    /// session. The sink's append methods are no-ops (return `Ok(())`).
+    ///
+    /// Kept on the production path (not `#[cfg(test)]`) because
+    /// workspace-internal crates such as `cc-agents` driver tasks need a
+    /// real `ToolContext` when no caller session is available, and
+    /// downstream users of the library also need a sanctioned way to
+    /// build a minimal ctx.
+    pub fn for_test_bare(cancel: CancellationToken) -> Self {
+        ToolContext {
+            session: Arc::new(NoopSessionSink),
+            cancel,
+            message_id: None,
+        }
+    }
+}
+
+/// Session sink whose append methods silently succeed. Intended for
+/// tests and non-session contexts (driver tasks that run tools without a
+/// caller session). Production code paths MUST wire a real `Session`
+/// implementation.
+struct NoopSessionSink;
+
+impl SessionSink for NoopSessionSink {
+    fn append_interrupt_marker(&self, _for_tool_use: bool) -> CcResult<()> {
+        Ok(())
+    }
+
+    fn append_file_history_snapshot(
+        &self,
+        _snapshot: &FileHistorySnapshot,
+        _is_update: bool,
+    ) -> CcResult<()> {
+        Ok(())
+    }
+}
+
 /// The trait all tools (built-in + MCP) implement.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -71,8 +156,10 @@ pub trait Tool: Send + Sync {
     }
 
     /// Execute the tool with the given JSON input.
-    /// `cancel` is checked periodically — tools should return early on cancellation.
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult>;
+    /// `ctx.cancel` is checked periodically — tools should return early on
+    /// cancellation. `ctx.session` lets the tool append side-effect
+    /// entries (file-history snapshots, interrupt markers).
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult>;
 
     /// Convert to API ToolDefinition.
     fn to_definition(&self) -> ToolDefinition {
@@ -117,5 +204,14 @@ mod tests {
         let json = serde_json::to_value(&schema).unwrap();
         assert_eq!(json["type"], "object");
         assert_eq!(json["additionalProperties"], false);
+    }
+
+    #[test]
+    fn for_test_bare_noop_sink_round_trips() {
+        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(cancel);
+        assert!(ctx.session.append_interrupt_marker(false).is_ok());
+        assert!(ctx.session.append_interrupt_marker(true).is_ok());
+        assert!(ctx.message_id.is_none());
     }
 }

@@ -9,9 +9,8 @@ use async_trait::async_trait;
 use cc_agents::TeammateDirectory;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct SendMessageTool {
     pub directory: Arc<Mutex<TeammateDirectory>>,
@@ -54,7 +53,7 @@ impl Tool for SendMessageTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let to = match input.get("to").and_then(Value::as_str) {
             Some(t) => t.to_string(),
             None => return Ok(ToolResult::error("missing required field: to")),
@@ -126,6 +125,7 @@ impl Tool for SendMessageTool {
 mod tests {
     use super::*;
     use cc_core::task::TaskId;
+    use tokio_util::sync::CancellationToken;
 
     fn make_tool() -> (SendMessageTool, tokio::sync::mpsc::Receiver<String>) {
         let dir = Arc::new(Mutex::new(TeammateDirectory::new()));
@@ -135,18 +135,15 @@ mod tests {
         (SendMessageTool { directory: dir }, rx)
     }
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
     async fn send_to_known_teammate() {
         let (tool, mut rx) = make_tool();
         let r = tool
-            .execute(
-                json!({"to": "worker", "message": "start task 1"}),
-                &cancel(),
-            )
+            .execute(json!({"to": "worker", "message": "start task 1"}), &ctx())
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -157,7 +154,7 @@ mod tests {
     async fn send_to_unknown_returns_error() {
         let (tool, _rx) = make_tool();
         let r = tool
-            .execute(json!({"to": "nobody", "message": "hello"}), &cancel())
+            .execute(json!({"to": "nobody", "message": "hello"}), &ctx())
             .await
             .unwrap();
         assert!(r.is_error);
@@ -167,10 +164,7 @@ mod tests {
     #[tokio::test]
     async fn missing_fields_return_errors() {
         let (tool, _rx) = make_tool();
-        let r = tool
-            .execute(json!({"to": "worker"}), &cancel())
-            .await
-            .unwrap();
+        let r = tool.execute(json!({"to": "worker"}), &ctx()).await.unwrap();
         assert!(r.is_error);
     }
 }

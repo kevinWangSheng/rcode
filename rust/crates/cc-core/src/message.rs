@@ -494,8 +494,7 @@ mod tests {
 
     #[test]
     fn text_block_cache_control_emitted_on_wire() {
-        let b =
-            ContentBlock::text("hi").with_cache_control(CacheControl::ephemeral_unscoped());
+        let b = ContentBlock::text("hi").with_cache_control(CacheControl::ephemeral_unscoped());
         let json = serde_json::to_string(&b).unwrap();
         assert_eq!(
             json,

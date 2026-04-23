@@ -3,12 +3,10 @@
 //! Prefer this over `Bash(sleep ...)` — it doesn't hold a shell process and
 //! can be interrupted via the CancellationToken.
 
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 use async_trait::async_trait;
 use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
-
-use crate::{Tool, ToolInputSchema, ToolResult};
 
 pub struct SleepTool;
 
@@ -40,7 +38,7 @@ impl Tool for SleepTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let ms = match input.get("duration_ms").and_then(Value::as_u64) {
             Some(n) => n.min(300_000),
             None => return Ok(ToolResult::error("missing required field: duration_ms")),
@@ -50,7 +48,7 @@ impl Tool for SleepTool {
 
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
+            _ = ctx.cancel.cancelled() => {
                 Err(CcError::Cancelled)
             }
             _ = tokio::time::sleep(dur) => {
@@ -63,9 +61,10 @@ impl Tool for SleepTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
-    fn cancel() -> CancellationToken {
-        CancellationToken::new()
+    fn ctx() -> ToolContext {
+        ToolContext::for_test_bare(CancellationToken::new())
     }
 
     #[tokio::test]
@@ -73,7 +72,7 @@ mod tests {
         let tool = SleepTool;
         let start = std::time::Instant::now();
         let r = tool
-            .execute(json!({"duration_ms": 50}), &cancel())
+            .execute(json!({"duration_ms": 50}), &ctx())
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -84,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn missing_duration_returns_error() {
         let tool = SleepTool;
-        let r = tool.execute(json!({}), &cancel()).await.unwrap();
+        let r = tool.execute(json!({}), &ctx()).await.unwrap();
         assert!(r.is_error);
     }
 
@@ -93,7 +92,8 @@ mod tests {
         let tool = SleepTool;
         let token = CancellationToken::new();
         token.cancel();
-        let r = tool.execute(json!({"duration_ms": 5000}), &token).await;
+        let ctx = ToolContext::for_test_bare(token);
+        let r = tool.execute(json!({"duration_ms": 5000}), &ctx).await;
         assert!(matches!(r, Err(CcError::Cancelled)));
     }
 }

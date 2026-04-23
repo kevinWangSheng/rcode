@@ -3,8 +3,7 @@ use cc_core::{CcError, CcResult};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
-use tokio_util::sync::CancellationToken;
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct GlobTool;
 
@@ -41,7 +40,7 @@ impl Tool for GlobTool {
         true
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let pattern = input["pattern"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'pattern' field"))?;
@@ -72,7 +71,7 @@ impl Tool for GlobTool {
             // A huge repo with a broad glob (e.g. `**/*`) can iterate
             // hundreds of thousands of entries before returning. Peek at
             // the cancel token each iteration so Ctrl+C lands quickly.
-            if cancel.is_cancelled() {
+            if ctx.cancel.is_cancelled() {
                 return Err(CcError::tool("tool", "Glob cancelled"));
             }
             if entry.is_file() {

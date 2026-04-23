@@ -42,9 +42,9 @@ impl SubAgentRunner for SubAgentRunnerImpl {
         cancel: CancellationToken,
     ) -> CcResult<String> {
         // Each sub-agent gets its own fresh session (isolated transcript).
-        let session = Session::new().map_err(|e| {
+        let session = Arc::new(Session::new().map_err(|e| {
             cc_core::CcError::Other(format!("sub-agent session create failed: {e}"))
-        })?;
+        })?);
 
         // Stable id for this sub-agent lifecycle — referenced by SubagentStart
         // hook results (via `agent_id` in HookInput) so hooks can scope their

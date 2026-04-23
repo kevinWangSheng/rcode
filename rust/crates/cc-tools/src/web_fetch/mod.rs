@@ -20,8 +20,7 @@ use async_trait::async_trait;
 use cc_core::{CcError, CcResult, Summarizer};
 use serde_json::{json, Value};
 
-use crate::{Tool, ToolInputSchema, ToolResult};
-use tokio_util::sync::CancellationToken;
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 const MAX_RESPONSE_BYTES: usize = 1_000_000; // 1 MB
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -81,7 +80,7 @@ impl Tool for WebFetchTool {
         true
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let url = input["url"]
             .as_str()
             .ok_or_else(|| CcError::tool("tool", "missing 'url' field"))?
@@ -137,7 +136,7 @@ impl Tool for WebFetchTool {
                 Ok(r) => r,
                 Err(e) => return Ok(ToolResult::error(format!("WebFetch request failed: {e}"))),
             },
-            _ = cancel.cancelled() => {
+            _ = ctx.cancel.cancelled() => {
                 return Err(CcError::tool("tool", "WebFetch cancelled"));
             }
         };
@@ -157,7 +156,7 @@ impl Tool for WebFetchTool {
                 Ok(b) => b,
                 Err(e) => return Ok(ToolResult::error(format!("WebFetch read failed: {e}"))),
             },
-            _ = cancel.cancelled() => {
+            _ = ctx.cancel.cancelled() => {
                 return Err(CcError::tool("tool", "WebFetch cancelled"));
             }
         };
@@ -187,7 +186,7 @@ impl Tool for WebFetchTool {
         let mut body = cleaned;
         let mut summarize_error: Option<String> = None;
         if let (Some(summarizer), Some(prompt)) = (&self.summarizer, summary_prompt.as_deref()) {
-            match summarizer.summarize(prompt, &body, cancel).await {
+            match summarizer.summarize(prompt, &body, &ctx.cancel).await {
                 Ok(summary) => body = summary,
                 Err(e) => {
                     tracing::warn!("WebFetch summarizer failed: {e}; returning raw body");
@@ -250,6 +249,7 @@ fn strip_html(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn rejects_non_http_urls() {
@@ -277,9 +277,9 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_file_url() {
         let tool = WebFetchTool::new();
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"url": "file:///etc/passwd"}), &cancel)
+            .execute(json!({"url": "file:///etc/passwd"}), &ctx)
             .await
             .unwrap();
         assert!(result.is_error);
@@ -289,8 +289,8 @@ mod tests {
     #[tokio::test]
     async fn execute_missing_url_errors() {
         let tool = WebFetchTool::new();
-        let cancel = CancellationToken::new();
-        let err = tool.execute(json!({}), &cancel).await.unwrap_err();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let err = tool.execute(json!({}), &ctx).await.unwrap_err();
         assert!(err.to_string().contains("url"));
     }
 
@@ -316,16 +316,17 @@ mod tests {
         });
 
         let tool = WebFetchTool::new();
-        let cancel = CancellationToken::new();
-        let cancel2 = cancel.clone();
+        let token = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(token.clone());
+        let token2 = token.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            cancel2.cancel();
+            token2.cancel();
         });
 
         let url = format!("http://127.0.0.1:{port}/hang");
         let start = std::time::Instant::now();
-        let result = tool.execute(json!({"url": url}), &cancel).await;
+        let result = tool.execute(json!({"url": url}), &ctx).await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
         let err = result.unwrap_err();
         let elapsed = start.elapsed();
@@ -348,11 +349,11 @@ mod tests {
         let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
         let tool = WebFetchTool::new();
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(
                 json!({"url": "http://169.254.169.254/latest/meta-data/iam/"}),
-                &cancel,
+                &ctx,
             )
             .await
             .unwrap();
@@ -385,9 +386,9 @@ mod tests {
         });
 
         let tool = WebFetchTool::new();
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let url = format!("http://127.0.0.1:{port}/");
-        let result = tool.execute(json!({"url": url}), &cancel).await.unwrap();
+        let result = tool.execute(json!({"url": url}), &ctx).await.unwrap();
         assert!(result.is_error, "loopback fetch must be refused");
         assert!(
             result.content.contains("refused"),
@@ -409,9 +410,9 @@ mod tests {
         let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
         let tool = WebFetchTool::new();
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"url": "http://10.0.0.1/admin"}), &cancel)
+            .execute(json!({"url": "http://10.0.0.1/admin"}), &ctx)
             .await
             .unwrap();
         assert!(result.is_error);
@@ -423,9 +424,9 @@ mod tests {
         let _lock = crate::web_fetch::ssrf::ENV_LOCK.lock().await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
         let tool = WebFetchTool::new();
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"url": "http://[::1]:8080/"}), &cancel)
+            .execute(json!({"url": "http://[::1]:8080/"}), &ctx)
             .await
             .unwrap();
         assert!(result.is_error);
@@ -499,9 +500,9 @@ mod tests {
 
         let (port, handle) = serve_once("raw server body").await;
         let url = format!("http://127.0.0.1:{port}/doc");
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"url": url, "prompt": "be brief"}), &cancel)
+            .execute(json!({"url": url, "prompt": "be brief"}), &ctx)
             .await
             .unwrap();
         let _ = handle.await;
@@ -539,8 +540,8 @@ mod tests {
 
         let (port, handle) = serve_once("plain body").await;
         let url = format!("http://127.0.0.1:{port}/doc");
-        let cancel = CancellationToken::new();
-        let result = tool.execute(json!({"url": url}), &cancel).await.unwrap();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let result = tool.execute(json!({"url": url}), &ctx).await.unwrap();
         let _ = handle.await;
         std::env::remove_var("CC_WEBFETCH_ALLOW_PRIVATE");
 
@@ -571,9 +572,9 @@ mod tests {
 
         let (port, handle) = serve_once("plain body").await;
         let url = format!("http://127.0.0.1:{port}/doc");
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"url": url, "prompt": "   "}), &cancel)
+            .execute(json!({"url": url, "prompt": "   "}), &ctx)
             .await
             .unwrap();
         let _ = handle.await;
@@ -602,9 +603,9 @@ mod tests {
 
         let (port, handle) = serve_once("fallback body").await;
         let url = format!("http://127.0.0.1:{port}/doc");
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"url": url, "prompt": "be brief"}), &cancel)
+            .execute(json!({"url": url, "prompt": "be brief"}), &ctx)
             .await
             .unwrap();
         let _ = handle.await;
@@ -637,9 +638,9 @@ mod tests {
         let tool = WebFetchTool::new();
         let (port, handle) = serve_once("unchanged").await;
         let url = format!("http://127.0.0.1:{port}/doc");
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"url": url, "prompt": "ignored"}), &cancel)
+            .execute(json!({"url": url, "prompt": "ignored"}), &ctx)
             .await
             .unwrap();
         let _ = handle.await;

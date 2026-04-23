@@ -3,9 +3,8 @@
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct ExitPlanModeTool;
 
@@ -29,7 +28,7 @@ impl Tool for ExitPlanModeTool {
         .unwrap()
     }
 
-    async fn execute(&self, _input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         Ok(ToolResult::ok(
             "Exited plan mode. You are now in implementation mode. \
              Proceed with writing code to implement the designed solution.",
@@ -46,7 +45,10 @@ mod tests {
     async fn exits_plan_mode() {
         let tool = ExitPlanModeTool;
         let r = tool
-            .execute(json!({}), &CancellationToken::new())
+            .execute(
+                json!({}),
+                &ToolContext::for_test_bare(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);

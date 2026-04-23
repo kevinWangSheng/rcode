@@ -10,9 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cc_core::CcResult;
 use serde_json::{json, Value};
-use tokio_util::sync::CancellationToken;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 /// A simplified view of a registered tool for search purposes.
 pub struct ToolEntry {
@@ -67,7 +66,7 @@ impl Tool for ToolSearchTool {
         .unwrap()
     }
 
-    async fn execute(&self, input: Value, _cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
         let query = match input.get("query").and_then(Value::as_str) {
             Some(q) => q.to_string(),
             None => return Ok(ToolResult::error("missing required field: query")),
@@ -178,6 +177,7 @@ impl Tool for ToolSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
 
     fn make_tool(entries: Vec<ToolEntry>) -> ToolSearchTool {
         ToolSearchTool {
@@ -220,7 +220,7 @@ mod tests {
         let r = tool
             .execute(
                 json!({"query": "select:Read,Write"}),
-                &CancellationToken::new(),
+                &ToolContext::for_test_bare(CancellationToken::new()),
             )
             .await
             .unwrap();
@@ -235,7 +235,10 @@ mod tests {
     async fn keyword_search() {
         let tool = make_tool(sample_tools());
         let r = tool
-            .execute(json!({"query": "file"}), &CancellationToken::new())
+            .execute(
+                json!({"query": "file"}),
+                &ToolContext::for_test_bare(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert!(!r.is_error);
@@ -249,7 +252,7 @@ mod tests {
         let r = tool
             .execute(
                 json!({"query": "nonexistent_xyz"}),
-                &CancellationToken::new(),
+                &ToolContext::for_test_bare(CancellationToken::new()),
             )
             .await
             .unwrap();
@@ -261,7 +264,10 @@ mod tests {
     async fn not_wired_returns_error() {
         let tool = ToolSearchTool { list_tools: None };
         let r = tool
-            .execute(json!({"query": "read"}), &CancellationToken::new())
+            .execute(
+                json!({"query": "read"}),
+                &ToolContext::for_test_bare(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert!(r.is_error);

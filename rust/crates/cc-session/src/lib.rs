@@ -1,7 +1,6 @@
 use cc_core::{CcError, CcResult, ContentBlock, MessageContent, MessageParam, Role};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -27,8 +26,7 @@ pub const INTERRUPT_MESSAGE: &str = "[Request interrupted by user]";
 
 /// Literal marking an interrupt that happened while a tool_use was in
 /// flight. Matches TS `src/utils/messages.ts::INTERRUPT_MESSAGE_FOR_TOOL_USE`.
-pub const INTERRUPT_MESSAGE_FOR_TOOL_USE: &str =
-    "[Request interrupted by user for tool use]";
+pub const INTERRUPT_MESSAGE_FOR_TOOL_USE: &str = "[Request interrupted by user for tool use]";
 
 /// Abstracts `File::sync_all` so the fsync step of an append can be
 /// observed in tests.
@@ -88,47 +86,15 @@ impl PartialEq for TranscriptEntry {
 
 // ── FileHistorySnapshot (parity with TS src/utils/fileHistory.ts:33-52)
 //
-// TS writes one `file-history-snapshot` JSONL entry per edit so the
-// edited-file backup map is recoverable on resume (used by /undo, /diff,
-// and the Edit tool's `originalFile` reference). We mirror the TS wire
-// shape exactly — camelCase field names, same field set — so a Rust-written
-// transcript is a drop-in replacement for a TS-written one and vice versa.
+// The wire types live in `cc-core::file_history` so
+// `cc_core::SessionSink` — which is the bridge tool code uses to reach
+// the session — can reference them without creating a cc-core ↔
+// cc-session dep cycle. Re-exported here so external callers (and tests
+// inside this crate) keep their historical import paths.
 
-/// One backup entry for a tracked file. A `backup_file_name` of `None`
-/// represents "the file did not exist at this version" (parity with TS
-/// `BackupFileName = string | null`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FileHistoryBackup {
-    pub backup_file_name: Option<String>,
-    pub version: u32,
-    /// ISO-8601 timestamp (TS persists `Date` as an ISO string).
-    pub backup_time: String,
-}
-
-/// Per-message snapshot of every file Claude touched up to that turn.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FileHistorySnapshot {
-    /// UUID of the message this snapshot belongs to.
-    pub message_id: String,
-    /// Map of absolute file path → backup slot.
-    pub tracked_file_backups: BTreeMap<String, FileHistoryBackup>,
-    /// ISO-8601 timestamp.
-    pub timestamp: String,
-}
-
-/// JSONL wrapper around a `FileHistorySnapshot`. This is what ends up on
-/// disk as one `{"type":"file-history-snapshot", ...}` line.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FileHistorySnapshotMessage {
-    pub message_id: String,
-    pub snapshot: FileHistorySnapshot,
-    /// `true` when this snapshot refines an earlier one for the same
-    /// message (matches TS `isSnapshotUpdate`).
-    pub is_snapshot_update: bool,
-}
+pub use cc_core::file_history::{
+    FileHistoryBackup, FileHistorySnapshot, FileHistorySnapshotMessage,
+};
 
 /// Meta entries written to the JSONL transcript alongside message turns.
 ///
@@ -229,7 +195,11 @@ pub enum MetaEntry {
         surface: String,
         #[serde(rename = "fileStates")]
         file_states: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none", rename = "promptCount")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "promptCount"
+        )]
         prompt_count: Option<u64>,
         #[serde(
             default,
@@ -249,7 +219,11 @@ pub enum MetaEntry {
             rename = "permissionPromptCountAtLastCommit"
         )]
         permission_prompt_count_at_last_commit: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none", rename = "escapeCount")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "escapeCount"
+        )]
         escape_count: Option<u64>,
         #[serde(
             default,
@@ -628,6 +602,25 @@ impl Session {
     }
 }
 
+/// Bridge impl so tool code holding an `Arc<dyn cc_core::SessionSink>`
+/// can drive the same append paths as direct `Session` callers. Kept in
+/// the same crate as `Session` so the two stay in sync; the methods
+/// delegate to the inherent `append_interrupt_marker` /
+/// `append_file_history_snapshot` implementations above.
+impl cc_core::SessionSink for Session {
+    fn append_interrupt_marker(&self, for_tool_use: bool) -> CcResult<()> {
+        Session::append_interrupt_marker(self, for_tool_use)
+    }
+
+    fn append_file_history_snapshot(
+        &self,
+        snapshot: &FileHistorySnapshot,
+        is_update: bool,
+    ) -> CcResult<()> {
+        Session::append_file_history_snapshot(self, snapshot, is_update)
+    }
+}
+
 fn sessions_root() -> CcResult<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| CcError::io("could not determine home directory for session storage"))?;
@@ -874,6 +867,7 @@ pub fn list_sessions() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -1294,7 +1288,10 @@ mod tests {
         });
         let line = serde_json::to_string(&entry).unwrap();
         let parsed: SessionEntry = serde_json::from_str(&line).unwrap();
-        assert_eq!(entry, parsed, "FileHistorySnapshot must survive a roundtrip");
+        assert_eq!(
+            entry, parsed,
+            "FileHistorySnapshot must survive a roundtrip"
+        );
         // And it deserialises into the right variant rather than Unknown.
         assert!(matches!(
             parsed,
@@ -1306,7 +1303,10 @@ mod tests {
     fn meta_entry_summary_roundtrip() {
         let line = r#"{"type":"summary","leafUuid":"u","summary":"did a thing"}"#;
         let entry: SessionEntry = serde_json::from_str(line).unwrap();
-        assert!(matches!(entry, SessionEntry::Meta(MetaEntry::Summary { .. })));
+        assert!(matches!(
+            entry,
+            SessionEntry::Meta(MetaEntry::Summary { .. })
+        ));
     }
 
     #[test]
@@ -1317,7 +1317,10 @@ mod tests {
 
         let wt_line = r#"{"type":"worktree-state","sessionId":"s","worktreeSession":{"originalCwd":"/x","worktreePath":"/y","worktreeName":"n","sessionId":"s"}}"#;
         let wt: SessionEntry = serde_json::from_str(wt_line).unwrap();
-        assert!(matches!(wt, SessionEntry::Meta(MetaEntry::WorktreeState { .. })));
+        assert!(matches!(
+            wt,
+            SessionEntry::Meta(MetaEntry::WorktreeState { .. })
+        ));
     }
 
     #[test]
@@ -1350,8 +1353,14 @@ mod tests {
         let entry: SessionEntry = serde_json::from_str(line).unwrap();
         match &entry {
             SessionEntry::Unknown(value) => {
-                assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("marble-origami-commit"));
-                assert_eq!(value.get("collapseId").and_then(|v| v.as_str()), Some("1234567890123456"));
+                assert_eq!(
+                    value.get("type").and_then(|v| v.as_str()),
+                    Some("marble-origami-commit")
+                );
+                assert_eq!(
+                    value.get("collapseId").and_then(|v| v.as_str()),
+                    Some("1234567890123456")
+                );
             }
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -1361,7 +1370,8 @@ mod tests {
     /// `SessionEntry::Message` — `TranscriptEntry` is tried first.
     #[test]
     fn message_entry_back_compat() {
-        let line = r#"{"message":{"role":"user","content":"hi"},"timestamp":"2026-04-23T00:00:00Z"}"#;
+        let line =
+            r#"{"message":{"role":"user","content":"hi"},"timestamp":"2026-04-23T00:00:00Z"}"#;
         let entry: SessionEntry = serde_json::from_str(line).unwrap();
         assert!(matches!(entry, SessionEntry::Message(_)));
     }
@@ -1484,9 +1494,7 @@ mod tests {
             .append_file_history_snapshot(&snap_a, false)
             .unwrap();
         session.append(&MessageParam::assistant("ok")).unwrap();
-        session
-            .append_file_history_snapshot(&snap_b, true)
-            .unwrap();
+        session.append_file_history_snapshot(&snap_b, true).unwrap();
 
         let snapshots = session.file_history_snapshots().unwrap();
         assert_eq!(snapshots.len(), 2, "two snapshots in write order");

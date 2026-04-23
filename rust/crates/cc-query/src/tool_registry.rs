@@ -81,9 +81,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use cc_core::{CcResult, ToolInputSchema};
-    use cc_tools::ToolResult;
+    use cc_tools::{ToolContext, ToolResult};
     use serde_json::Value;
-    use tokio_util::sync::CancellationToken;
 
     struct DummyTool {
         tool_name: String,
@@ -109,11 +108,7 @@ mod tests {
         fn is_read_only(&self) -> bool {
             self.read_only
         }
-        async fn execute(
-            &self,
-            _input: Value,
-            _cancel: &CancellationToken,
-        ) -> CcResult<ToolResult> {
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> CcResult<ToolResult> {
             Ok(ToolResult::ok("ok"))
         }
     }

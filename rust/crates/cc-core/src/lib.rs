@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod error;
+pub mod file_history;
 pub mod hook;
 pub mod message;
 pub mod model;
@@ -11,6 +12,7 @@ pub mod tool;
 
 pub use agent::SubAgentRunner;
 pub use error::{CcError, CcResult};
+pub use file_history::*;
 pub use hook::*;
 pub use message::*;
 pub use model::*;

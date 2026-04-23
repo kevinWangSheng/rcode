@@ -3,8 +3,7 @@ use cc_core::CcResult;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use crate::{Tool, ToolInputSchema, ToolResult};
-use tokio_util::sync::CancellationToken;
+use crate::{Tool, ToolContext, ToolInputSchema, ToolResult};
 
 pub struct BashTool;
 
@@ -70,7 +69,7 @@ impl Tool for BashTool {
         false
     }
 
-    async fn execute(&self, input: Value, cancel: &CancellationToken) -> CcResult<ToolResult> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let command = input["command"]
             .as_str()
             .ok_or_else(|| cc_core::CcError::tool("tool", "missing 'command' field"))?
@@ -164,7 +163,7 @@ impl Tool for BashTool {
                 // asynchronous and only reaps the shell, which leaves
                 // grandchild commands (e.g. `sleep 30`) orphaned and alive,
                 // breaking "the next bash sees a clean slate".
-                _ = cancel.cancelled() => {
+                _ = ctx.cancel.cancelled() => {
                     kill_process_group(child_pid);
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -218,9 +217,9 @@ mod tests {
     #[tokio::test]
     async fn bash_echo() {
         let tool = BashTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"command": "echo hello"}), &cancel)
+            .execute(json!({"command": "echo hello"}), &ctx)
             .await
             .unwrap();
         assert!(!result.is_error);
@@ -230,9 +229,9 @@ mod tests {
     #[tokio::test]
     async fn bash_nonzero_exit_includes_code_no_is_error() {
         let tool = BashTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"command": "exit 42"}), &cancel)
+            .execute(json!({"command": "exit 42"}), &ctx)
             .await
             .unwrap();
         // Per behavior contract: no is_error for bash failures
@@ -243,9 +242,9 @@ mod tests {
     #[tokio::test]
     async fn bash_stderr_included_on_failure() {
         let tool = BashTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"command": "echo err >&2 && exit 1"}), &cancel)
+            .execute(json!({"command": "echo err >&2 && exit 1"}), &ctx)
             .await
             .unwrap();
         assert!(result.content.contains("STDERR:"));
@@ -255,8 +254,8 @@ mod tests {
     #[tokio::test]
     async fn bash_missing_command_errors() {
         let tool = BashTool;
-        let cancel = CancellationToken::new();
-        let result = tool.execute(json!({}), &cancel).await;
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let result = tool.execute(json!({}), &ctx).await;
         assert!(result.is_err());
     }
 
@@ -270,9 +269,9 @@ mod tests {
         // Regression: successful commands that write to both streams (cargo,
         // make, etc.) used to drop stderr. Both must be surfaced now.
         let tool = BashTool;
-        let cancel = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
-            .execute(json!({"command": "echo out && echo err >&2"}), &cancel)
+            .execute(json!({"command": "echo out && echo err >&2"}), &ctx)
             .await
             .unwrap();
         assert!(
@@ -312,12 +311,13 @@ mod tests {
         let pidfile_str = pidfile.to_string_lossy().to_string();
 
         let tool = BashTool;
-        let cancel = CancellationToken::new();
-        let cancel2 = cancel.clone();
+        let token = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(token.clone());
+        let token2 = token.clone();
         tokio::spawn(async move {
             // Give bash time to launch sleep and write the pid.
             tokio::time::sleep(Duration::from_millis(250)).await;
-            cancel2.cancel();
+            token2.cancel();
         });
 
         // `sleep 30 &` backgrounds the sleep; `$!` is the backgrounded
@@ -327,7 +327,7 @@ mod tests {
         // leaves the `sleep 30` orphaned and still running — which is
         // what this test guards against.
         let command = format!("sleep 30 & echo $! > {pidfile_str} && wait $!");
-        let result = tool.execute(json!({"command": command}), &cancel).await;
+        let result = tool.execute(json!({"command": command}), &ctx).await;
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
 
         let pid_str = std::fs::read_to_string(&pidfile).unwrap_or_default();
@@ -363,14 +363,15 @@ mod tests {
     async fn bash_honors_cancel_token() {
         use std::time::Duration;
         let tool = BashTool;
-        let cancel = CancellationToken::new();
-        let cancel2 = cancel.clone();
+        let token = CancellationToken::new();
+        let ctx = ToolContext::for_test_bare(token.clone());
+        let token2 = token.clone();
         // Cancel after 100ms, while the command is still sleeping.
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            cancel2.cancel();
+            token2.cancel();
         });
-        let result = tool.execute(json!({"command": "sleep 5"}), &cancel).await;
+        let result = tool.execute(json!({"command": "sleep 5"}), &ctx).await;
         // Cancelled before the 5s sleep finishes.
         assert!(result.is_err(), "expected cancel error, got {:?}", result);
         assert!(result.unwrap_err().to_string().contains("cancelled"));
