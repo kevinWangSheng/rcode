@@ -86,8 +86,14 @@ pub enum AppAction {
     /// Adjust the highlighted row. Positive = down, negative = up.
     PaletteMove(i32),
     /// Replace the input with the highlighted command + trailing space and
-    /// return to normal input mode. Equivalent to Tab / Enter.
+    /// return to normal input mode. Bound to Tab — leaves the buffer
+    /// in place so the user can keep editing before submitting.
     PaletteAccept,
+    /// Same completion as `PaletteAccept`, then immediately fires
+    /// Submit so the chosen command runs. Bound to Enter — matches the
+    /// TS CLI which treats Enter on a highlighted palette match as
+    /// "run this".
+    PaletteAcceptAndSubmit,
     /// Dismiss the palette and restore the snapshotted buffer byte-for-byte.
     PaletteCancel,
 
@@ -581,6 +587,17 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             let cur = app.palette_selected as i32;
             let next = (cur + delta).rem_euclid(n as i32);
             app.palette_selected = next as usize;
+        }
+        AppAction::PaletteAcceptAndSubmit => {
+            if app.mode != AppMode::CommandPalette {
+                return UpdateResult::Continue;
+            }
+            let _ = update(app, AppAction::PaletteAccept, ctx);
+            // After a Commands accept the buffer is `/foo ` and the
+            // user expects "run it now" semantics on Enter. After a
+            // Files accept the buffer is mid-prose with `@path` spliced
+            // in — submitting it as a message is also the right move.
+            return update(app, AppAction::Submit, ctx);
         }
         AppAction::PaletteAccept => {
             if app.mode != AppMode::CommandPalette {

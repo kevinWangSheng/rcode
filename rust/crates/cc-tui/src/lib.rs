@@ -410,8 +410,20 @@ fn map_key_event(
     use crossterm::event::{KeyCode, KeyModifiers};
     use keybindings::Action;
 
-    // Check global keybindings first
+    // Check global keybindings first.
+    //
+    // Submit (Enter by default) is special-cased: while the slash /
+    // file palette is open it MUST route to PaletteAccept so the
+    // selected entry replaces the buffer, otherwise Enter shortcuts
+    // the global match here and submits the half-typed `/co` filter
+    // as a literal slash command (reported 2026-04-23: selecting
+    // `/context` then Enter produced `unknown command: /co`).
     if let Some(action) = kb.match_action(key) {
+        if matches!(action, Action::Submit) && app.mode == AppMode::CommandPalette {
+            // Enter on a palette match: complete AND run. Tab below
+            // covers complete-only.
+            return Some(AppAction::PaletteAcceptAndSubmit);
+        }
         return match action {
             Action::Quit => Some(AppAction::Quit),
             Action::Abort => {
@@ -431,7 +443,11 @@ fn map_key_event(
     match app.mode {
         AppMode::CommandPalette => match key.code {
             KeyCode::Esc => Some(AppAction::PaletteCancel),
-            KeyCode::Tab | KeyCode::Enter => Some(AppAction::PaletteAccept),
+            // Tab = complete only (leave buffer for further editing).
+            // Enter is handled above via the global Submit binding +
+            // PaletteAcceptAndSubmit so Enter behaves like "run".
+            KeyCode::Tab => Some(AppAction::PaletteAccept),
+            KeyCode::Enter => Some(AppAction::PaletteAcceptAndSubmit),
             KeyCode::Up => Some(AppAction::PaletteMove(-1)),
             KeyCode::Down => Some(AppAction::PaletteMove(1)),
             KeyCode::Left => Some(AppAction::CursorMove(-1)),
