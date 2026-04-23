@@ -979,6 +979,315 @@ fn acv5_palette_esc_restores_original_buffer() {
     );
 }
 
+// ── fix-tui-palette-stale-after-submit: palette closes on any Submit ─────────
+
+/// Helper: open palette, set filter to `cmd`, then Submit.
+fn submit_from_palette(app: &mut App, uctx: &UpdateContext, cmd: &str) -> UpdateResult {
+    update(app, AppAction::PaletteOpen, uctx);
+    for c in cmd.chars() {
+        update(app, AppAction::InsertChar(c), uctx);
+    }
+    update(app, AppAction::Submit, uctx)
+}
+
+fn assert_palette_closed(app: &App) {
+    assert_eq!(app.mode, AppMode::Input, "mode must return to Input");
+    assert!(
+        app.palette_matches.is_empty(),
+        "palette_matches must be cleared: {:?}",
+        app.palette_matches
+    );
+    assert_eq!(
+        app.palette_selected, 0,
+        "palette_selected must reset to 0"
+    );
+    assert!(
+        app.palette_original.is_none(),
+        "palette_original must be cleared"
+    );
+}
+
+#[test]
+fn palette_closes_after_info_command() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+
+    submit_from_palette(&mut app, &uctx, "help");
+    assert_palette_closed(&app);
+}
+
+#[test]
+fn palette_closes_after_clear_command() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+    // Seed a transcript item so we can observe /clear wiping it.
+    app.push_user("hi".into());
+
+    submit_from_palette(&mut app, &uctx, "clear");
+    assert_palette_closed(&app);
+    // /clear empties transcript and pushes a SystemNotice.
+    match app.transcript.last() {
+        Some(TranscriptItem::SystemNotice(m)) => assert!(m.contains("cleared")),
+        other => panic!("expected SystemNotice after /clear, got {other:?}"),
+    }
+}
+
+#[test]
+fn palette_closes_after_compact_command() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+
+    submit_from_palette(&mut app, &uctx, "compact");
+    assert_palette_closed(&app);
+    assert!(
+        matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::CompactBoundary)
+        ),
+        "compact must push a CompactBoundary"
+    );
+}
+
+#[test]
+fn palette_closes_after_switch_model() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+
+    submit_from_palette(&mut app, &uctx, "model gpt-4");
+    assert_palette_closed(&app);
+    assert_eq!(app.status.model, "gpt-4");
+}
+
+#[test]
+fn palette_closes_after_unknown_command() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+
+    submit_from_palette(&mut app, &uctx, "doesnotexist");
+    assert_palette_closed(&app);
+    assert!(
+        matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::SystemNotice(m)) if m.contains("unknown command")
+        ),
+        "unknown command must push a SystemNotice; got {:?}",
+        app.transcript.last()
+    );
+}
+
+/// No-regression guard: user messages still flip to Streaming even though the
+/// Submit path now closes the palette by default. `SubmitUserMessage` calls
+/// `start_stream()` after `close_palette`, so Streaming wins.
+#[test]
+fn user_message_still_enters_streaming() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+    for c in "hello".chars() {
+        update(&mut app, AppAction::InsertChar(c), &uctx);
+    }
+    let result = update(&mut app, AppAction::Submit, &uctx);
+    assert!(matches!(result, UpdateResult::SubmitToEngine(ref t) if t == "hello"));
+    assert_eq!(app.mode, AppMode::Streaming);
+}
+
+// ── fix-tui-input-horizontal-scroll: viewport keeps caret visible ────────────
+
+/// Helper: render `app` to an 80x24 TestBackend and return (caret_x,
+/// caret_y, row_at_input_line). Input row on 80x24 is y=20 (transcript
+/// 18 + spinner 1 + input top border → content at 19+1=20).
+fn render_and_probe(
+    app: &App,
+    w: u16,
+    h: u16,
+) -> (u16, u16, String) {
+    use cc_tui::render;
+    use ratatui::backend::{Backend, TestBackend};
+    use ratatui::Terminal;
+
+    let backend = TestBackend::new(w, h);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render::render(f, app)).unwrap();
+    let pos = term.backend_mut().get_cursor_position().unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut row = String::new();
+    for x in 0..buf.area.width {
+        row.push_str(buf[(x, pos.y)].symbol());
+    }
+    (pos.x, pos.y, row)
+}
+
+/// Typing past the right edge keeps the caret visible AND shows the most
+/// recently typed character in the rendered row. Pre-fix: the `Paragraph`
+/// truncated at 76 cells so anything past the window disappeared.
+#[test]
+fn typing_past_width_keeps_caret_visible() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+    for _ in 0..200 {
+        update(&mut app, AppAction::InsertChar('x'), &uctx);
+    }
+    let (caret_x, _caret_y, row) = render_and_probe(&app, 80, 24);
+    // inner_right_edge for an 80-col frame: border at x=79, so caret must
+    // land strictly inside x ≤ 78.
+    assert!(
+        caret_x < 79,
+        "caret escaped right border at x={caret_x}: {row}"
+    );
+    // Last char typed must be visible somewhere in the input row.
+    assert!(row.contains('x'), "no 'x' rendered in input row: {row}");
+}
+
+/// Home resets the viewport offset to 0 so the first char of the buffer
+/// is visible and the caret lands at the gutter (col 3 on an 80-col
+/// frame: border 1 + gutter 2).
+#[test]
+fn home_resets_viewport() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+    for _ in 0..200 {
+        update(&mut app, AppAction::InsertChar('x'), &uctx);
+    }
+    update(&mut app, AppAction::CursorHome, &uctx);
+    let (caret_x, _caret_y, row) = render_and_probe(&app, 80, 24);
+    assert_eq!(caret_x, 3, "Home caret not at gutter: {row}");
+    // First 'x' of the buffer sits at col 3 (same as caret). Index by
+    // char (not byte), since the border `│` glyph takes 3 UTF-8 bytes.
+    assert_eq!(
+        row.chars().nth(3),
+        Some('x'),
+        "first 'x' missing at col 3: {row}"
+    );
+}
+
+/// End scrolls the viewport so the tail is visible. Caret lands just
+/// inside the right edge (col 77 or 78 on 80 cols).
+#[test]
+fn end_scrolls_to_tail() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+    // Unique tail char so we can locate it in the row.
+    for _ in 0..199 {
+        update(&mut app, AppAction::InsertChar('x'), &uctx);
+    }
+    update(&mut app, AppAction::InsertChar('Z'), &uctx);
+    update(&mut app, AppAction::CursorHome, &uctx);
+    update(&mut app, AppAction::CursorEnd, &uctx);
+    let (caret_x, _caret_y, row) = render_and_probe(&app, 80, 24);
+    assert!(
+        (77..=78).contains(&caret_x),
+        "End caret at unexpected col {caret_x}: {row}"
+    );
+    assert!(row.contains('Z'), "tail 'Z' missing from row: {row}");
+}
+
+/// From End on a 100-char buffer, each Left press moves the rendered
+/// caret column by at least one cell. Pre-fix: the caret stuck at col 78
+/// (the clamp) so ~25 Left presses produced zero visual movement.
+#[test]
+fn left_moves_caret_every_press() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+    for _ in 0..100 {
+        update(&mut app, AppAction::InsertChar('x'), &uctx);
+    }
+    let (initial_x, _, _) = render_and_probe(&app, 80, 24);
+    let mut last = initial_x;
+    for i in 0..26 {
+        update(&mut app, AppAction::CursorMove(-1), &uctx);
+        let (x, _, row) = render_and_probe(&app, 80, 24);
+        assert!(
+            x < last,
+            "Left press #{i} did not move caret (was {last}, still {x}): {row}"
+        );
+        last = x;
+    }
+}
+
+/// CJK at the right edge: the caret must land on a cell boundary and the
+/// rightmost visible glyph must render fully (both halves present, no
+/// partial 2-cell glyph chopped by the slice).
+#[test]
+fn cjk_caret_on_cell_boundary() {
+    let (reg, ctx) = test_ctx();
+    let uctx = UpdateContext {
+        commands: &reg,
+        command_ctx: &ctx,
+    };
+    let mut app = App::new("s".into(), "m".into());
+    // "你好" × 50 = 100 CJK chars, 200 display cells. Well past an 80-col
+    // inner width (76 cells).
+    for _ in 0..50 {
+        update(&mut app, AppAction::InsertChar('你'), &uctx);
+        update(&mut app, AppAction::InsertChar('好'), &uctx);
+    }
+    update(&mut app, AppAction::CursorEnd, &uctx);
+    let (caret_x, _, row) = render_and_probe(&app, 80, 24);
+    // Caret sits just past the last glyph at the right edge.
+    assert!(
+        (77..=78).contains(&caret_x),
+        "caret at unexpected col {caret_x} for CJK buffer end: {row}"
+    );
+    // The last CJK char must be visible. Locate it by searching backwards
+    // for `好` in the rendered row.
+    assert!(row.contains('好'), "last '好' missing from row: {row}");
+    // The rightmost CJK glyph occupies two adjacent cells. Find it: the
+    // last non-blank, non-border char should be part of a 2-cell glyph.
+    // Precise check: the cell at (caret_x - 1) must NOT be a half-rendered
+    // half-glyph. Ratatui's TestBackend fills the continuation cell of a
+    // wide glyph with an empty string; asserting the char at caret_x - 2
+    // is a CJK glyph and the cell at caret_x - 1 exists is enough.
+    let chars: Vec<char> = row.chars().collect();
+    let left_of_caret = chars[(caret_x as usize).saturating_sub(2)];
+    assert!(
+        is_cjk(left_of_caret),
+        "expected CJK glyph just left of caret, got {left_of_caret:?} in row: {row}"
+    );
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}')
+}
+
 // ── M5 AC-V6: CC_TUI_MINIMAL opt-out ─────────────────────────────────────────
 
 /// AC-V6: with CC_TUI_MINIMAL=1 set, an assistant message containing markdown

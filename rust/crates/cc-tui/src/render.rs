@@ -509,7 +509,17 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         AppMode::PermissionPrompt => theme.permission_blue,
     };
 
-    // Inner content: gutter glyph + buffer (or placeholder when idle/empty).
+    let gutter_cells: u16 = 2; // "> "
+    // Content cells available for the buffer: total - 2 borders - gutter.
+    let inner_width = area.width.saturating_sub(2).saturating_sub(gutter_cells);
+
+    // Reflow the viewport offset so the caret stays inside the window
+    // before we slice. Uses interior mutability so we can call this from
+    // `&App` render code.
+    app.reflow_input_viewport(inner_width);
+    let offset = app.input_view_offset.get();
+
+    // Inner content: gutter glyph + (sliced buffer or placeholder).
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
     spans.push(Span::styled(
         "> ".to_string(),
@@ -525,10 +535,28 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 .add_modifier(Modifier::ITALIC),
         ));
     } else {
-        spans.push(Span::styled(
-            app.input.clone(),
-            Style::default().fg(theme.text),
-        ));
+        // Slice the buffer by display cells starting at `offset`. Walk
+        // chars skipping until we've passed `offset` cells, then emit up
+        // to `inner_width` cells of content. This keeps long buffers
+        // from truncating silently past the right edge.
+        let mut shown = String::new();
+        let mut cum = 0usize;
+        let mut emitted = 0usize;
+        let inner = inner_width as usize;
+        for ch in app.input.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cum < offset {
+                cum += w;
+                continue;
+            }
+            if emitted + w > inner {
+                break;
+            }
+            shown.push(ch);
+            emitted += w;
+            cum += w;
+        }
+        spans.push(Span::styled(shown, Style::default().fg(theme.text)));
     }
 
     let para = Paragraph::new(Line::from(spans)).block(
@@ -543,30 +571,19 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // Hide the caret while a permission prompt is up — keystrokes there
     // map to the y/a/n shortcut, not free text — but show it everywhere
     // else (Input, CommandPalette, even Streaming where the user can
-    // queue follow-up input). Without this the input box looks dead and
-    // the user can't tell where typing will land.
+    // queue follow-up input).
     //
-    // Cursor sits one row down from the top border, after `> ` gutter +
-    // already-typed text. We measure with `UnicodeWidthStr` so CJK /
-    // emoji land at the right cell. Clamp to area's right edge so a
-    // very long buffer never points outside the box (the visible text
-    // inside the box is already truncated at the border by Paragraph).
+    // Caret display col = `caret_col - offset` (relative to the visible
+    // window). The outer clamp stays as a safety net but should not
+    // normally fire because reflow keeps the caret inside the window.
     if !matches!(app.mode, AppMode::PermissionPrompt) {
-        // Width of the text PRECEDING the caret, not the whole buffer —
-        // otherwise Left/Home would visually move the caret to the same
-        // end-of-text column as the "typing at the end" case. The
-        // `input_cursor` field on `App` tracks the byte offset; slicing
-        // at that offset is safe because the offset is maintained on a
-        // UTF-8 char boundary by every edit helper.
-        let cursor_offset = app.input_cursor.min(app.input.len());
-        let before_caret = &app.input[..cursor_offset];
-        let prefix_width = UnicodeWidthStr::width(before_caret) as u16;
-        let gutter_cells: u16 = 2; // "> "
+        let caret_col = app.input_caret_display_col();
+        let rel = caret_col.saturating_sub(offset) as u16;
         let cursor_x = area
             .x
             .saturating_add(1) // step past left border
             .saturating_add(gutter_cells)
-            .saturating_add(prefix_width)
+            .saturating_add(rel)
             .min(area.x.saturating_add(area.width).saturating_sub(2));
         let cursor_y = area.y.saturating_add(1); // step past top border
         frame.set_cursor_position((cursor_x, cursor_y));
@@ -1187,6 +1204,37 @@ mod tests {
         let s = render_to_string(&app, 80, 24);
         assert!(s.contains("Permission required"));
         assert!(s.contains("Write"));
+    }
+
+    /// fix-tui-help-wrap-indent: when the `/help` notice is rendered on
+    /// an 80-col terminal, no non-blank row of the notice must start at
+    /// column 0 — the reader's eye needs a leading indent for the
+    /// continuation to read as "still inside the help block". This
+    /// pins the behaviour introduced by the `format_entry` two-line
+    /// form plus `push_system_notice`'s 3-space continuation prefix.
+    #[test]
+    fn help_notice_no_zero_indent_continuation() {
+        use crate::commands::CommandRegistry;
+        let mut app = App::new("s".into(), "m".into());
+        let reg = CommandRegistry::empty();
+        app.push_system(reg.help_text());
+        // 80×30: transcript area is rows 0..25 (chrome = spinner+input+footer+status = 5).
+        let s = render_to_string(&app, 80, 30);
+        let all = rows(&s);
+        let transcript = &all[..all.len().saturating_sub(6)];
+        for (i, row) in transcript.iter().enumerate() {
+            let body = row.trim_end_matches('\n');
+            if body.trim().is_empty() {
+                continue;
+            }
+            // Every populated transcript row in the notice starts with
+            // notice prefix or command-entry indent. The failure mode we
+            // guard against is the wrap tail landing at col 0.
+            assert!(
+                body.starts_with(' '),
+                "transcript row {i} begins at col 0: {body:?}\nfull frame:\n{s}"
+            );
+        }
     }
 
     #[test]

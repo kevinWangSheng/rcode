@@ -1,6 +1,7 @@
 //! TUI application state — extracted from rendering and async runtime so it can
 //! be unit-tested headlessly.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Instant;
@@ -9,6 +10,7 @@ use cc_core::PromptDecision;
 use ratatui::text::Line;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::keybindings::Keybindings;
 
@@ -247,6 +249,12 @@ pub struct App {
     /// actions in `action.rs`; reset to `input.len()` whenever `input`
     /// is replaced wholesale (Submit, NewLine, palette accept/cancel).
     pub input_cursor: usize,
+    /// Horizontal view offset (in display cells) into `input`, used by
+    /// `render_input` to scroll wide buffers so the caret stays visible.
+    /// Always lands on a char-boundary cell — never in the middle of a
+    /// CJK / emoji glyph. `Cell` because render takes `&App` but needs
+    /// to update the offset as the caret moves.
+    pub input_view_offset: Cell<usize>,
 }
 
 impl App {
@@ -280,6 +288,7 @@ impl App {
             emitted_to_scrollback: 0,
             welcome_banner: None,
             input_cursor: 0,
+            input_view_offset: Cell::new(0),
         }
     }
 
@@ -559,10 +568,73 @@ impl App {
         self.input_cursor = self.input.len();
     }
 
-    /// Clear the input buffer and reset the caret to 0.
+    /// Clear the input buffer and reset the caret + viewport to 0.
     pub fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.input_view_offset.set(0);
+    }
+
+    /// Display-cell column of the caret inside the logical buffer. CJK
+    /// ideographs and emoji contribute their full terminal-cell width so
+    /// the offset math stays on cell boundaries.
+    pub fn input_caret_display_col(&self) -> usize {
+        let cursor = self.input_cursor.min(self.input.len());
+        UnicodeWidthStr::width(&self.input[..cursor])
+    }
+
+    /// Total display width of the buffer in terminal cells.
+    pub fn input_display_width(&self) -> usize {
+        UnicodeWidthStr::width(self.input.as_str())
+    }
+
+    /// Adjust `input_view_offset` so the caret stays inside the visible
+    /// window `[offset + 1, offset + inner_width - 2]` (one-cell margin on
+    /// each side). No-op when the buffer fits inside `inner_width`.
+    ///
+    /// Invariant after call:
+    /// - `buffer_width < inner_width`  →  `offset == 0`.
+    /// - otherwise, the caret's display col is inside the visible window,
+    ///   and the offset lands on a char boundary (never splits a wide
+    ///   glyph).
+    ///
+    /// Takes `&self` + interior mutability so `render_input` can reflow
+    /// without threading a `&mut App` through `ratatui::Frame::draw`.
+    pub fn reflow_input_viewport(&self, inner_width: u16) {
+        let inner = inner_width as usize;
+        if inner == 0 {
+            self.input_view_offset.set(0);
+            return;
+        }
+        if self.input_display_width() < inner {
+            self.input_view_offset.set(0);
+            return;
+        }
+
+        let caret_col = self.input_caret_display_col();
+        let mut target = self.input_view_offset.get();
+
+        // Scroll left when the caret crossed the left margin.
+        if caret_col < target + 1 {
+            target = caret_col.saturating_sub(1);
+        }
+        // Scroll right when the caret crossed the right margin. Using
+        // inner.saturating_sub(2) leaves a one-cell margin on the right.
+        else if caret_col >= target + inner.saturating_sub(1) {
+            target = caret_col.saturating_sub(inner.saturating_sub(2));
+        }
+
+        // Snap the offset down to the nearest char-boundary cell so the
+        // left edge never splits a CJK / emoji glyph.
+        let mut cum = 0usize;
+        for ch in self.input.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cum + w > target {
+                break;
+            }
+            cum += w;
+        }
+        self.input_view_offset.set(cum);
     }
 
     /// Insert `c` at the caret and advance the caret past it.

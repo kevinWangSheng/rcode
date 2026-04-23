@@ -310,22 +310,33 @@ impl CommandRegistry {
         out.push_str("Slash commands:\n\n");
         out.push_str("Built-ins:\n");
         for b in Builtin::ALL {
-            out.push_str(&format!("  /{:<10} {}\n", b.name(), b.description()));
+            out.push_str(&format_entry(b.name(), b.description()));
         }
         if !self.skills.is_empty() {
             out.push_str("\nSkills:\n");
             for s in &self.skills {
-                out.push_str(&format!(
-                    "  /{:<10} {}\n",
-                    s.name,
-                    desc_or_placeholder(&s.description)
-                ));
+                out.push_str(&format_entry(&s.name, desc_or_placeholder(&s.description)));
             }
         }
         out.push_str(
             "\nType / to start a command. Press Esc to cancel. Ctrl+Q or /exit to quit.\n",
         );
         out
+    }
+}
+
+/// Render a single `/help` row. Short names (≤ 10 chars) keep the single-line
+/// layout so the output is byte-identical to the pre-fix formatter. Longer
+/// names (e.g. `reload-keybindings`) split into two lines with a 14-space
+/// leading indent on the continuation — this aligns the description with the
+/// short-name description column after `push_system_notice`'s 3-space
+/// continuation prefix, which avoids Ratatui's word-wrap dumping the tail at
+/// column 0.
+fn format_entry(name: &str, desc: &str) -> String {
+    if name.len() <= 10 {
+        format!("  /{name:<10} {desc}\n")
+    } else {
+        format!("  /{name}\n              {desc}\n")
     }
 }
 
@@ -462,11 +473,7 @@ fn format_skills(registry: &CommandRegistry) -> String {
     }
     let mut out = String::from("Available skills:\n");
     for s in &registry.skills {
-        out.push_str(&format!(
-            "  /{:<12} {}\n",
-            s.name,
-            desc_or_placeholder(&s.description)
-        ));
+        out.push_str(&format_entry(&s.name, desc_or_placeholder(&s.description)));
     }
     out
 }
@@ -729,6 +736,46 @@ mod tests {
             }
             other => panic!("expected Info, got {other:?}"),
         }
+    }
+
+    // ── fix-tui-help-wrap-indent: format_entry helper ────────────────────
+
+    #[test]
+    fn format_entry_short() {
+        // Byte-identical to the pre-fix `  /{:<10} {}\n` formatter.
+        assert_eq!(
+            format_entry("help", "show this help"),
+            "  /help       show this help\n"
+        );
+    }
+
+    #[test]
+    fn format_entry_long() {
+        // Two-line form for names > 10 chars: 14-space continuation indent.
+        assert_eq!(
+            format_entry("reload-keybindings", "re-read"),
+            "  /reload-keybindings\n              re-read\n"
+        );
+    }
+
+    #[test]
+    fn format_entry_boundary() {
+        // Threshold is at 10 characters: length-10 stays one line,
+        // length-11 flips to two lines.
+        let ten = "0123456789";
+        let eleven = "0123456789a";
+        assert_eq!(ten.len(), 10);
+        assert_eq!(eleven.len(), 11);
+        assert!(
+            !format_entry(ten, "d").contains('\n')
+                || format_entry(ten, "d").matches('\n').count() == 1,
+            "length-10 must be single-line (one trailing \\n only)"
+        );
+        assert_eq!(
+            format_entry(eleven, "d").matches('\n').count(),
+            2,
+            "length-11 must split (name \\n + description \\n)"
+        );
     }
 
     #[test]

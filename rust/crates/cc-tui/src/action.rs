@@ -238,6 +238,17 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
 
             // Check if it's a slash command
             if let Some(cmd) = parse(&text) {
+                // Close the palette BEFORE dispatch so every terminal outcome
+                // (Info/Clear/Compact/SwitchModel/ReloadKeybindings/Unknown)
+                // leaves mode == Input. SubmitUserMessage re-enters Streaming
+                // below via start_stream; Exit tears down regardless. Guarded
+                // on CommandPalette so `/exit` submitted during Streaming
+                // (keyboard routed there for a queued message scenario)
+                // doesn't lose its Streaming context before the Exit arm
+                // checks it to cancel the engine turn.
+                if app.mode == AppMode::CommandPalette {
+                    close_palette(app, None);
+                }
                 // Snapshot current usage into CommandContext before dispatch
                 // so /cost and similar commands see up-to-date numbers.
                 let mut cmd_ctx = ctx.command_ctx.clone();
