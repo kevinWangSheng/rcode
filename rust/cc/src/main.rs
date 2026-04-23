@@ -9,7 +9,7 @@ use cc_api::{ApiClient, AuthCredential};
 use cc_auth::{ensure_fresh_credentials, Credentials};
 use cc_config::{load_settings, resolve_model};
 use cc_core::{MessageParam, SystemBlock};
-use cc_hooks::{HookRunner, HooksSettings};
+use cc_hooks::{HookContext, HookRunner, HooksSettings};
 use cc_permissions::PermissionEngine;
 use cc_query::{
     engine::{QueryEngine, QueryEngineConfig, QueryOptions},
@@ -182,7 +182,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     let http_config = cc_http::HttpClientConfig::from_env();
     let http = cc_http::build_client(&http_config).unwrap_or_default();
-    let hook_runner = Arc::new(HookRunner::new(&hooks_config, http.clone()));
+    // TS parity (hooks.ts:881-926): expose CLAUDE_PROJECT_DIR to every
+    // hook child process. Plugin fields stay unset until the plugin loader
+    // lands (Batch G), but the plumbing is already in place.
+    let hook_context = HookContext {
+        project_dir: std::env::current_dir().ok(),
+        ..Default::default()
+    };
+    let hook_runner = Arc::new(HookRunner::new(&hooks_config, http.clone()).with_context(hook_context));
 
     // Fire SessionStart hook (§4 contract: trigger='resume' when resuming)
     {

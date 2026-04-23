@@ -179,6 +179,11 @@ pub enum HookOutcome {
     Ok,
     Block(String),  // exit 2 or {"block": true}
     Failed(String), // non-blocking error
+    /// Hook opted into `async_rewake: true` and exited 2 — engine should
+    /// treat the message as a rewake signal rather than a plain block.
+    /// Currently aggregated alongside `Block`; a task-notification queue
+    /// in cc-query will later promote this into a re-entry.
+    AsyncRewake(String),
 }
 
 /// Structured JSON response from a hook (stdout).

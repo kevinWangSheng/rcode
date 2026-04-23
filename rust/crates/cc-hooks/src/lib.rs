@@ -14,12 +14,14 @@ pub use cc_core::hook::{
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+
+pub mod http;
 
 /// Aggregated result of running all hooks for an event.
 #[derive(Debug, Default)]
@@ -32,6 +34,82 @@ pub struct HookRunResult {
     /// Used by SessionStart / SubagentStart / UserPromptSubmit to inject context
     /// as a user message before the next turn.
     pub additional_contexts: Vec<String>,
+    /// Set when a hook with `async_rewake: true` exits 2. Distinct from
+    /// `block_message` so a future task-notification queue can promote this
+    /// into a re-entry rather than a tool-result error. For now cc-query
+    /// treats it like `blocked` (tool-result error).
+    pub async_rewake: Option<String>,
+}
+
+/// Extra environment the runner exports to every hook child process.
+///
+/// Mirrors TS `src/utils/hooks.ts:881-926`:
+/// * `CLAUDE_PROJECT_DIR` — workspace root.
+/// * `CLAUDE_PLUGIN_ROOT` — source dir of the plugin that registered the hook.
+/// * `CLAUDE_PLUGIN_DATA` — writable per-plugin data dir.
+/// * `CLAUDE_PLUGIN_OPTION_*` — each option is uppercased + non-ident chars
+///   replaced with `_`, then stringified. Matches TS `hooks.ts:898-906`.
+///
+/// All fields are optional so the most common case (plain project hook, no
+/// plugin) needs no boilerplate.
+#[derive(Debug, Clone, Default)]
+pub struct HookContext {
+    pub project_dir: Option<PathBuf>,
+    pub plugin_root: Option<PathBuf>,
+    pub plugin_data: Option<PathBuf>,
+    pub plugin_options: HashMap<String, String>,
+}
+
+impl HookContext {
+    /// Construct the env-var pairs this context contributes to a hook child
+    /// process. Key order: `CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT`,
+    /// `CLAUDE_PLUGIN_DATA`, then `CLAUDE_PLUGIN_OPTION_*` sorted by key.
+    pub fn env_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        if let Some(dir) = &self.project_dir {
+            pairs.push((
+                "CLAUDE_PROJECT_DIR".to_string(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
+        if let Some(root) = &self.plugin_root {
+            pairs.push((
+                "CLAUDE_PLUGIN_ROOT".to_string(),
+                root.to_string_lossy().into_owned(),
+            ));
+        }
+        if let Some(data) = &self.plugin_data {
+            pairs.push((
+                "CLAUDE_PLUGIN_DATA".to_string(),
+                data.to_string_lossy().into_owned(),
+            ));
+        }
+        let mut opts: Vec<(&String, &String)> = self.plugin_options.iter().collect();
+        opts.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in opts {
+            pairs.push((plugin_option_env_key(k), v.clone()));
+        }
+        pairs
+    }
+}
+
+/// Build the `CLAUDE_PLUGIN_OPTION_*` name for a single option key.
+///
+/// Matches TS `src/utils/hooks.ts:903-904`:
+/// ```ts
+/// const envKey = key.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()
+/// ```
+pub fn plugin_option_env_key(key: &str) -> String {
+    let mut out = String::with_capacity("CLAUDE_PLUGIN_OPTION_".len() + key.len());
+    out.push_str("CLAUDE_PLUGIN_OPTION_");
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_uppercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 impl HookRunResult {
@@ -62,6 +140,9 @@ pub struct HookRunner {
     managed_only: bool,
     /// Whether hooks are disabled entirely.
     disabled: bool,
+    /// Extra env vars to export into every hook child process (project dir,
+    /// plugin root/data/options).
+    context: HookContext,
 }
 
 impl HookRunner {
@@ -79,6 +160,7 @@ impl HookRunner {
             http,
             managed_only: false,
             disabled: false,
+            context: HookContext::default(),
         }
     }
 
@@ -90,7 +172,20 @@ impl HookRunner {
             http: reqwest::Client::new(),
             managed_only: false,
             disabled: true,
+            context: HookContext::default(),
         }
+    }
+
+    /// Attach a `HookContext` that the runner exports into each hook's
+    /// child process. Replaces any previously-set context.
+    pub fn with_context(mut self, context: HookContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Read-only access to the current context.
+    pub fn context(&self) -> &HookContext {
+        &self.context
     }
 
     /// Set managed-only mode (only policy-path hooks are allowed).
@@ -188,6 +283,7 @@ impl HookRunner {
         // Extract env context from input for subprocess injection
         let session_id = input.session_id.clone();
         let cwd = input.cwd.clone();
+        let plugin_env: Arc<Vec<(String, String)>> = Arc::new(self.context.env_pairs());
 
         // Execute all in parallel
         let futures: Vec<_> = hooks
@@ -199,6 +295,7 @@ impl HookRunner {
                 let env_path = env_file.as_ref().map(|(p, _)| p.clone());
                 let sid = session_id.clone();
                 let cwd = cwd.clone();
+                let plugin_env = plugin_env.clone();
                 async move {
                     let timeout = Duration::from_secs(h.timeout);
                     tokio::select! {
@@ -206,7 +303,7 @@ impl HookRunner {
                         _ = cancel.cancelled() => (HookOutcome::Failed("cancelled".into()), None),
                         result = tokio::time::timeout(
                             timeout,
-                            execute_one_hook(h, &input_json, &http, env_path.as_deref(), &sid, &cwd),
+                            execute_one_hook(h, &input_json, &http, env_path.as_deref(), &sid, &cwd, &plugin_env),
                         ) => {
                             match result {
                                 Ok(pair) => pair,
@@ -244,6 +341,15 @@ impl HookRunner {
                 HookOutcome::Block(msg) => {
                     result.blocked = true;
                     result.block_message = Some(msg);
+                }
+                HookOutcome::AsyncRewake(msg) => {
+                    // TS parity deferred: until cc-query grows a task-notification
+                    // queue we treat rewake the same as Block at the consumer —
+                    // but surface the distinct field so the queue can be wired
+                    // later without another type change.
+                    result.blocked = true;
+                    result.block_message = Some(msg.clone());
+                    result.async_rewake = Some(msg);
                 }
                 HookOutcome::Failed(msg) => {
                     debug!("hook failed (non-blocking): {msg}");
@@ -312,6 +418,7 @@ async fn execute_one_hook(
     env_file_path: Option<&Path>,
     session_id: &str,
     cwd: &str,
+    plugin_env: &[(String, String)],
 ) -> (HookOutcome, Option<String>) {
     match &hook.kind {
         HookKind::Command => {
@@ -320,7 +427,16 @@ async fn execute_one_hook(
             };
             match command {
                 cc_core::hook::HookCommand::Argv(argv) if !argv.is_empty() => {
-                    run_argv_hook(argv, input_json, env_file_path, session_id, cwd).await
+                    run_argv_hook(
+                        argv,
+                        input_json,
+                        env_file_path,
+                        session_id,
+                        cwd,
+                        plugin_env,
+                        hook.async_rewake,
+                    )
+                    .await
                 }
                 cc_core::hook::HookCommand::Argv(_) => {
                     // Empty argv — treat as unconfigured.
@@ -344,7 +460,17 @@ async fn execute_one_hook(
                         );
                     }
                     let shell = hook.shell.as_deref().unwrap_or("bash");
-                    run_command_hook(s, input_json, shell, env_file_path, session_id, cwd).await
+                    run_command_hook(
+                        s,
+                        input_json,
+                        shell,
+                        env_file_path,
+                        session_id,
+                        cwd,
+                        plugin_env,
+                        hook.async_rewake,
+                    )
+                    .await
                 }
             }
         }
@@ -376,18 +502,31 @@ async fn execute_one_hook(
 
 /// Run a hook in argv form — no intervening shell. `argv[0]` is the
 /// executable, `argv[1..]` are literal args. Nothing is interpreted.
+#[allow(clippy::too_many_arguments)]
 async fn run_argv_hook(
     argv: &[String],
     input_json: &str,
     env_file_path: Option<&Path>,
     session_id: &str,
     cwd: &str,
+    plugin_env: &[(String, String)],
+    async_rewake: bool,
 ) -> (HookOutcome, Option<String>) {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    run_prepared_hook(cmd, input_json, env_file_path, session_id, cwd).await
+    run_prepared_hook(
+        cmd,
+        input_json,
+        env_file_path,
+        session_id,
+        cwd,
+        plugin_env,
+        async_rewake,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_command_hook(
     command: &str,
     input_json: &str,
@@ -395,20 +534,34 @@ async fn run_command_hook(
     env_file_path: Option<&Path>,
     session_id: &str,
     cwd: &str,
+    plugin_env: &[(String, String)],
+    async_rewake: bool,
 ) -> (HookOutcome, Option<String>) {
     let mut cmd = Command::new(shell);
     cmd.arg("-c").arg(command);
-    run_prepared_hook(cmd, input_json, env_file_path, session_id, cwd).await
+    run_prepared_hook(
+        cmd,
+        input_json,
+        env_file_path,
+        session_id,
+        cwd,
+        plugin_env,
+        async_rewake,
+    )
+    .await
 }
 
 /// Inner runner that takes a pre-configured `Command` (argv or `sh -c`)
 /// and runs the common stdin-feed / wait / parse-output pipeline.
+#[allow(clippy::too_many_arguments)]
 async fn run_prepared_hook(
     mut cmd: Command,
     input_json: &str,
     env_file_path: Option<&Path>,
     session_id: &str,
     cwd: &str,
+    plugin_env: &[(String, String)],
+    async_rewake: bool,
 ) -> (HookOutcome, Option<String>) {
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -416,6 +569,10 @@ async fn run_prepared_hook(
         // §5.3: inject hook environment variables (TS: hooks.ts:815-926)
         .env("CLAUDE_SESSION_ID", session_id)
         .env("CLAUDE_CWD", cwd);
+
+    for (k, v) in plugin_env {
+        cmd.env(k, v);
+    }
 
     if let Some(path) = env_file_path {
         cmd.env("CLAUDE_ENV_FILE", path);
@@ -473,6 +630,9 @@ async fn run_prepared_hook(
             .and_then(|o| o.additional_context.clone());
         if resp.decision.as_deref() == Some("block") {
             let msg = resp.reason.or(resp.stop_reason).unwrap_or_default();
+            if async_rewake {
+                return (HookOutcome::AsyncRewake(msg), extra);
+            }
             return (HookOutcome::Block(msg), extra);
         }
         // Structured response but not blocking — treat as Ok
@@ -480,7 +640,12 @@ async fn run_prepared_hook(
     }
 
     if exit_code == 2 {
-        (HookOutcome::Block(stdout.trim().to_string()), None)
+        let msg = stdout.trim().to_string();
+        if async_rewake {
+            (HookOutcome::AsyncRewake(msg), None)
+        } else {
+            (HookOutcome::Block(msg), None)
+        }
     } else if exit_code != 0 {
         // The refactor to shared argv/shell runner means we no longer have
         // a `command` identifier here — the caller knows what it ran.
@@ -503,7 +668,18 @@ async fn run_http_hook(
         .body(input_json.to_string());
 
     if let Some(headers) = extra_headers {
-        for (k, v) in headers {
+        // Run every header through env-var interpolation + CR/LF/NUL
+        // rejection before attaching. Defends against CRLF-injection
+        // via crafted `${SECRET}` values and matches TS parity
+        // (execHttpHook.ts:76-108 with a fail-loud twist — see http.rs).
+        let env: HashMap<String, String> = std::env::vars().collect();
+        let prepared = match http::prepare_headers(headers, &env, None) {
+            Ok(p) => p,
+            Err(e) => {
+                return HookOutcome::Failed(format!("http hook header prep: {e}"));
+            }
+        };
+        for (k, v) in prepared {
             request = request.header(k, v);
         }
     }
