@@ -101,4 +101,6 @@ already covered by existing `--print` integration paths in cc-bridge.
 1. Audit the rest of the CLI for other missing short flags TS has?
    (`-c` for `--continue`, `-r` for `--resume`, etc.) Out of scope
    for this one-liner; spin up a second change if you want the full
-   sweep.
+   sweep. **Resolved** by `fix-cli-short-aliases` — adds `-c` / `-r`
+   and documents the `-v` / `-n` / `-w` / `-d` divergences that are
+   either meaning-changes or apply to unimplemented flags.

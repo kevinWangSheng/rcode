@@ -41,11 +41,11 @@ struct Cli {
     print: Option<String>,
 
     /// Resume a previous session by ID.
-    #[arg(long, value_name = "SESSION_ID")]
+    #[arg(short = 'r', long, value_name = "SESSION_ID")]
     resume: Option<String>,
 
     /// Resume the most recent session (mutually exclusive with --resume).
-    #[arg(long)]
+    #[arg(short = 'c', long)]
     r#continue: bool,
 
     /// Model override (default: claude-sonnet-4-6).
@@ -948,6 +948,25 @@ mod tests {
         assert_eq!(long.print, Some("hello".into()));
         assert_eq!(short.print, Some("hello".into()));
         assert_eq!(long.print, short.print);
+    }
+
+    #[test]
+    fn continue_short_flag_c_equivalent_to_long() {
+        use clap::Parser;
+        let long = Cli::parse_from(["claude", "--continue"]);
+        let short = Cli::parse_from(["claude", "-c"]);
+        assert!(long.r#continue);
+        assert!(short.r#continue);
+    }
+
+    #[test]
+    fn resume_short_flag_r_equivalent_to_long() {
+        use clap::Parser;
+        let long = Cli::parse_from(["claude", "--resume", "sess-abc"]);
+        let short = Cli::parse_from(["claude", "-r", "sess-abc"]);
+        assert_eq!(long.resume.as_deref(), Some("sess-abc"));
+        assert_eq!(short.resume.as_deref(), Some("sess-abc"));
+        assert_eq!(long.resume, short.resume);
     }
 
     #[test]
