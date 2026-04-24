@@ -98,6 +98,13 @@ enum Commands {
     /// Authenticate with claude.ai via OAuth and save the token to
     /// ~/.claude/credentials.json. Used by dev builds to avoid Keychain prompts.
     Login,
+    /// Diagnose credential / MCP / config health and print remediation
+    /// hints. Safe to run any time — reads state only, never writes.
+    Doctor,
+    /// Print an upgrade hint. Self-update isn't wired yet on the Rust
+    /// build; the doctor command will show the same reminder when a
+    /// newer release has been announced.
+    Update,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -142,17 +149,86 @@ async fn main() {
         .init();
 
     if let Err(e) = run(cli).await {
-        eprintln!("error: {e}");
+        let msg = e.to_string();
+        eprintln!("error: {msg}");
+        for hint in error_hints(&msg) {
+            eprintln!("hint: {hint}");
+        }
         std::process::exit(1);
     }
 }
 
+/// Map free-form error messages to one or more remediation hints.
+/// Rough pattern-match on common startup failures so new users aren't
+/// greeted with an opaque `error: …` line. Each hint is a single line,
+/// printed under a `hint:` prefix so downstream users can grep / split
+/// by that prefix.
+fn error_hints(msg: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let lower = msg.to_ascii_lowercase();
+
+    if lower.contains("credential")
+        || lower.contains("oauth")
+        || lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("anthropic_api_key")
+    {
+        out.push("run `claude login` to refresh your Anthropic credentials.");
+        out.push("or set the ANTHROPIC_API_KEY env var if you prefer API-key auth.");
+    }
+    if lower.contains("rate limit") || lower.contains("429") || lower.contains("resets") {
+        out.push("retry in a few minutes; Anthropic rate limits reset on a rolling window.");
+    }
+    if lower.contains("network")
+        || lower.contains("dns")
+        || lower.contains("connection refused")
+        || lower.contains("timed out")
+    {
+        out.push("check your internet connection, then run `claude doctor` to re-test.");
+    }
+    if lower.contains("mcp") && (lower.contains("expired") || lower.contains("404")) {
+        out.push("MCP session dropped — the next call will reinitialize automatically.");
+    }
+    if lower.contains("tls_cert") || lower.contains("tls_key") {
+        out.push("mTLS is half-configured; set BOTH TLS_CERT and TLS_KEY, or unset both.");
+    }
+    if lower.contains("settings.json") && (lower.contains("parse") || lower.contains("deserialize"))
+    {
+        out.push(
+            "settings.json has a syntax error; `claude doctor` prints the file paths it loads.",
+        );
+    }
+    if lower.contains("permission denied") && lower.contains("path") {
+        out.push("check filesystem permissions on the path; `chmod +r` / `chown` as needed.");
+    }
+
+    if out.is_empty() {
+        out.push("run `claude doctor` for a health summary, or `claude --help` for usage.");
+    }
+    out
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Subcommand branches (don't require credentials to already exist).
-    if let Some(Commands::Login) = &cli.command {
-        let path = cc_auth::run_login_flow(cc_auth::OAuthConfig::default()).await?;
-        println!("Credentials saved to {}", path.display());
-        return Ok(());
+    match &cli.command {
+        Some(Commands::Login) => {
+            let path = cc_auth::run_login_flow(cc_auth::OAuthConfig::default()).await?;
+            println!("Credentials saved to {}", path.display());
+            return Ok(());
+        }
+        Some(Commands::Doctor) => {
+            run_doctor().await;
+            return Ok(());
+        }
+        Some(Commands::Update) => {
+            println!(
+                "Self-update is not yet wired on the Rust build. To upgrade, pull the \n\
+                 latest release from https://github.com/anthropics/claude-code and \n\
+                 rebuild with `cargo install --path rust/cc`."
+            );
+            return Ok(());
+        }
+        None => {}
     }
 
     // Validation goes first so failures don't leak session files, print a
@@ -1017,4 +1093,95 @@ mod tests {
             panic!("expected Enabled after clamp");
         }
     }
+
+    #[test]
+    fn error_hints_cover_common_startup_cases() {
+        // Auth / OAuth / 401 → two hints about login + env var.
+        let hints = error_hints("oauth token has expired (401 Unauthorized)");
+        assert!(
+            hints.iter().any(|h| h.contains("claude login")),
+            "auth error missing login hint: {hints:?}"
+        );
+        assert!(
+            hints.iter().any(|h| h.contains("ANTHROPIC_API_KEY")),
+            "auth error missing api-key hint: {hints:?}"
+        );
+
+        // Rate limit.
+        let hints = error_hints("HTTP 429: rate limit exceeded");
+        assert!(hints.iter().any(|h| h.contains("rate limit")), "{hints:?}");
+
+        // Network fault.
+        let hints = error_hints("DNS resolution failed: connection refused");
+        assert!(hints.iter().any(|h| h.contains("doctor")), "{hints:?}");
+
+        // mTLS misconfig.
+        let hints = error_hints("TLS_CERT set but TLS_KEY is missing");
+        assert!(hints.iter().any(|h| h.contains("mTLS")), "{hints:?}");
+
+        // Settings.json parse error.
+        let hints = error_hints("failed to parse settings.json: unexpected token");
+        assert!(
+            hints.iter().any(|h| h.contains("settings.json")),
+            "{hints:?}"
+        );
+
+        // Unknown error → generic fallback.
+        let hints = error_hints("something strange happened 42");
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("doctor"));
+    }
+}
+
+/// `claude doctor` implementation. Prints a health summary covering
+/// credential state, settings load, and any configured MCP servers.
+/// Safe to run any time — never writes state.
+#[allow(clippy::items_after_test_module)]
+async fn run_doctor() {
+    println!("claude doctor — environment health check\n");
+
+    // Credentials
+    match cc_auth::resolve_credentials() {
+        Ok((_creds, source)) => {
+            println!("✓ credentials: loaded from {source:?}");
+        }
+        Err(e) => {
+            println!("✗ credentials: {e}");
+            println!("    → run `claude login` or set ANTHROPIC_API_KEY to authenticate.");
+        }
+    }
+
+    // Settings
+    let cwd = std::env::current_dir().ok();
+    match load_settings(cwd.as_deref()) {
+        Ok(_) => println!("✓ settings: layered load succeeded"),
+        Err(e) => {
+            println!("✗ settings: {e}");
+            println!(
+                "    → check JSON syntax; `jq . ~/.claude/settings.json` prints parse errors."
+            );
+        }
+    }
+
+    // MCP env (mTLS)
+    let has_cert = std::env::var_os("TLS_CERT").is_some();
+    let has_key = std::env::var_os("TLS_KEY").is_some();
+    match (has_cert, has_key) {
+        (false, false) => println!("  mTLS: off (TLS_CERT / TLS_KEY unset)"),
+        (true, true) => println!("✓ mTLS: both TLS_CERT and TLS_KEY set"),
+        _ => {
+            println!("✗ mTLS: exactly one of TLS_CERT / TLS_KEY is set; this will fail at startup")
+        }
+    }
+
+    // Version line
+    println!(
+        "\nclaude version: {} ({} build)",
+        env!("CARGO_PKG_VERSION"),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
 }
