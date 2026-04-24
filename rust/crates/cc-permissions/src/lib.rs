@@ -217,18 +217,29 @@ impl PermissionEngine {
             }
         }
 
-        // 4. Mode-based default behavior. The three post-D-A variants
-        // (AcceptEdits, BypassPermissions, Auto) map to existing
-        // behaviour as a no-op: later changes will layer tool-specific
-        // `check_permissions` hooks (AcceptEdits), SafetyCheck
-        // gating (BypassPermissions), and the classifier (Auto) on
-        // top without widening the enum.
+        // 4. Mode-based default behavior. Each variant maps to a
+        // concrete decision once the earlier allow/deny/session
+        // stages have not produced one.
         match self.mode {
-            PermissionMode::DontAsk
-            | PermissionMode::AcceptEdits
-            | PermissionMode::BypassPermissions => {
-                // Auto-allow: no dialog, no prompt.
+            // `acceptEdits` + `bypassPermissions`: today both auto-
+            // allow unconditionally (the finer per-tool semantics
+            // land in Change B). `bypassPermissions` intentionally
+            // bypasses the ask dialog — deny rules at stage 1 still
+            // win, which is the spec-correct behaviour.
+            PermissionMode::AcceptEdits | PermissionMode::BypassPermissions => {
                 PermissionResult::allow(PermissionSource::ModeDefault)
+            }
+            // `dontAsk`: 2026-04-24 P0 safety fix. TS `dontAsk`
+            // semantically means **"if you would have asked, deny
+            // instead"** — the rejection message names the mode so
+            // the model can retry with a different approach. Before
+            // the fix, Rust auto-allowed in this mode, which is the
+            // OPPOSITE of the name — a user setting
+            // `"defaultMode": "dontAsk"` expecting "refuse by
+            // default" silently got "allow by default". See
+            // DONT_ASK_REJECT_MESSAGE for the payload contract.
+            PermissionMode::DontAsk => {
+                PermissionResult::deny(PermissionSource::ModeDefault, DONT_ASK_REJECT_MESSAGE)
             }
             PermissionMode::Plan => {
                 if is_write_tool(tool_name) {
@@ -251,6 +262,15 @@ impl PermissionEngine {
         }
     }
 }
+
+/// Message surfaced as the `tool_result` body when `dontAsk` mode
+/// rejects a tool call. Matches TS `DONT_ASK_REJECT_MESSAGE` in
+/// `src/utils/permissions.ts` so model behaviour stays portable.
+pub const DONT_ASK_REJECT_MESSAGE: &str =
+    "Permission rejected: this session is in `dontAsk` mode and no \
+     rule explicitly allows this tool. Either (a) configure an allow \
+     rule in settings.json, or (b) re-run without `defaultMode: \
+     \"dontAsk\"`.";
 
 #[cfg(test)]
 mod tests {
@@ -386,13 +406,35 @@ mod tests {
     }
 
     #[test]
-    fn dont_ask_mode_auto_allows_after_deny() {
+    fn dont_ask_mode_denies_when_no_rule_matches() {
+        // 2026-04-24 P0 security fix: TS `dontAsk` means "refuse by
+        // default", not "allow by default". Before this change Rust
+        // auto-allowed in this mode — the opposite of the name.
         let mut engine = PermissionEngine::default();
         engine.set_mode(PermissionMode::DontAsk);
-        // No rules — mode should auto-allow
+        let result = engine.check("Bash", &json!({}));
+        assert_eq!(result.behavior, PermissionBehavior::Deny);
+        assert_eq!(result.source, PermissionSource::ModeDefault);
+        assert!(
+            result
+                .message
+                .as_ref()
+                .map(|m| m.contains("dontAsk"))
+                .unwrap_or(false),
+            "rejection message must cite the dontAsk mode so the model \
+             can retry differently: {:?}",
+            result.message,
+        );
+    }
+
+    #[test]
+    fn dont_ask_mode_allow_rule_still_allows() {
+        // An explicit allow rule overrides the dontAsk default.
+        let engine = PermissionEngine::from_settings([json!("Bash")], Vec::<Value>::new());
+        let mut engine = engine;
+        engine.set_mode(PermissionMode::DontAsk);
         let result = engine.check("Bash", &json!({}));
         assert_eq!(result.behavior, PermissionBehavior::Allow);
-        assert_eq!(result.source, PermissionSource::ModeDefault);
     }
 
     #[test]
