@@ -86,6 +86,16 @@ pub struct QueryEngine {
     events_tx: Option<mpsc::Sender<AppEvent>>,
     /// Set to `true` when auto-compact fires inside the most recent `run_turn`.
     compacted_last_turn: bool,
+    /// Consecutive auto-compact attempts that did NOT recover enough
+    /// tokens to bring input_tokens back under the threshold. Bumped
+    /// whenever a compaction runs on a turn that was *itself*
+    /// flagged `compacted_last_turn` — i.e. the previous turn's
+    /// compaction didn't help. Reset to 0 on any turn whose input
+    /// fits under the threshold. When the counter crosses
+    /// [`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES`] we raise a hard error
+    /// instead of looping the compaction forever. Matches the TS
+    /// circuit breaker in `services/messages/compact.ts`.
+    consecutive_autocompact_failures: u32,
     /// Contexts collected from PreToolUse hooks that must flow into the next
     /// API call as synthetic `MessageParam::user` entries. Drained at the top
     /// of each `run_turn` loop iteration so the strings are part of the
@@ -147,6 +157,7 @@ impl QueryEngine {
             usage: UsageTracker::default(),
             events_tx: None,
             compacted_last_turn: false,
+            consecutive_autocompact_failures: 0,
             pending_additional_contexts: Vec::new(),
             #[cfg(test)]
             stream_override: None,
@@ -438,16 +449,45 @@ impl QueryEngine {
                     self.session.append(&result_msg)?;
                     messages.push(result_msg);
 
-                    // Auto-compact check (§4.5: threshold = context_window - 13,000)
+                    // Auto-compact check (§4.5: threshold = context_window - 13,000,
+                    // or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` % of the window).
                     let threshold = compact_threshold();
-                    if self.usage.last_input_tokens() > threshold {
+                    let input = self.usage.last_input_tokens();
+                    if input > threshold {
+                        // Circuit breaker: if the previous turn already
+                        // auto-compacted and we're STILL over the
+                        // threshold, count that as a failed attempt.
+                        // MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES consecutive
+                        // failures → hard error so the caller sees a
+                        // clear signal instead of an infinite compact
+                        // loop. Matches TS `services/messages/compact.ts`.
+                        if self.compacted_last_turn {
+                            self.consecutive_autocompact_failures += 1;
+                            if self.consecutive_autocompact_failures
+                                >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+                            {
+                                return Err(cc_core::CcError::api(format!(
+                                    "auto-compact failed to recover context {} times in a row \
+                                     (input_tokens={input} threshold={threshold}); giving up. \
+                                     Consider lowering CLAUDE_CODE_MAX_CONTEXT_TOKENS or raising \
+                                     CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, or start a new session.",
+                                    self.consecutive_autocompact_failures
+                                )));
+                            }
+                        }
                         debug!(
-                            "auto-compact triggered: input_tokens={} > threshold={threshold}",
-                            self.usage.last_input_tokens()
+                            "auto-compact triggered: input_tokens={input} > threshold={threshold} \
+                             (consecutive_failures={})",
+                            self.consecutive_autocompact_failures
                         );
                         compact_messages(messages);
                         self.compacted_last_turn = true;
                         self.emit(AppEvent::CompactBoundary).await;
+                    } else if self.compacted_last_turn {
+                        // Compaction recovered enough context. Reset the
+                        // breaker so isolated bursts don't cumulatively
+                        // trip it across long sessions.
+                        self.consecutive_autocompact_failures = 0;
                     }
 
                     // Continue loop
@@ -983,16 +1023,49 @@ pub(crate) fn merge_tool_results(
         .collect()
 }
 
-/// Auto-compact threshold (§4.5).
-/// = effective_context_window - 13,000
-/// Default effective_context_window = 200,000 (claude-sonnet-4-6).
+/// Auto-compact threshold (§4.5). Matches TS `AUTO_COMPACT_BUFFER_
+/// TOKENS = 13_000` with an optional percentage override via
+/// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. The pct override — when set to
+/// a value in (0, 100] — expresses the threshold as "compact when
+/// input_tokens ≥ <pct>% of context_window" instead of the fixed
+/// 13 KB buffer. Invalid values (≤ 0, > 100, non-numeric) log a
+/// warning and fall back to the default.
+///
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` scales the context window; the
+/// auto-compact threshold is derived from that value regardless of
+/// which override path produced it.
 fn compact_threshold() -> u32 {
     let context_window: u32 = std::env::var("CLAUDE_CODE_MAX_CONTEXT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(cc_core::model::models::DEFAULT_CONTEXT_WINDOW);
-    context_window.saturating_sub(13_000)
+    if let Ok(raw) = std::env::var("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE") {
+        match raw.parse::<f64>() {
+            Ok(pct) if pct > 0.0 && pct <= 100.0 => {
+                let scaled = (context_window as f64 * pct / 100.0).floor() as u32;
+                return scaled.min(context_window);
+            }
+            _ => {
+                tracing::warn!(
+                    raw = raw.as_str(),
+                    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE must be a number in (0, 100]; falling back to default buffer"
+                );
+            }
+        }
+    }
+    context_window.saturating_sub(AUTO_COMPACT_BUFFER_TOKENS)
 }
+
+/// Fixed buffer subtracted from the context window to leave headroom
+/// for the next turn's output plus streaming overhead. 13 KB matches
+/// the TS constant (services/messages/compact.ts).
+const AUTO_COMPACT_BUFFER_TOKENS: u32 = 13_000;
+
+/// Number of consecutive failed auto-compact attempts allowed before
+/// the engine raises a hard error instead of trying again. TS uses 3;
+/// Rust mirrors it so the two runtimes produce the same "I've tried
+/// three times, I'm stopping" signal for client-facing error UX.
+pub const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES: u32 = 3;
 
 /// Simple compaction: keep only the first user message and the last N messages.
 /// Also strips image blocks from kept messages (§4 contract: images stripped before API call).
@@ -1226,6 +1299,57 @@ mod tests {
             before.len(),
             "no compaction when ≤ KEEP_RECENT + 1"
         );
+    }
+
+    /// P0 #20: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` sets the threshold
+    /// as a percentage of the context window rather than the fixed
+    /// 13 KB buffer. Legal values are in (0, 100]; anything else
+    /// falls back to the default with a warning. Env state is
+    /// mutable-global, so the test serialises around a lock guard
+    /// to avoid racing with siblings that also read env vars.
+    #[test]
+    fn compact_threshold_honors_pct_override() {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        let default_window = cc_core::model::models::DEFAULT_CONTEXT_WINDOW;
+        // Default: buffer-based. 13_000 subtracted from the window.
+        std::env::remove_var("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
+        std::env::remove_var("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+        assert_eq!(
+            compact_threshold(),
+            default_window - AUTO_COMPACT_BUFFER_TOKENS
+        );
+
+        // Valid pct override: 80% of 200k = 160k.
+        std::env::set_var("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "80");
+        assert_eq!(compact_threshold(), (default_window as f64 * 0.80) as u32);
+
+        // Invalid pct (> 100) falls back to buffer default; garbage
+        // string also falls back (+ warns).
+        std::env::set_var("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "150");
+        assert_eq!(
+            compact_threshold(),
+            default_window - AUTO_COMPACT_BUFFER_TOKENS
+        );
+        std::env::set_var("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "lolwut");
+        assert_eq!(
+            compact_threshold(),
+            default_window - AUTO_COMPACT_BUFFER_TOKENS
+        );
+
+        // Cleanup so sibling tests that also read env see pristine state.
+        std::env::remove_var("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE");
+    }
+
+    /// P0 #20: the consecutive-failure constant matches TS so both
+    /// runtimes draw the same line in the sand. Structural guard —
+    /// the end-to-end trip of the breaker is covered by the engine's
+    /// integration surface.
+    #[test]
+    fn max_consecutive_autocompact_failures_matches_ts() {
+        assert_eq!(MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES, 3);
     }
 
     #[tokio::test]
