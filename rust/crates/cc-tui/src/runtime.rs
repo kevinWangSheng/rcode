@@ -31,7 +31,17 @@ use ratatui::Terminal;
 /// Keeping the viewport at a small, stable size sidesteps both problems
 /// and matches what Claude Code's Ink TUI does: the live area is just
 /// input + chrome, content lives in scrollback.
-pub(crate) const FIXED_INLINE_ROWS: u16 = 8;
+///
+/// The 6 rows are consumed by: spinner (1) + input box (3) + help
+/// footer (1) + status bar (1). The transcript slot (Constraint::Min(0)
+/// in `render`) therefore collapses to 0 in Inline mode — nothing
+/// visible during streaming outside the spinner, but also no dead
+/// blank rows between scrollback content and the input box (the
+/// 2026-04-24 "empty line above input" complaint). In Fullscreen
+/// mode the viewport is the whole terminal, so Min(0) still gets
+/// however many rows remain after chrome — transcript rendering
+/// there is unaffected.
+pub(crate) const FIXED_INLINE_ROWS: u16 = 6;
 
 /// Active viewport flavour. `Fullscreen` is the fallback we land in when
 /// the inline init's DSR-cursor probe times out (slow / nested terminals).
@@ -301,7 +311,38 @@ where
     let start = app.emitted_to_scrollback;
     for idx in start..app.transcript.len() {
         let item = &app.transcript[idx];
-        let lines = crate::render::render_item_lines(item, width, &theme);
+        let mut lines = crate::render::render_item_lines(item, width, &theme);
+        // Strip the trailing blank line that `push_user_message` /
+        // `push_assistant_text` append for intra-frame visual rhythm
+        // in Fullscreen mode — in Inline mode it lands as a dead row
+        // of scrollback directly above the input viewport, which is
+        // exactly the "空了一行" complaint from 2026-04-24. The
+        // separation between consecutive scrollback items is already
+        // handled by the following item's leading glyph (`> ` for
+        // user, the tool-card bullet for tools, etc.), so dropping
+        // this trailing blank only removes the gap, not the rhythm.
+        // Strip leading + trailing blank lines. Three sources leak
+        // blanks into flushed content and show up as gap rows in
+        // scrollback right above the Inline viewport:
+        //   1. `push_user_message` / `push_assistant_text` append a
+        //      trailing blank for intra-frame rhythm in Fullscreen —
+        //      in scrollback that lands as a dead row above the input.
+        //   2. Assistant streams sometimes begin with `\n` (model
+        //      artefact), so `render_markdown` emits a leading blank.
+        //   3. Tool cards / system notices may bracket themselves
+        //      with blanks.
+        // The next flushed item always starts with its own leading
+        // glyph (`> `, tool bullet, etc.), so intra-item spacing is
+        // preserved even without these blanks. Closes the 2026-04-24
+        // "空了一行" complaint.
+        let is_blank =
+            |l: &ratatui::text::Line<'static>| l.spans.iter().all(|s| s.content.trim().is_empty());
+        while lines.first().is_some_and(&is_blank) {
+            lines.remove(0);
+        }
+        while lines.last().is_some_and(&is_blank) {
+            lines.pop();
+        }
         let row_count = lines.len() as u16;
         if row_count == 0 {
             app.emitted_to_scrollback = idx + 1;
@@ -354,7 +395,21 @@ where
             if end > 0 {
                 let stable = app.streaming_text[..end].to_string();
                 let tail = app.streaming_text[end..].to_string();
-                let lines = crate::markdown::render_markdown(&stable);
+                let mut lines = crate::markdown::render_markdown(&stable);
+                // Same leading/trailing-blank strip as the transcript-item
+                // flush above. `stable` ends at a `\n\n` boundary by
+                // construction of `stable_streaming_prefix_end`, so the last
+                // rendered Line is always blank and lands as a dead row in
+                // scrollback above the viewport.
+                let is_blank = |l: &ratatui::text::Line<'static>| {
+                    l.spans.iter().all(|s| s.content.trim().is_empty())
+                };
+                while lines.first().is_some_and(&is_blank) {
+                    lines.remove(0);
+                }
+                while lines.last().is_some_and(&is_blank) {
+                    lines.pop();
+                }
                 let row_count = lines.len() as u16;
                 tracing::debug!(
                     stable_bytes = stable.len(),

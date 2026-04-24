@@ -129,6 +129,22 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         }
     }
 
+    // Strip trailing blank lines so the last rendered row is real
+    // content, not a dead separator. `push_user_message` and
+    // `push_assistant_text` append a `Line::from("")` for intra-frame
+    // rhythm between consecutive items — useful when multiple items
+    // sit in the transcript, harmful on the last item because it
+    // turns into a blank row directly above the spinner + input box
+    // (the 2026-04-24 "空了一行" complaint in Fullscreen-fallback
+    // mode). We keep all INTER-item blanks so multi-turn transcripts
+    // still breathe; only the last trailing blank is removed.
+    while lines
+        .last()
+        .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+    {
+        lines.pop();
+    }
+
     // Pin viewport to the bottom of the transcript by default.
     //
     // Count *terminal cells*, not Unicode code points. CJK ideographs and
@@ -711,8 +727,9 @@ fn render_command_palette(frame: &mut Frame, app: &App, input_area: Rect, theme:
     }
 
     // Clamp the popup so it stays inside the frame buffer. In Inline
-    // mode the viewport is FIXED_INLINE_ROWS tall (8), so the rows
-    // available ABOVE the input box can be as few as 2. Without this
+    // mode the viewport is FIXED_INLINE_ROWS tall (6 post-2026-04-24),
+    // so the rows available ABOVE the input box can be as few as 1.
+    // Without this
     // clamp `frame.render_widget(Clear, area)` writes to absolute
     // coordinates that fall outside `frame.area()` and ratatui's
     // `Buffer::index_of` panics with "index outside of buffer".
@@ -1025,26 +1042,27 @@ mod tests {
     }
 
     /// Regression: rendering the slash-command palette at the small
-    /// FIXED_INLINE_ROWS=8 viewport height with a maximum-sized 8-entry
-    /// match list panicked with
+    /// inline-viewport height with a maximum-sized 8-entry match list
+    /// panicked with
     /// `index outside of buffer: the area is Rect{ x:0, y:91, h:8 }
     /// but index is (0, 84)` because the palette popup was placed at
     /// `input_area.y - (n+2)` without bounding to the frame top.
-    /// User-supplied stack on 2026-04-21.
+    /// User-supplied stack on 2026-04-21. Kept at h=8 (the pre-
+    /// 2026-04-24 viewport height) so the test continues to exercise
+    /// the "a few rows above input" shape; the even-smaller h=6 case
+    /// is implicitly covered because h=6 offers even less headroom.
     #[test]
-    fn palette_popup_does_not_panic_on_8_row_viewport() {
+    fn palette_popup_does_not_panic_on_small_viewport() {
         use crate::app::AppMode;
         let mut app = App::new("s".into(), "m".into());
-        // Mimic the post-`/` state: mode = CommandPalette, 8 matches
-        // (the maximum the popup ever shows). Real palette_matches
-        // contents don't matter for the OOB check — only the count.
         app.mode = AppMode::CommandPalette;
         app.set_input("/");
         app.palette_matches = (0..8).map(|i| format!("cmd{i}")).collect();
-        // FIXED_INLINE_ROWS = 8 in the runtime; reproduce that height
-        // here. Width matches the user's report (354) so any width-
-        // dependent regression also lands.
+        // Width matches the user's report (354) so any width-dependent
+        // regression also lands.
         let _ = render_to_string(&app, 354, 8);
+        // And at the new (post-2026-04-24) inline height of 6 rows.
+        let _ = render_to_string(&app, 354, 6);
     }
 
     /// AC-V11 — each `AppMode` produces the matching footer hint string at
@@ -1256,6 +1274,43 @@ mod tests {
         assert!(
             s.contains("user message number 39"),
             "latest message should be visible at the bottom:\n{s}"
+        );
+    }
+
+    /// Regression for the 2026-04-24 "still an empty row above the
+    /// input box" complaint in Inline mode: with `FIXED_INLINE_ROWS=6`
+    /// the transcript-area `Constraint::Min(0)` must collapse to 0
+    /// rows, so the 80x6 render contains ONLY chrome (spinner + input
+    /// box + help + status) with no blank transcript row between
+    /// scrollback (above the inline viewport, invisible to this test)
+    /// and the input-box top border.
+    #[test]
+    fn inline_viewport_has_no_transcript_gap_above_input() {
+        let app = App::new("s".into(), "m".into());
+        // Matches the Inline viewport exactly: width doesn't matter,
+        // height must equal FIXED_INLINE_ROWS.
+        let s = render_to_string(&app, 80, 6);
+        let all = rows(&s);
+        assert_eq!(all.len(), 6, "expected 6 rows, got {}", all.len());
+        // Row 0 must be the spinner row. The spinner is empty outside
+        // of streaming — but the row itself still exists as the top
+        // row of the inline viewport.
+        // Row 1 must be the input-box TOP border ─ this is the key
+        // invariant. Previously FIXED_INLINE_ROWS=8 placed two blank
+        // transcript rows before the border, producing the visible gap.
+        assert!(
+            all[1].trim_start().starts_with('┌'),
+            "row 1 must be the input-box top border, got {:?}\nfull:\n{s}",
+            all[1]
+        );
+        // Rows 3..6 carry input-body, input-bottom-border, help-footer,
+        // status-bar respectively. Lightly probe the help footer so
+        // this test catches any layout reshuffle that leaves chrome
+        // out of place.
+        assert!(
+            all[4].contains("for shortcuts"),
+            "row 4 must be the help footer, got {:?}\nfull:\n{s}",
+            all[4]
         );
     }
 
