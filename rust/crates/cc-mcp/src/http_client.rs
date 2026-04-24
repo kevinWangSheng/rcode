@@ -482,8 +482,9 @@ impl McpHttpClient {
 
         if content_type.starts_with("application/json") {
             let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
-            return serde_json::from_slice::<JsonRpcResponse>(&bytes)
-                .map_err(|e| format!("parse json-rpc: {e}"));
+            let parsed: JsonRpcResponse =
+                serde_json::from_slice(&bytes).map_err(|e| format!("parse json-rpc: {e}"))?;
+            return lift_session_expired(&self.server_name, parsed);
         }
 
         if content_type.starts_with("text/event-stream") {
@@ -495,7 +496,7 @@ impl McpHttpClient {
                 let mut guard = self.last_event_id.lock().await;
                 *guard = Some(eid);
             }
-            return parse_sse_for_id(&body, req_id);
+            return lift_session_expired(&self.server_name, parse_sse_for_id(&body, req_id)?);
         }
 
         Err(format!("unexpected content-type: {content_type}"))
@@ -659,6 +660,31 @@ fn session_expired_msg(server_name: &str) -> String {
     format!("MCP session expired (404) for '{server_name}'; reconnecting")
 }
 
+/// JSON-RPC error code for "session has been closed" per the MCP
+/// 2025-03-26 Streamable-HTTP transport spec. A server can return
+/// this on a session-bound request instead of HTTP 404; the client
+/// treats both paths identically (reconnect + retry-once).
+const JSON_RPC_SESSION_EXPIRED_CODE: i64 = -32001;
+
+/// Normalise "session expired" signals from the server into the same
+/// error marker the HTTP 404 path raises. A server answering a
+/// session-bound request with HTTP 200 + JSON-RPC `error.code ==
+/// -32001` means "the id you carried is gone; please reinitialise"
+/// — without lifting it here, `send_request` would bubble the success-
+/// shaped JsonRpcResponse to the caller and the reconnect + retry
+/// would never fire (P0 #11 tail, 2026-04-24 parity-gaps).
+fn lift_session_expired(
+    server_name: &str,
+    resp: JsonRpcResponse,
+) -> Result<JsonRpcResponse, String> {
+    if let Some(err) = &resp.error {
+        if err.code == JSON_RPC_SESSION_EXPIRED_CODE {
+            return Err(session_expired_msg(server_name));
+        }
+    }
+    Ok(resp)
+}
+
 /// Is `err` the distinctive session-expired marker we raise from
 /// `send_request_inner`? Returning `true` tells the outer send path it's
 /// safe to attempt a single reconnect + retry.
@@ -758,6 +784,52 @@ mod tests {
         // about the last non-empty value — the reset semantics don't apply.
         let body = "id: 42\ndata: {}\n\nid:\ndata: {}\n\n";
         assert_eq!(parse_sse_last_event_id(body).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn lift_session_expired_converts_minus_32001_to_reconnect_marker() {
+        let resp = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(7),
+            result: None,
+            error: Some(crate::types::JsonRpcError {
+                code: JSON_RPC_SESSION_EXPIRED_CODE,
+                message: "Session has been closed".into(),
+                data: None,
+            }),
+        };
+        let err = lift_session_expired("fs", resp).unwrap_err();
+        assert!(
+            is_session_expired_err(&err),
+            "lifted error must match is_session_expired_err: {err}"
+        );
+    }
+
+    #[test]
+    fn lift_session_expired_passes_through_other_errors() {
+        let resp = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(7),
+            result: None,
+            error: Some(crate::types::JsonRpcError {
+                code: -32601,
+                message: "method not found".into(),
+                data: None,
+            }),
+        };
+        let ok = lift_session_expired("fs", resp).unwrap();
+        assert_eq!(ok.error.as_ref().map(|e| e.code), Some(-32601));
+    }
+
+    #[test]
+    fn lift_session_expired_passes_through_success() {
+        let resp = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(7),
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+        };
+        assert!(lift_session_expired("fs", resp).is_ok());
     }
 
     #[test]

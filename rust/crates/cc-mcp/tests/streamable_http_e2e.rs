@@ -622,6 +622,126 @@ async fn second_404_in_a_row_surfaces_error() {
     server.await.unwrap();
 }
 
+/// 2026-04-24 P0 #11 tail: a session-bound request answered with
+/// HTTP 200 + JSON-RPC `error.code == -32001` (the MCP-spec-defined
+/// "Session has been closed" signal) must trigger the same reconnect
+/// + retry path the HTTP-404 variant does. Before the fix, the
+/// client surfaced the raw JsonRpcResponse to the caller because
+/// `is_session_expired_err` only matched on the 404 marker string.
+#[tokio::test]
+async fn session_minus_32001_body_triggers_reconnect_and_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    const SESSION_ID_V1: &str = "sess-v1-32001";
+    const SESSION_ID_V2: &str = "sess-v2-32001";
+
+    let server = tokio::spawn(async move {
+        // 1. initialize → v1
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (_h, req) = read_request(&mut sock).await;
+        let id = req["id"].as_u64().unwrap_or(0);
+        write_response(
+            &mut sock,
+            200,
+            &[("Mcp-Session-Id", SESSION_ID_V1)],
+            &json!({
+                "jsonrpc":"2.0","id":id,
+                "result":{"protocolVersion":"2024-11-05","capabilities":{},
+                    "serverInfo":{"name":"stub","version":"0.0.1"}}
+            }),
+        )
+        .await;
+
+        // 2. initialized notif
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut sock).await;
+        write_empty_202(&mut sock).await;
+
+        // 3. tools/list with v1 → HTTP 200 + -32001 body (the new
+        //    in-spec signal). The HTTP status is a success; only the
+        //    JSON-RPC body signals the stale session.
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (headers, req) = read_request(&mut sock).await;
+        assert_eq!(req["method"], "tools/list");
+        assert_eq!(
+            headers.get("mcp-session-id").map(String::as_str),
+            Some(SESSION_ID_V1),
+        );
+        let body_id = req["id"].as_u64().unwrap_or(0);
+        write_response(
+            &mut sock,
+            200,
+            &[],
+            &json!({
+                "jsonrpc":"2.0","id":body_id,
+                "error":{"code":-32001,"message":"Session has been closed"}
+            }),
+        )
+        .await;
+
+        // 4. reconnect initialize → v2
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (headers, req) = read_request(&mut sock).await;
+        assert_eq!(req["method"], "initialize");
+        assert!(
+            !headers.contains_key("mcp-session-id"),
+            "reconnect initialize must drop the expired id"
+        );
+        let id = req["id"].as_u64().unwrap_or(0);
+        write_response(
+            &mut sock,
+            200,
+            &[("Mcp-Session-Id", SESSION_ID_V2)],
+            &json!({
+                "jsonrpc":"2.0","id":id,
+                "result":{"protocolVersion":"2024-11-05","capabilities":{},
+                    "serverInfo":{"name":"stub","version":"0.0.1"}}
+            }),
+        )
+        .await;
+
+        // 5. post-reconnect initialized notif
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (headers, _) = read_request(&mut sock).await;
+        assert_eq!(
+            headers.get("mcp-session-id").map(String::as_str),
+            Some(SESSION_ID_V2)
+        );
+        write_empty_202(&mut sock).await;
+
+        // 6. retried tools/list with v2 → success
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (headers, req) = read_request(&mut sock).await;
+        assert_eq!(req["method"], "tools/list");
+        assert_eq!(
+            headers.get("mcp-session-id").map(String::as_str),
+            Some(SESSION_ID_V2),
+        );
+        let id = req["id"].as_u64().unwrap_or(0);
+        write_response(
+            &mut sock,
+            200,
+            &[],
+            &json!({"jsonrpc":"2.0","id":id,"result":{"tools":[]}}),
+        )
+        .await;
+    });
+
+    let mut client = McpHttpClient::connect("stub", &url).await.expect("connect");
+    assert_eq!(client.session_id().await.as_deref(), Some(SESSION_ID_V1));
+
+    // The caller sees a clean success — the -32001 → reconnect → retry
+    // transition is invisible, exactly like the 404 path.
+    let tools = client
+        .list_tools()
+        .await
+        .expect("tools/list after -32001 reconnect");
+    assert!(tools.is_empty());
+    assert_eq!(client.session_id().await.as_deref(), Some(SESSION_ID_V2));
+    assert_eq!(client.session_version(), 1);
+    server.await.unwrap();
+}
+
 /// Five in-flight `tools/call` requests race into a 404 at the same time.
 /// Only one reconnect (`initialize` + `notifications/initialized`) must
 /// happen; the other four tasks observe the version bump and retry with
