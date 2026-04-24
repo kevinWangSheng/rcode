@@ -174,6 +174,13 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     //     viewport payload short.
     crossterm::terminal::enable_raw_mode()
         .map_err(|e| cc_core::CcError::Other(format!("enable raw mode: {e}")))?;
+    // Enable bracketed paste so multi-line paste chunks arrive as a single
+    // `Event::Paste(String)` instead of a sequence of per-char `KeyEvents`
+    // where each embedded `\n` would be interpreted as Enter → Submit. Best-
+    // effort: older / nested terminals that don't honour the DEC mode just
+    // ignore the write and we fall back to per-char key events (pre-fix
+    // behaviour), so failing here should not abort startup.
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
     let term_size = crossterm::terminal::size()
         .map_err(|e| cc_core::CcError::Other(format!("terminal size: {e}")))?;
     let initial_height = clamp_viewport(FIXED_INLINE_ROWS, term_size.1);
@@ -309,6 +316,13 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
                     Some(Ok(crossterm::event::Event::Key(key))) => {
                         map_key_event(&key, &app.keybindings, &app)
                     }
+                    Some(Ok(crossterm::event::Event::Paste(text))) => {
+                        // Bracketed paste: route the whole chunk through a
+                        // single action so embedded `\n`s stay in the input
+                        // buffer instead of each arriving as a separate
+                        // Enter → Submit. See `AppAction::Paste` docs.
+                        Some(AppAction::Paste(text))
+                    }
                     Some(Ok(crossterm::event::Event::Resize(_, _))) => None,
                     Some(Err(_)) | None => Some(AppAction::Quit),
                     _ => None,
@@ -334,6 +348,8 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
                     // with SIGINT-style status. No alt-screen to leave under
                     // inline mode.
                     root_cancel.cancel();
+                    let _ =
+                        crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
                     let _ = crossterm::terminal::disable_raw_mode();
                     std::process::exit(130);
                 }
@@ -395,6 +411,7 @@ pub async fn run_tui(config: TuiConfig) -> cc_core::CcResult<()> {
     // Restore terminal: drop raw mode but leave the rendered inline content
     // in scrollback. Insert a trailing newline so the user's next shell
     // prompt starts on a fresh row instead of overlapping our last line.
+    let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
     let _ = crossterm::terminal::disable_raw_mode();
     println!();
     Ok(())

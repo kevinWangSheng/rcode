@@ -39,6 +39,11 @@ pub enum AppAction {
     HelpShortcut,
     Submit,
     NewLine,
+    /// Bracketed-paste chunk. `text` may contain newlines — they go
+    /// into `app.input` verbatim so the full buffer is sent as one
+    /// message on Submit, rather than each `\n` triggering a
+    /// submit as if the user hit Enter between every pasted line.
+    Paste(String),
 
     // Navigation
     ScrollUp(u16),
@@ -432,6 +437,21 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
         AppAction::NewLine => {
             app.input_insert_char('\n');
         }
+        AppAction::Paste(text) => {
+            // Bracketed paste: insert the whole chunk as one unit so the
+            // `\n`s land in `app.input` verbatim instead of each arriving
+            // as a separate `Enter` (which the key path would route to
+            // `Submit` and accidentally send each pasted line as its own
+            // turn). Gate on `can_edit_input` so paste during a
+            // permission prompt or streaming still routes consistently
+            // with the key path.
+            if can_edit_input(app.mode) {
+                app.input_insert_str(&text);
+                if app.mode == AppMode::CommandPalette {
+                    refresh_palette(app, ctx.commands);
+                }
+            }
+        }
         AppAction::ScrollUp(n) => {
             app.scroll = app.scroll.saturating_add(n);
         }
@@ -697,6 +717,39 @@ mod tests {
             CommandRegistry::empty(),
             CommandContext::new("0.1.0", "test-model"),
         )
+    }
+
+    /// Regression for the "paste with newline auto-submits each line" bug
+    /// (2026-04-24): a bracketed-paste chunk carrying embedded `\n` MUST
+    /// land in `app.input` as one contiguous buffer — Submit must not
+    /// fire inside the paste, and the chunk must be retrievable verbatim
+    /// on a subsequent Submit.
+    #[test]
+    fn paste_inserts_multiline_chunk_as_single_buffer() {
+        let mut app = App::new("s".into(), "m".into());
+        let (reg, ctx) = test_ctx();
+        let uctx = UpdateContext {
+            commands: &reg,
+            command_ctx: &ctx,
+        };
+
+        let pasted = "fn a() {\n    b();\n}".to_string();
+        let r = update(&mut app, AppAction::Paste(pasted.clone()), &uctx);
+        // Paste must NOT submit — embedded `\n` is content, not Enter.
+        assert!(matches!(r, UpdateResult::Continue));
+        assert_eq!(app.input, pasted);
+        // The caret parks at the end of the pasted chunk so the user
+        // can continue typing after it.
+        assert_eq!(app.input_cursor, pasted.len());
+
+        // A following Submit sends the whole multi-line buffer as ONE
+        // turn, with embedded newlines preserved (Submit still trims
+        // leading/trailing whitespace — verified by the existing
+        // `insert_and_submit_*` test — so we pass a payload without
+        // trailing whitespace here).
+        let r2 = update(&mut app, AppAction::Submit, &uctx);
+        assert!(matches!(r2, UpdateResult::SubmitToEngine(t) if t == pasted));
+        assert!(app.input.is_empty());
     }
 
     #[test]

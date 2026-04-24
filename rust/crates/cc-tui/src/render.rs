@@ -547,6 +547,46 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 .fg(theme.dim)
                 .add_modifier(Modifier::ITALIC),
         ));
+    } else if app.input.contains('\n') {
+        // Multi-line buffer (e.g. bracketed paste of a code block). The
+        // input widget is a single-row display, so rather than silently
+        // dropping `\n` (which has zero terminal-cell width and would
+        // render pasted-code as a mashed single line) we show the FIRST
+        // line plus a dim `[+N more lines]` counter. The submit path
+        // still sends `app.input` verbatim, so the full multi-line
+        // content reaches the model.
+        let mut lines_iter = app.input.split('\n');
+        let first = lines_iter.next().unwrap_or("");
+        let remaining = lines_iter.count();
+        // Slice the first line by display cells starting at `offset`,
+        // same logic as the single-line branch.
+        let mut shown = String::new();
+        let mut cum = 0usize;
+        let mut emitted = 0usize;
+        let inner = inner_width as usize;
+        for ch in first.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cum < offset {
+                cum += w;
+                continue;
+            }
+            if emitted + w > inner {
+                break;
+            }
+            shown.push(ch);
+            emitted += w;
+            cum += w;
+        }
+        spans.push(Span::styled(shown, Style::default().fg(theme.text)));
+        spans.push(Span::styled(
+            format!(
+                " [+{remaining} more line{}]",
+                if remaining == 1 { "" } else { "s" }
+            ),
+            Style::default()
+                .fg(theme.dim)
+                .add_modifier(Modifier::ITALIC),
+        ));
     } else {
         // Slice the buffer by display cells starting at `offset`. Walk
         // chars skipping until we've passed `offset` cells, then emit up
@@ -1216,6 +1256,54 @@ mod tests {
         assert!(
             s.contains("user message number 39"),
             "latest message should be visible at the bottom:\n{s}"
+        );
+    }
+
+    /// Regression for the "big gap between content and input" report
+    /// (2026-04-24, CC_TUI_FORCE_FULLSCREEN=1): a SHORT transcript in
+    /// Fullscreen-fallback mode must sit flush against the spinner
+    /// row just above the input box, not float at row 0 with a
+    /// yawning gap below it.
+    #[test]
+    fn short_transcript_pins_to_bottom_in_fullscreen() {
+        let mut app = App::new("s".into(), "m".into());
+        app.push_user("hello".into());
+        app.start_stream();
+        app.on_token("Hello! How can I help?");
+        app.finish_stream();
+
+        // 80×30: transcript is rows 0..24 (chrome = spinner+input+footer+status = 6).
+        // Latest content must land on the last non-blank transcript row.
+        let s = render_to_string(&app, 80, 30);
+        let all = rows(&s);
+        // Pick the transcript slice (everything above the 6-row chrome).
+        let transcript = &all[..all.len().saturating_sub(6)];
+        // Walk backwards: the first non-blank row from the bottom is
+        // where the content currently sits. It must be one of the LAST
+        // two transcript rows (user + assistant pair), not the FIRST.
+        let last_non_blank = transcript
+            .iter()
+            .rposition(|r| !r.trim().is_empty())
+            .expect("transcript must render at least one non-blank row");
+        assert!(
+            last_non_blank >= transcript.len() - 3,
+            "latest content must be pinned near the bottom of the transcript area, \
+             but the last non-blank row is {last_non_blank} of {} transcript rows.\n\
+             full frame:\n{s}",
+            transcript.len()
+        );
+        // Also: the FIRST non-blank row must be in the bottom half —
+        // if content starts at row 0 we have the gap bug.
+        let first_non_blank = transcript
+            .iter()
+            .position(|r| !r.trim().is_empty())
+            .expect("transcript must render at least one non-blank row");
+        assert!(
+            first_non_blank > transcript.len() / 2,
+            "content must not float at the top of the transcript area; \
+             first non-blank row is {first_non_blank} of {} transcript rows (gap bug).\n\
+             full frame:\n{s}",
+            transcript.len()
         );
     }
 
