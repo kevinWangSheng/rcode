@@ -113,28 +113,11 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Permission mode — controls the default behavior when no rule matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PermissionMode {
-    /// Normal interactive mode: ask the user when no rule matches.
-    #[default]
-    Default,
-    /// `dontAsk` / auto-approve mode: auto-allow after deny check (no dialog).
-    DontAsk,
-    /// `plan` mode: read-only tools allowed; write tools auto-denied.
-    Plan,
-}
-
-impl PermissionMode {
-    /// Parse from the `defaultMode` settings string.
-    pub fn from_settings_str(s: &str) -> Self {
-        match s {
-            "dontAsk" | "bypassPermissions" | "acceptEdits" => Self::DontAsk,
-            "plan" => Self::Plan,
-            _ => Self::Default,
-        }
-    }
-}
+// PermissionMode now lives in cc-core so richer audit types
+// (`PermissionDecisionReason`) can reference it without creating a
+// cycle. Re-export here to preserve the old `cc_permissions::PermissionMode`
+// public path for downstream crates.
+pub use cc_core::PermissionMode;
 
 /// Write tools — auto-denied in plan mode.
 static WRITE_TOOLS: &[&str] = &["Write", "Edit", "Bash", "MultiEdit"];
@@ -234,10 +217,17 @@ impl PermissionEngine {
             }
         }
 
-        // 4. Mode-based default behavior
+        // 4. Mode-based default behavior. The three post-D-A variants
+        // (AcceptEdits, BypassPermissions, Auto) map to existing
+        // behaviour as a no-op: later changes will layer tool-specific
+        // `check_permissions` hooks (AcceptEdits), SafetyCheck
+        // gating (BypassPermissions), and the classifier (Auto) on
+        // top without widening the enum.
         match self.mode {
-            PermissionMode::DontAsk => {
-                // Auto-allow: no dialog, no prompt
+            PermissionMode::DontAsk
+            | PermissionMode::AcceptEdits
+            | PermissionMode::BypassPermissions => {
+                // Auto-allow: no dialog, no prompt.
                 PermissionResult::allow(PermissionSource::ModeDefault)
             }
             PermissionMode::Plan => {
@@ -252,8 +242,10 @@ impl PermissionEngine {
                     PermissionResult::allow(PermissionSource::ModeDefault)
                 }
             }
-            PermissionMode::Default => {
-                // Ask the user interactively
+            PermissionMode::Default | PermissionMode::Auto => {
+                // Ask the user interactively (Auto will route through
+                // the classifier once Change E lands; until then it
+                // falls back to a safe ask.)
                 PermissionResult::ask()
             }
         }
@@ -470,7 +462,18 @@ mod tests {
         engine.set_mode_str("unknown");
         assert_eq!(engine.mode, PermissionMode::Default);
 
+        // After D-A each settings-level string maps to its OWN
+        // variant. Three formerly-collapsed strings
+        // (bypassPermissions / acceptEdits / auto) now have distinct
+        // modes; the engine still maps them to the same *behavior*
+        // until Change B / E land.
         engine.set_mode_str("bypassPermissions");
-        assert_eq!(engine.mode, PermissionMode::DontAsk);
+        assert_eq!(engine.mode, PermissionMode::BypassPermissions);
+
+        engine.set_mode_str("acceptEdits");
+        assert_eq!(engine.mode, PermissionMode::AcceptEdits);
+
+        engine.set_mode_str("auto");
+        assert_eq!(engine.mode, PermissionMode::Auto);
     }
 }

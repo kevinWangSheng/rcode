@@ -695,7 +695,13 @@ impl QueryEngine {
                         .await
                         .unwrap_or(PromptDecision::Deny);
                     match decision {
-                        PromptDecision::Deny => {
+                        PromptDecision::Deny | PromptDecision::Interrupt => {
+                            // Interrupt is a hook-produced signal that
+                            // the whole turn must abort. Today the
+                            // engine has no dedicated "abort turn"
+                            // plumbing (Change D will add it); treat
+                            // the marker as the same fatal-deny path
+                            // as a user Deny so no tool runs.
                             fire_permission_denied(
                                 &self.hooks,
                                 &self.session.id,
