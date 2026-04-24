@@ -593,12 +593,14 @@ fn map_engine_event(event: CoreEvent) -> Option<AppAction> {
             })
         }
         CoreEvent::Error(msg) => Some(AppAction::Error(msg)),
-        // Ignored: thinking blocks and streaming tool-use fragments are
-        // internal streaming details not shown in the transcript view.
-        CoreEvent::StreamThinking(_)
-        | CoreEvent::StreamToolUse(_)
-        | CoreEvent::StreamEnd(_)
-        | CoreEvent::TaskUpdate(_) => None,
+        // Extended-thinking deltas now land as their own transcript
+        // variant (2026-04-24 parity-gaps P1 #21). StreamToolUse /
+        // StreamEnd / TaskUpdate remain no-ops: tool-use text is
+        // superseded by the ToolStart card the engine emits, StreamEnd
+        // is purely a lifecycle signal, and TaskUpdate is internal to
+        // the agent task queue.
+        CoreEvent::StreamThinking(text) => Some(AppAction::ThinkingDelta(text)),
+        CoreEvent::StreamToolUse(_) | CoreEvent::StreamEnd(_) | CoreEvent::TaskUpdate(_) => None,
     }
 }
 

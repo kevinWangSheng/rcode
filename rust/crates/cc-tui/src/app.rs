@@ -31,6 +31,16 @@ pub const HISTORY_MAX: usize = 200;
 pub enum TranscriptItem {
     UserMessage(String),
     AssistantText(String),
+    /// Extended-thinking content from the assistant (Anthropic
+    /// `thinking` block). Rendered in a dim italic style with a `💭 `
+    /// gutter so it reads as "meta commentary" distinct from the
+    /// primary reply. Streaming `StreamThinking` deltas coalesce into
+    /// a single variant: the TUI drops a fresh one when the
+    /// transcript tail is not yet a `ThinkingBlock` (or the last
+    /// block already committed its text) and otherwise extends in
+    /// place. Without this variant `StreamThinking` events silently
+    /// dropped on the floor (2026-04-24 parity-gaps P1 #21).
+    ThinkingBlock(String),
     ToolCall {
         name: String,
         input_summary: String,
@@ -521,6 +531,7 @@ impl App {
             transcript = transcript.saturating_add(match item {
                 TranscriptItem::UserMessage(t) => count_wrapped(t).saturating_add(1),
                 TranscriptItem::AssistantText(t) => count_wrapped(t).saturating_add(1),
+                TranscriptItem::ThinkingBlock(t) => count_wrapped(t).saturating_add(1),
                 TranscriptItem::ToolCall { input_summary, .. } => {
                     count_wrapped(input_summary).max(1)
                 }
@@ -637,6 +648,22 @@ impl App {
 
     pub fn push_compact_boundary(&mut self) {
         self.transcript.push(TranscriptItem::CompactBoundary);
+        self.scroll = 0;
+    }
+
+    /// Append a streaming `StreamThinking` delta. If the tail of the
+    /// transcript is already a `ThinkingBlock`, the delta is appended
+    /// in place so a multi-chunk thinking section coalesces into one
+    /// block; otherwise a new `ThinkingBlock` variant is pushed. Called
+    /// from the `CoreEvent::StreamThinking` → `AppAction::ThinkingDelta`
+    /// mapping so extended-thinking output lands in the transcript
+    /// instead of being silently dropped (2026-04-24 parity-gaps P1 #21).
+    pub fn push_thinking_delta(&mut self, delta: String) {
+        if let Some(TranscriptItem::ThinkingBlock(existing)) = self.transcript.last_mut() {
+            existing.push_str(&delta);
+        } else {
+            self.transcript.push(TranscriptItem::ThinkingBlock(delta));
+        }
         self.scroll = 0;
     }
 
@@ -913,5 +940,35 @@ mod tests {
         assert_eq!(app.mode, AppMode::Streaming);
         app.finish_stream();
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    /// 2026-04-24 parity-gaps P1 #21: consecutive ThinkingDelta chunks
+    /// must coalesce into a single transcript entry; a non-thinking
+    /// item between two chunks forces a new block.
+    #[test]
+    fn thinking_delta_coalesces_until_new_item() {
+        let mut app = App::new("s".into(), "m".into());
+        app.push_thinking_delta("hmm,".into());
+        app.push_thinking_delta(" let me think".into());
+        assert_eq!(app.transcript.len(), 1);
+        matches!(app.transcript[0], TranscriptItem::ThinkingBlock(_));
+        if let TranscriptItem::ThinkingBlock(t) = &app.transcript[0] {
+            assert_eq!(t, "hmm, let me think");
+        }
+
+        // An assistant text resets the coalescing window — the next
+        // delta must start a new ThinkingBlock entry.
+        app.transcript
+            .push(TranscriptItem::AssistantText("answer".into()));
+        app.push_thinking_delta("second thought".into());
+        assert_eq!(app.transcript.len(), 3);
+        if let TranscriptItem::ThinkingBlock(t) = app.transcript.last().unwrap() {
+            assert_eq!(t, "second thought");
+        } else {
+            panic!(
+                "expected trailing ThinkingBlock, got {:?}",
+                app.transcript.last()
+            );
+        }
     }
 }

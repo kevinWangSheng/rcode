@@ -52,6 +52,11 @@ pub enum AppAction {
 
     // Streaming
     StreamDelta(String),
+    /// A chunk of extended-thinking text from the model. Coalesces with
+    /// the preceding `ThinkingBlock` transcript entry (if any) so a
+    /// multi-chunk thinking section renders as one block, not N tiny
+    /// lines. 2026-04-24 parity-gaps P1 #21.
+    ThinkingDelta(String),
     ToolStart {
         name: String,
         input_summary: String,
@@ -468,6 +473,13 @@ pub fn update(app: &mut App, action: AppAction, ctx: &UpdateContext) -> UpdateRe
             // rather than relying on the engine to stop emitting instantly.
             if app.mode == AppMode::Streaming {
                 app.on_token(&delta);
+            }
+        }
+        AppAction::ThinkingDelta(delta) => {
+            // Same AC-2b guard as `StreamDelta`: don't append thinking
+            // text for a turn the user already aborted.
+            if app.mode == AppMode::Streaming {
+                app.push_thinking_delta(delta);
             }
         }
         AppAction::ToolStart {

@@ -233,6 +233,7 @@ fn push_transcript_item(
     match item {
         TranscriptItem::UserMessage(text) => push_user_message(lines, text, theme),
         TranscriptItem::AssistantText(text) => push_assistant_text(lines, text),
+        TranscriptItem::ThinkingBlock(text) => push_thinking_block(lines, text, theme),
         TranscriptItem::ToolCall {
             name,
             input_summary,
@@ -246,6 +247,37 @@ fn push_transcript_item(
         TranscriptItem::SystemNotice(text) => push_system_notice(lines, text, theme),
         TranscriptItem::CompactBoundary => push_compact_boundary(lines, width, theme),
     }
+}
+
+/// Render an extended-thinking block as dim italic text with a `💭 `
+/// gutter glyph on the first line. The style lets readers distinguish
+/// the model's internal reasoning from the primary reply without the
+/// two streams visually competing. The bubble glyph is U+1F4AD which
+/// renders as 2 cells on most monospace fonts; if your terminal has
+/// no emoji coverage it falls back to tofu but that's cosmetic only.
+fn push_thinking_block(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme) {
+    let body_style = Style::default()
+        .fg(theme.dim)
+        .add_modifier(Modifier::ITALIC);
+    let gutter_style = Style::default().fg(theme.dim);
+    let mut body_lines = text.lines();
+    if let Some(first) = body_lines.next() {
+        lines.push(Line::from(vec![
+            Span::styled("💭 ".to_string(), gutter_style),
+            Span::styled(first.to_string(), body_style),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled("💭".to_string(), gutter_style)));
+    }
+    for rest in body_lines {
+        lines.push(Line::from(vec![
+            Span::raw("   ".to_string()),
+            Span::styled(rest.to_string(), body_style),
+        ]));
+    }
+    // Trailing blank row so the next transcript item breathes. Matches
+    // push_user_message / push_assistant_text rhythm.
+    lines.push(Line::from(""));
 }
 
 // Phase D5 gutter conventions:
@@ -1106,6 +1138,40 @@ mod tests {
         app.mode = AppMode::CommandPalette;
         let s = render_to_string(&app, 80, 24);
         assert!(rows(&s)[22].contains("↑↓ select"));
+    }
+
+    /// 2026-04-24 parity-gaps P1 #21: `StreamThinking` events land in the
+    /// transcript as a `ThinkingBlock` variant, rendered dim italic with
+    /// a `💭 ` gutter. Before the fix the enum had no variant for it and
+    /// the mapping in `tui_action_from_event` returned `None`, so all
+    /// extended-thinking text was silently dropped.
+    #[test]
+    fn thinking_block_renders_dim_italic_with_bubble_gutter() {
+        let mut app = App::new("s".into(), "claude-sonnet-4-6".into());
+        app.transcript
+            .push(TranscriptItem::ThinkingBlock("hmm, recursion?".into()));
+        let s = render_to_string(&app, 80, 24);
+        assert!(s.contains("💭"), "bubble glyph missing:\n{s}");
+        assert!(s.contains("hmm, recursion"), "body missing:\n{s}");
+
+        // The body span must carry ITALIC so it visually separates from
+        // the surrounding prose. Walk the rendered spans directly.
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let theme = theme::current();
+        let buf = term.backend().buffer();
+        // "hmm" starts at col 3 (after "💭 " which is 3 cells incl.
+        // trailing space) on a row containing the body.
+        // Walk rows and find the first cell whose style carries ITALIC.
+        let italic_present = buf
+            .content()
+            .iter()
+            .any(|cell| cell.modifier.contains(Modifier::ITALIC) && cell.fg == theme.dim);
+        assert!(
+            italic_present,
+            "no dim-italic cells rendered for thinking block"
+        );
     }
 
     /// Regression (2026-04-24 critique P0 #1): dismissing the permission
