@@ -13,6 +13,25 @@ const MAX_LINES_DEFAULT: usize = 2000;
 /// pass `offset` + `limit`, or use Grep/Bash for partial reads.
 const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Character-device paths Read must refuse. `/dev/zero` would stream
+/// null bytes until the cap fired; `/dev/random` / `/dev/urandom`
+/// would block or drain entropy; `/dev/null` is a no-op but has no
+/// legitimate Read use case. TS `FileReadTool` keeps the same list.
+/// Any match against `path.starts_with(...)` short-circuits before
+/// the `tokio::fs::File::open` syscall so we never create the fd.
+const BLOCKED_DEVICE_PATHS: &[&str] = &[
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/null",
+    "/dev/tty",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/proc",
+    "/sys",
+];
+
 pub struct ReadTool;
 
 #[async_trait]
@@ -59,6 +78,22 @@ impl Tool for ReadTool {
             .ok_or_else(|| CcError::tool("tool", "missing 'file_path' field"))?;
 
         let path = Path::new(file_path);
+
+        // Refuse blocked device / kernel-fs paths up-front (P0 #13).
+        // `/dev/zero`, `/dev/random`, `/proc`, `/sys` etc. would either
+        // stream garbage, drain entropy, or expose host info we never
+        // meant to surface. The check happens before `File::open` so the
+        // fd is never created.
+        let path_str = path.to_string_lossy();
+        if BLOCKED_DEVICE_PATHS.iter().any(|blocked| {
+            path_str.as_ref() == *blocked || path_str.starts_with(&format!("{blocked}/"))
+        }) {
+            return Ok(ToolResult::error(format!(
+                "{file_path} is on the blocked-device-paths list. \
+                 Use Bash with an explicit tool (`head`, `dd`, `od`) if \
+                 you really need to sample a device node."
+            )));
+        }
 
         // Refuse reads of git-ignored paths (P0 #3). `is_git_ignored` is
         // best-effort: if git is unavailable, the path is outside a repo,
@@ -400,6 +435,33 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         #[cfg(unix)]
         swapper.join().unwrap();
+    }
+
+    /// P0 #13: Read refuses kernel-fs and infinite-stream device nodes
+    /// without opening an fd. Uses `/dev/zero` because it always exists
+    /// on Unix and an accidental non-capped read would OOM the process
+    /// by streaming `\x00` until the 50 MB cap kicked in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_refuses_blocked_device_paths() {
+        let tool = ReadTool;
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        for path in ["/dev/zero", "/dev/urandom", "/dev/null", "/proc/cpuinfo"] {
+            if !std::path::Path::new(path).exists() {
+                continue;
+            }
+            let r = tool
+                .execute(json!({"file_path": path}), &ctx)
+                .await
+                .unwrap();
+            assert!(r.is_error, "read should refuse {path}: {}", r.content);
+            assert!(
+                r.content.contains("blocked-device-paths"),
+                "{}: missing explanation: {}",
+                path,
+                r.content
+            );
+        }
     }
 
     /// P0 #3: Read must refuse git-ignored paths with a structured
