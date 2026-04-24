@@ -54,6 +54,18 @@ const CONTEXT_TOKEN_BUDGET: u64 = cc_core::model::models::DEFAULT_CONTEXT_WINDOW
 pub fn render(frame: &mut Frame, app: &App) {
     let theme = theme::current();
 
+    // Blank the frame buffer before every draw. Ratatui's `Paragraph` and
+    // friends only touch cells they explicitly write to; cells outside a
+    // line's rendered width keep whatever the previous frame painted. Once
+    // a transient overlay (permission modal, slash palette) drew border
+    // glyphs at e.g. `│` cells, a subsequent frame's layout widgets wrote
+    // *around* them, leaving ghost borders and stale help-footer text
+    // after the overlay unmounted. Resetting the frame area each draw is
+    // the Ink-style "full redraw" semantic — the diff layer still only
+    // sends changed cells to the terminal, so the cost is just an O(w*h)
+    // buffer reset, not extra bytes on the wire.
+    frame.render_widget(Clear, frame.area());
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1094,6 +1106,88 @@ mod tests {
         app.mode = AppMode::CommandPalette;
         let s = render_to_string(&app, 80, 24);
         assert!(rows(&s)[22].contains("↑↓ select"));
+    }
+
+    /// Regression (2026-04-24 critique P0 #1): dismissing the permission
+    /// modal must not leave `│` border cells or the `y allow · a always
+    /// · n deny` help-footer text painted on the next frame. Reproduces
+    /// by rendering with the modal open, then clearing the permission
+    /// state and rendering again — any stray `│` outside the input box
+    /// or the word "allow" in the post-close footer row is a ghost.
+    #[test]
+    fn permission_modal_leaves_no_ghost_on_close() {
+        let mut app = App::new("s".into(), "claude-sonnet-4-6".into());
+        app.mode = AppMode::PermissionPrompt;
+        app.permission = Some(PendingPermission {
+            tool_name: "Bash".into(),
+            summary: "ls /tmp".into(),
+        });
+        // First draw: modal is up, │ cells are expected inside modal.
+        let open = render_to_string(&app, 80, 24);
+        assert!(open.contains("Permission required"));
+        assert!(open.contains("y allow"));
+
+        // Close the modal, return to streaming mode (the typical path
+        // after the user hits y/a/n mid-turn).
+        app.permission = None;
+        app.mode = AppMode::Streaming;
+
+        let closed = render_to_string(&app, 80, 24);
+        // Help footer on row 22 must be the Streaming hint, not the
+        // permission prompt's.
+        let footer = rows(&closed)[22];
+        assert!(
+            footer.contains("esc to interrupt"),
+            "footer did not reset to streaming hint:\n{footer}"
+        );
+        assert!(
+            !footer.contains("y allow"),
+            "stale permission footer text survived:\n{footer}"
+        );
+        // Outside the bordered input box (rows 19..22, cols 0 and 79
+        // hold │), no other row should carry a │ cell. Any would be a
+        // ghost from the modal's border.
+        for (i, row) in rows(&closed).iter().enumerate() {
+            if (19..=21).contains(&i) {
+                continue; // legitimate input-box borders
+            }
+            assert!(!row.contains('│'), "ghost │ survived on row {i}:\n{row}");
+        }
+    }
+
+    /// Regression (2026-04-24 critique P0 #4): slash palette must paint
+    /// a Clear backdrop behind its border so transcript content that
+    /// happened to sit under the popup rect doesn't bleed through.
+    /// Seeds a long transcript line with a unique marker, opens the
+    /// palette in the same column range, and asserts no marker char
+    /// survives inside the palette interior.
+    #[test]
+    fn palette_popup_clears_transcript_behind_it() {
+        let mut app = App::new("s".into(), "m".into());
+        // Push a long user message with a distinctive marker so any
+        // bleed-through is identifiable.
+        app.push_user("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".into());
+
+        app.mode = AppMode::CommandPalette;
+        app.set_input("/");
+        app.palette_matches = vec!["help".into(), "status".into()];
+        app.palette_selected = 0;
+
+        let s = render_to_string(&app, 80, 24);
+        // Palette anchors to x=0 and renders 20-50 cols wide above the
+        // input box (~row 15 ish). Inside that rect we should see the
+        // palette entries, never the `Z`-marker from the transcript.
+        let grid = rows(&s);
+        // Find a row that contains "/help" — that's inside the palette.
+        let palette_row = grid
+            .iter()
+            .position(|r| r.contains("/help"))
+            .expect("palette never rendered");
+        let line = grid[palette_row];
+        assert!(
+            !line.contains('Z'),
+            "transcript bled through palette backdrop: {line}"
+        );
     }
 
     /// AC-V11 bonus — typing into the input shows the claude-orange `>`

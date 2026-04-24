@@ -39,8 +39,9 @@ impl Tool for BashTool {
 
     fn description(&self) -> &str {
         "Execute a shell command and return its output. \
-         Non-zero exit codes are included in the result (no is_error flag). \
-         Use for file operations, running scripts, and system commands."
+         Non-zero exit codes flag the result as is_error (and include the \
+         exit code in the body). Use for file operations, running scripts, \
+         and system commands."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -176,10 +177,13 @@ impl Tool for BashTool {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        // Behavior contract: Bash non-zero exit → include exit code in content, NO is_error flag.
-        // Both streams are always included when non-empty — successful commands
-        // that write progress to stderr (cargo, make, etc.) would otherwise
-        // silently lose that output.
+        // Exit-code-based error signalling: a non-zero exit flips
+        // `is_error=true` so the TUI renders `✗` instead of `✓`
+        // (2026-04-24 critique P0 #3). Successful commands that stream
+        // progress to stderr (cargo, make, etc.) still exit 0, so they
+        // surface as success — the earlier contract of "never flag
+        // is_error" was over-broad and hid genuine failures behind a
+        // green tick.
         let content = if exit_code == 0 {
             if stdout.is_empty() && stderr.is_empty() {
                 String::new()
@@ -202,10 +206,13 @@ impl Tool for BashTool {
             parts.join("\n")
         };
 
-        // Trim trailing whitespace
         let content = content.trim_end().to_string();
 
-        Ok(ToolResult::ok(content))
+        if exit_code == 0 {
+            Ok(ToolResult::ok(content))
+        } else {
+            Ok(ToolResult::error(content))
+        }
     }
 }
 
@@ -227,16 +234,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_nonzero_exit_includes_code_no_is_error() {
+    async fn bash_nonzero_exit_flags_is_error_and_includes_code() {
         let tool = BashTool;
         let ctx = ToolContext::for_test_bare(CancellationToken::new());
         let result = tool
             .execute(json!({"command": "exit 42"}), &ctx)
             .await
             .unwrap();
-        // Per behavior contract: no is_error for bash failures
-        assert!(!result.is_error);
+        // 2026-04-24 critique P0 #3: non-zero exit → is_error=true so
+        // the TUI renders ✗ instead of a misleading green ✓.
+        assert!(result.is_error);
         assert!(result.content.contains("Exit code: 42"));
+    }
+
+    #[tokio::test]
+    async fn bash_stderr_only_on_success_is_not_error() {
+        // cargo/make pattern: non-empty stderr with exit 0 still reads
+        // as success. Guards the flipside of the P0 #3 fix.
+        let tool = BashTool;
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let result = tool
+            .execute(json!({"command": "echo progress >&2; exit 0"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.contains("progress"));
     }
 
     #[tokio::test]

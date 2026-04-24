@@ -7,11 +7,15 @@
 //!   - Inline: `**bold**`, `*italic*`, `` `code` ``, `[label](url)`
 //!   - Block: `#` / `##` / `###` headings, `-` / `*` / `N.` lists,
 //!     `>` blockquotes, `---` horizontal rules, ` ``` ` fenced
-//!     code blocks (with optional language label on the fence).
+//!     code blocks (with optional language label on the fence), and
+//!     GFM-style pipe tables (`| col | col |` + `| --- | --- |`).
 //!
-//! The parser is single-pass, line-oriented. Unterminated fences are
-//! rendered with a trailing `"...streaming"` hint so the user sees
-//! something sensible during live streaming.
+//! The parser is single-pass, line-oriented with one exception: pipe
+//! tables need a 2-line peek (header + separator) before we commit to
+//! the table shape, so `render_markdown` walks its input by index
+//! instead of by iterator. Unterminated fences are rendered with a
+//! trailing `"...streaming"` hint so the user sees something sensible
+//! during live streaming.
 //!
 //! The renderer deliberately avoids a full CommonMark implementation:
 //! an 80-line tokenizer is easier to audit than pulling in `pulldown-cmark`.
@@ -22,6 +26,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Render `text` as a sequence of ratatui `Line`s.
 ///
@@ -29,13 +34,14 @@ use ratatui::{
 /// does not need to handle any markdown state itself.
 pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
     let mut in_fence = false;
     #[cfg(feature = "tui-syntect")]
     let mut highlighter: Option<crate::syntax::FenceHighlighter> = None;
 
-    for raw in text.split_inclusive('\n') {
-        // Strip trailing newline; the Line itself carries the row break.
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
 
         // ── Fenced code block state machine ──────────────────────────
         let trimmed = line.trim_start();
@@ -59,6 +65,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
                     highlighter = None;
                 }
             }
+            i += 1;
             continue;
         }
         if in_fence {
@@ -66,14 +73,24 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
             {
                 if let Some(h) = highlighter.as_mut() {
                     out.push(h.highlight_line(line));
+                    i += 1;
                     continue;
                 }
             }
             out.push(render_code_line(line));
+            i += 1;
+            continue;
+        }
+
+        // ── GFM pipe table (2-line lookahead) ────────────────────────
+        if let Some((rendered, consumed)) = try_render_table(&lines[i..]) {
+            out.extend(rendered);
+            i += consumed;
             continue;
         }
 
         out.push(render_block_line(line));
+        i += 1;
     }
 
     if in_fence {
@@ -117,6 +134,132 @@ fn code_style() -> Style {
     // Reversed-ish look: a subtle background tint keeps code readable
     // without drawing the eye away from prose.
     Style::default().fg(Color::LightYellow)
+}
+
+/// Try to render a GFM-style pipe table starting at `lines[0]`. Returns
+/// `Some((rendered_rows, consumed))` on success where `consumed` is the
+/// number of input lines that formed the table. Returns `None` if
+/// `lines[0..2]` don't match the header+separator pattern so the caller
+/// can fall through to `render_block_line`.
+fn try_render_table(lines: &[&str]) -> Option<(Vec<Line<'static>>, usize)> {
+    if lines.len() < 2 {
+        return None;
+    }
+    let header = parse_pipe_row(lines[0])?;
+    if header.len() < 2 {
+        // A single-column "table" is almost always a misidentified prose
+        // pipe; require two columns minimum to be conservative.
+        return None;
+    }
+    let sep_cols = parse_separator_row(lines[1])?;
+    if sep_cols != header.len() {
+        return None;
+    }
+
+    let mut rows: Vec<Vec<String>> = vec![header];
+    let mut consumed = 2; // header + separator
+    while consumed < lines.len() {
+        match parse_pipe_row(lines[consumed]) {
+            Some(row) => {
+                rows.push(pad_or_truncate(row, rows[0].len()));
+                consumed += 1;
+            }
+            None => break,
+        }
+    }
+
+    Some((render_table_block(&rows), consumed))
+}
+
+fn parse_pipe_row(s: &str) -> Option<Vec<String>> {
+    let t = s.trim();
+    // Require the line to be bracketed by `|` so accidental inline
+    // pipes in prose ("`cat|grep`") don't trip the table detector.
+    if !t.starts_with('|') || !t.ends_with('|') || t.len() < 3 {
+        return None;
+    }
+    let inner = &t[1..t.len() - 1];
+    let cells: Vec<String> = inner.split('|').map(|c| c.trim().to_string()).collect();
+    if cells.is_empty() {
+        None
+    } else {
+        Some(cells)
+    }
+}
+
+fn parse_separator_row(s: &str) -> Option<usize> {
+    let cells = parse_pipe_row(s)?;
+    for cell in &cells {
+        let stripped: &str = cell.trim_matches(|c: char| c == ':' || c.is_whitespace());
+        // Each cell must be `---`, `:---`, `---:`, or `:---:` — i.e.
+        // purely hyphens after optional alignment markers, ≥1 hyphen.
+        if stripped.is_empty() || !stripped.chars().all(|c| c == '-') {
+            return None;
+        }
+    }
+    Some(cells.len())
+}
+
+fn pad_or_truncate(mut row: Vec<String>, want: usize) -> Vec<String> {
+    while row.len() < want {
+        row.push(String::new());
+    }
+    row.truncate(want);
+    row
+}
+
+fn render_table_block(rows: &[Vec<String>]) -> Vec<Line<'static>> {
+    debug_assert!(!rows.is_empty());
+    let n_cols = rows[0].len();
+    let mut widths = vec![0usize; n_cols];
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(n_cols) {
+            widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+        }
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(rows.len() + 1);
+    out.push(render_table_row(&rows[0], &widths, true));
+    out.push(render_table_separator(&widths));
+    for row in rows.iter().skip(1) {
+        out.push(render_table_row(row, &widths, false));
+    }
+    out
+}
+
+fn render_table_row(cells: &[String], widths: &[usize], is_header: bool) -> Line<'static> {
+    let border = Style::default().fg(Color::DarkGray);
+    let cell_style = if is_header {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 2 + 1);
+    spans.push(Span::styled("│".to_string(), border));
+    for (i, cell) in cells.iter().enumerate() {
+        let w = widths[i];
+        let pad = w.saturating_sub(UnicodeWidthStr::width(cell.as_str()));
+        let text = format!(" {cell}{} ", " ".repeat(pad));
+        spans.push(Span::styled(text, cell_style));
+        spans.push(Span::styled("│".to_string(), border));
+    }
+    Line::from(spans)
+}
+
+fn render_table_separator(widths: &[usize]) -> Line<'static> {
+    let border = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(widths.len() * 2 + 1);
+    spans.push(Span::styled("├".to_string(), border));
+    for (i, w) in widths.iter().enumerate() {
+        spans.push(Span::styled("─".repeat(w + 2), border));
+        if i + 1 < widths.len() {
+            spans.push(Span::styled("┼".to_string(), border));
+        } else {
+            spans.push(Span::styled("┤".to_string(), border));
+        }
+    }
+    Line::from(spans)
 }
 
 fn render_block_line(line: &str) -> Line<'static> {
@@ -536,6 +679,83 @@ fn main() {}
         let out = render_markdown("> quoted");
         let plain = lines_to_string(&out);
         assert!(plain.contains("▏ quoted"));
+    }
+
+    /// 2026-04-24 critique P0 #2: pipe tables must render as a grid,
+    /// not as raw `|` / `---` text. Header row + separator + two body
+    /// rows → 4 rendered lines with `│` column separators and `─`
+    /// rule between header and body.
+    #[test]
+    fn pipe_table_renders_as_grid() {
+        let input = "\
+| Col A | Col B |
+| --- | --- |
+| a1 | b1 |
+| a2 | b2 |
+";
+        let out = render_markdown(input);
+        let plain = lines_to_string(&out);
+        // Header and body cells must be present.
+        assert!(plain.contains("Col A"), "header cell missing:\n{plain}");
+        assert!(plain.contains("a1"), "body cell missing:\n{plain}");
+        assert!(plain.contains("b2"), "second body cell missing:\n{plain}");
+        // Grid glyphs must be present.
+        assert!(plain.contains("│"), "column separator missing:\n{plain}");
+        assert!(plain.contains("┼"), "header/body cross missing:\n{plain}");
+        // Raw `---` separator must be GONE (replaced by the ─ rule).
+        let raw_sep_lines: Vec<&str> = plain.lines().filter(|l| l.contains("---")).collect();
+        assert!(
+            raw_sep_lines.is_empty(),
+            "raw | --- | separator leaked: {raw_sep_lines:?}"
+        );
+        // Header spans must carry BOLD.
+        let header_row = out
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("Col A")))
+            .expect("header line missing");
+        let bolded = header_row
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(bolded, "table header must be bold");
+    }
+
+    /// Single-column "| foo |" prose lines without a separator row
+    /// must NOT be misdetected as a table — they should fall through
+    /// to normal block-line rendering.
+    #[test]
+    fn single_pipe_line_not_detected_as_table() {
+        let out = render_markdown("| just text |");
+        let plain = lines_to_string(&out);
+        // No separator rule, no column splitter.
+        assert!(!plain.contains("├"), "false positive table:\n{plain}");
+    }
+
+    /// A header row with a wider column than any body cell must pad
+    /// the body cells so the grid stays aligned.
+    #[test]
+    fn pipe_table_pads_narrow_body_cells() {
+        let input = "\
+| Name    | Age |
+| ------- | --- |
+| Ada     | 36  |
+";
+        let out = render_markdown(input);
+        // Every row line should have the same display width (monospace
+        // alignment). Compare the count of `│` columns.
+        let grid_lines: Vec<&Line<'_>> = out
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.content == "│"))
+            .collect();
+        let first_count = grid_lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content == "│")
+            .count();
+        for line in &grid_lines[1..] {
+            let c = line.spans.iter().filter(|s| s.content == "│").count();
+            assert_eq!(c, first_count, "column separator count drifted");
+        }
     }
 
     #[cfg(feature = "tui-syntect")]
