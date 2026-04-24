@@ -169,8 +169,11 @@ impl McpHttpClient {
         extra_headers: HashMap<String, String>,
         timeout_ms: u64,
     ) -> Result<Self, String> {
-        let http = Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
+        let mut builder = Client::builder().timeout(Duration::from_millis(timeout_ms));
+        if let Some(identity) = load_mtls_identity()? {
+            builder = builder.identity(identity);
+        }
+        let http = builder
             .build()
             .map_err(|e| format!("failed to build http client: {e}"))?;
 
@@ -666,6 +669,51 @@ fn session_expired_msg(server_name: &str) -> String {
 /// treats both paths identically (reconnect + retry-once).
 const JSON_RPC_SESSION_EXPIRED_CODE: i64 = -32001;
 
+/// Load a client-authentication identity (client certificate + private
+/// key) for mutual-TLS against MCP servers that require it (P0 #10,
+/// 2026-04-24 parity-gaps — plan §2 Decision 5 marks mTLS as an
+/// in-scope cross-cutting feature). Reads `TLS_CERT` and `TLS_KEY` as
+/// paths to PEM-encoded files. Returns:
+///
+///   - `Ok(None)` when neither env var is set (no mTLS requested).
+///   - `Err(...)` when exactly one is set (misconfiguration —
+///     fail loud so silent reverts to non-mTLS don't happen).
+///   - `Err(...)` on read failure or malformed PEM.
+///   - `Ok(Some(Identity))` with the loaded identity threaded into
+///     the reqwest `Client::builder().identity(...)` pipeline.
+///
+/// The workspace's reqwest build uses `rustls-tls`, so we construct
+/// the identity via `Identity::from_pem` on a concatenated buffer —
+/// reqwest accepts a single PEM blob containing one CERTIFICATE
+/// plus one PRIVATE KEY block.
+fn load_mtls_identity() -> Result<Option<reqwest::Identity>, String> {
+    let cert_path = std::env::var_os("TLS_CERT");
+    let key_path = std::env::var_os("TLS_KEY");
+    match (cert_path, key_path) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(
+            "mTLS misconfigured: both TLS_CERT and TLS_KEY must be set (or neither). \
+             Set both to PEM-encoded file paths, or unset both to disable mTLS."
+                .to_string(),
+        ),
+        (Some(cert), Some(key)) => {
+            let cert_bytes = std::fs::read(&cert)
+                .map_err(|e| format!("TLS_CERT: failed to read {}: {e}", cert.to_string_lossy()))?;
+            let key_bytes = std::fs::read(&key)
+                .map_err(|e| format!("TLS_KEY: failed to read {}: {e}", key.to_string_lossy()))?;
+            let mut combined = Vec::with_capacity(cert_bytes.len() + key_bytes.len() + 1);
+            combined.extend_from_slice(&cert_bytes);
+            if !cert_bytes.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&key_bytes);
+            reqwest::Identity::from_pem(&combined)
+                .map(Some)
+                .map_err(|e| format!("mTLS identity parse failed: {e}"))
+        }
+    }
+}
+
 /// Normalise "session expired" signals from the server into the same
 /// error marker the HTTP 404 path raises. A server answering a
 /// session-bound request with HTTP 200 + JSON-RPC `error.code ==
@@ -784,6 +832,65 @@ mod tests {
         // about the last non-empty value — the reset semantics don't apply.
         let body = "id: 42\ndata: {}\n\nid:\ndata: {}\n\n";
         assert_eq!(parse_sse_last_event_id(body).as_deref(), Some("42"));
+    }
+
+    /// P0 #10: mTLS loader refuses a half-configured setup. Setting
+    /// TLS_CERT without TLS_KEY (or vice versa) is almost always a
+    /// typo / forgotten env var; silently falling back to no-mTLS
+    /// would mean the first connection goes out unauthenticated.
+    #[test]
+    fn mtls_loader_refuses_partial_env() {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        std::env::set_var("TLS_CERT", "/tmp/does-not-exist.pem");
+        std::env::remove_var("TLS_KEY");
+        let err = load_mtls_identity().unwrap_err();
+        assert!(err.contains("both TLS_CERT and TLS_KEY"), "got: {err}");
+
+        std::env::remove_var("TLS_CERT");
+        std::env::set_var("TLS_KEY", "/tmp/does-not-exist.key");
+        let err = load_mtls_identity().unwrap_err();
+        assert!(err.contains("both TLS_CERT and TLS_KEY"), "got: {err}");
+
+        std::env::remove_var("TLS_KEY");
+    }
+
+    /// P0 #10: neither env set → no mTLS, clean `Ok(None)`.
+    #[test]
+    fn mtls_loader_returns_none_when_unconfigured() {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        std::env::remove_var("TLS_CERT");
+        std::env::remove_var("TLS_KEY");
+        assert!(load_mtls_identity().unwrap().is_none());
+    }
+
+    /// P0 #10: garbage PEM → parse error surfaces, we don't silently
+    /// build a clientless identity.
+    #[test]
+    fn mtls_loader_rejects_malformed_pem() {
+        use std::io::Write;
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        let mut f = std::fs::File::create(&cert).unwrap();
+        writeln!(f, "not a pem").unwrap();
+        let mut f = std::fs::File::create(&key).unwrap();
+        writeln!(f, "also not a pem").unwrap();
+
+        std::env::set_var("TLS_CERT", &cert);
+        std::env::set_var("TLS_KEY", &key);
+        let err = load_mtls_identity().unwrap_err();
+        assert!(err.contains("identity parse failed"), "got: {err}");
+        std::env::remove_var("TLS_CERT");
+        std::env::remove_var("TLS_KEY");
     }
 
     #[test]
