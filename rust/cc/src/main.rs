@@ -37,7 +37,7 @@ struct Cli {
 
     /// SDK / non-interactive mode: send a single prompt, print the response,
     /// exit with code 0. Equivalent to `--message <TEXT> --no-tui --non-interactive`.
-    #[arg(long, value_name = "TEXT")]
+    #[arg(short = 'p', long, value_name = "TEXT")]
     print: Option<String>,
 
     /// Resume a previous session by ID.
@@ -876,6 +876,16 @@ mod tests {
             msg.contains("--resume") || msg.contains("--continue"),
             "error should mention resume-specific context, got: {msg}"
         );
+    }
+
+    #[test]
+    fn print_short_flag_p_equivalent_to_long() {
+        use clap::Parser;
+        let long = Cli::parse_from(["claude", "--print", "hello"]);
+        let short = Cli::parse_from(["claude", "-p", "hello"]);
+        assert_eq!(long.print, Some("hello".into()));
+        assert_eq!(short.print, Some("hello".into()));
+        assert_eq!(long.print, short.print);
     }
 
     #[test]
