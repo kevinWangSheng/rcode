@@ -44,3 +44,24 @@ network calls, or environment-variable reads beyond clap's
 already-parsed `Cli` struct. Any future validator added to it MUST
 be similarly pure so the "validate before disk" guarantee stays
 intact.
+
+#### Scenario: unit-testable without a filesystem or network
+
+- **Given** a `Cli` struct parsed via `Cli::try_parse_from([...])`
+- **When** `parse_cli_options(&cli)` runs in an isolated unit-test
+  process with no `$HOME`, no `~/.claude/`, and no network
+  connectivity
+- **Then** it returns `Ok(ParsedCliOptions { .. })` or
+  `Err(..)` deterministically based only on the `Cli` fields,
+  without touching the filesystem or initiating any network call
+- **And** no files are created, opened for writing, or read from
+  disk during the call
+
+#### Scenario: invalid `--thinking` surfaces as a pure Err
+
+- **Given** a `Cli` with `thinking = Some("abc".into())`
+- **When** `parse_cli_options(&cli)` runs
+- **Then** the helper returns `Err(msg)` where `msg` contains
+  `--thinking`, and the error propagates before any caller-side
+  disk work — this is what makes the "validate before session
+  create" invariant mechanically enforceable
