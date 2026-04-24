@@ -106,6 +106,27 @@ enum OutputFormat {
     Json,
 }
 
+/// Bundle of CLI inputs that have been validated post-clap. Populated by
+/// `parse_cli_options` so every "can fail to validate user input" step lives
+/// in one place and runs *before* any disk side effect (session file
+/// creation, credential refresh, settings load). New validators go here.
+#[derive(Debug)]
+struct ParsedCliOptions {
+    thinking: Option<ThinkingConfig>,
+}
+
+/// Run the side-effect-free post-clap validators. MUST NOT perform disk
+/// I/O, network calls, or env-var reads beyond the already-parsed `Cli`
+/// struct — the "validate before disk" guarantee in the
+/// `cli-startup-order` spec depends on this staying pure.
+fn parse_cli_options(cli: &Cli) -> Result<ParsedCliOptions, Box<dyn std::error::Error>> {
+    let thinking = match &cli.thinking {
+        Some(raw) => Some(parse_thinking(raw, cli.max_tokens)?),
+        None => None,
+    };
+    Ok(ParsedCliOptions { thinking })
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -133,6 +154,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("Credentials saved to {}", path.display());
         return Ok(());
     }
+
+    // Validation goes first so failures don't leak session files, print a
+    // misleading `Session: <uuid>` line, or trigger a credential refresh.
+    // See openspec/changes/fix-cli-validate-before-session-create.
+    let parsed = parse_cli_options(&cli)?;
 
     let (credentials, key_source) = ensure_fresh_credentials().await?;
     tracing::debug!("using credentials from {key_source}");
@@ -279,16 +305,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Build query options
     let non_interactive = cli.non_interactive || !atty_is_stdin();
-    let thinking = match &cli.thinking {
-        Some(raw) => Some(parse_thinking(raw, cli.max_tokens)?),
-        None => None,
-    };
     let options = QueryOptions {
         model: model.clone(),
         max_tokens: cli.max_tokens,
         non_interactive,
         bypass_permissions: cli.bypass_permissions,
-        thinking: thinking.clone(),
+        thinking: parsed.thinking.clone(),
     };
 
     // Build API client
@@ -378,7 +400,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             max_tokens: cli.max_tokens,
             non_interactive: true,
             bypass_permissions: cli.bypass_permissions,
-            thinking: thinking.clone(),
+            thinking: parsed.thinking.clone(),
         };
 
         let stdout = io::stdout();
@@ -876,6 +898,46 @@ mod tests {
             msg.contains("--resume") || msg.contains("--continue"),
             "error should mention resume-specific context, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_cli_options_rejects_invalid_thinking() {
+        // Pure check: parse_cli_options is side-effect-free, so an invalid
+        // `--thinking` value MUST surface as Err before run() can reach
+        // Session::new / ensure_fresh_credentials / settings load.
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["claude", "--thinking", "abc"]).expect("clap parses");
+        let err = parse_cli_options(&cli).expect_err("invalid thinking must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--thinking"),
+            "error should mention --thinking, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_cli_options_accepts_valid_inputs() {
+        use clap::Parser;
+
+        // (a) --thinking adaptive → Some(Adaptive)
+        let cli = Cli::try_parse_from(["claude", "--thinking", "adaptive"]).unwrap();
+        let parsed = parse_cli_options(&cli).expect("adaptive is valid");
+        assert!(matches!(parsed.thinking, Some(ThinkingConfig::Adaptive)));
+
+        // (b) no --thinking → None
+        let cli = Cli::try_parse_from(["claude"]).unwrap();
+        let parsed = parse_cli_options(&cli).expect("no thinking is valid");
+        assert!(parsed.thinking.is_none());
+
+        // (c) --thinking 2048 → Some(Enabled { 2048 })
+        let cli = Cli::try_parse_from(["claude", "--thinking", "2048"]).unwrap();
+        let parsed = parse_cli_options(&cli).expect("2048 is valid");
+        assert!(matches!(
+            parsed.thinking,
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: 2048
+            })
+        ));
     }
 
     #[test]
