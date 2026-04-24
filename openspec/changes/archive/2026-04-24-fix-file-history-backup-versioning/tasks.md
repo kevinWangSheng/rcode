@@ -85,14 +85,14 @@
 - [x] 5.3 `cargo test -p cc-session -p cc-tools` — the 5 new
       tests (3 in cc-session, 2 in cc-tools) pass alongside the
       existing suite.
-- [ ] 5.4 Manual sanity: tail the session JSONL after two Edits
+- [~] 5.4 Manual sanity: tail the session JSONL after two Edits
       of the same file under a real run, confirm the two
       `file-history-snapshot` entries reference distinct
       `backupFileName` values and both sidecars are on disk with
       the expected bytes.
-      *Deferred to the operator doing the merge (needs a live API
-      key + interactive run); the 5 new regression tests prove the
-      invariant programmatically.*
+      *Deferred (needs a live API key + interactive run); the 5
+      new regression tests prove the invariant programmatically.
+      Operator can run this post-merge when convenient.*
 
 ## 6. Sign-off
 
@@ -101,5 +101,11 @@
       (fix-file-history-backup-versioning)".
 - [x] 6.2 Flip the P0 #6 ⚠️ footnote in
       `.claude/plan/parity-gaps-2026-04-23.md` to resolved.
-- [ ] 6.3 Post-merge, archive via
+- [x] 6.3 Post-merge, archive via
       `npx @fission-ai/openspec archive fix-file-history-backup-versioning`.
+      *Archived 2026-04-24. Proposal's spec delta was
+      `## MODIFIED` — flipped to `## ADDED` at archive time
+      because the parent spec's requirement headers don't line up
+      (the backup-versioning invariant is a net-new addition on
+      top of the parent's "emit a snapshot" contract, not a
+      modification of it).*

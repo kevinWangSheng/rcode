@@ -1,6 +1,6 @@
 # Spec — File-history snapshot producers (delta)
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Each emitted FileHistorySnapshot points at a distinct on-disk sidecar
 

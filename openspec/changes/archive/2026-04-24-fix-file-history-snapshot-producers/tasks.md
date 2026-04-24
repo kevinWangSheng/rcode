@@ -194,26 +194,48 @@ roadmap.
       *Ran `cargo test --workspace` from the worktree; everything
       is green (≈616 passing, 0 failing, 1 ignored — the
       pre-existing placeholder).*
-- [ ] 7.4 Manual resume smoke: start a session, run a Write,
+- [~] 7.4 Manual resume smoke: start a session, run a Write,
       Ctrl+C during streaming, `claude --resume <id>`. Confirm
       the session JSONL contains the file-history-snapshot entry
       AND the canonical interrupt marker.
-      *Requires a live API key + an interactive run; deferred
-      to the operator doing the merge. The 5 new regression
-      tests prove the equivalent programmatically.*
+      *Deferred: requires a live API key + an interactive run.
+      The 5 new regression tests (this change §5 + the
+      backup-versioning follow-up's 5 more) prove the
+      equivalent programmatically. Operator can run this
+      post-merge when convenient.*
 
 ## 8. Sign-off
 
-- [ ] 8.1 Commit message: "closes P0 #6 end-to-end; locks in P0
+- [x] 8.1 Commit message: "closes P0 #6 end-to-end; locks in P0
       #5 interrupt-marker behaviour via regression tests".
-- [ ] 8.2 Flip P0 #5 and P0 #6 in
+      *Actual commit `cea2a4a` used the descriptive title
+      "cc-tools+cc-session+cc-query: Edit/Write emit
+      FileHistorySnapshot on success
+      (fix-file-history-snapshot-producers)". The prescribed
+      wording would have been clearer about the P0-row closure;
+      the shipped title identifies the change name and primary
+      crates — judged close enough to not warrant a rewrite. P0
+      #5 / #6 closure is captured in the parity-gaps roadmap and
+      the memory Batch B note (§8.2 / §8.3 below).*
+- [x] 8.2 Flip P0 #5 and P0 #6 in
       `.claude/plan/parity-gaps-2026-04-23.md` to "end-to-end
       live".
-- [ ] 8.3 Update memory `project_phase3_progress.md` Batch B
+      *Both rows already read "✅ DONE (2026-04-23)" with the
+      full chain explained and the `fix-file-history-backup-
+      versioning` follow-up cited on row #6. No further edits
+      needed.*
+- [x] 8.3 Update memory `project_phase3_progress.md` Batch B
       paragraph to note closure.
-- [ ] 8.4 Archive `fix-session-resume-wiring` (the only
+      *The Batch B paragraph already captured P0 #6 closure;
+      added a follow-up paragraph on 2026-04-24 covering the
+      `fix-file-history-backup-versioning` QA finding and its
+      `next_backup_version` fix.*
+- [x] 8.4 Archive `fix-session-resume-wiring` (the only
       remaining requirement there — cancel-path markers — is
       now owned by this change's §5 tests, so the parent
       wiring change has nothing left). Do the archive via
       `npx @fission-ai/openspec archive fix-session-resume-
       wiring` after merge.
+      *Archived 2026-04-24 as
+      `2026-04-24-fix-session-resume-wiring`; seeded the new
+      `session-resume-wiring` spec in openspec/specs/.*
