@@ -433,6 +433,7 @@ dependencies = [
  "async-trait",
  "cc-agents",
  "cc-core",
+ "cc-git",
  "cc-session",
  "glob",
  "libc",

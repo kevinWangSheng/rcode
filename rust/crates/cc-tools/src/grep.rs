@@ -95,36 +95,55 @@ impl Tool for GrepTool {
         let mut results: Vec<String> = Vec::new();
         let mut total_count: usize = 0;
 
-        'outer: for entry in WalkDir::new(search_path)
+        // Pass 1: collect candidate paths that survive the glob + file-type
+        // filters. We hold only `PathBuf`s here — no file opens yet —
+        // because pass 2 will reopen each survivor after the git-ignore
+        // batch filter runs. WalkDir's iter is streaming, but collecting
+        // path strings is cheap compared to the per-file regex cost.
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        for entry in WalkDir::new(search_path)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
-            // Bail out if the caller cancelled mid-walk. Grep is bounded by
-            // MAX_RESULTS, but "bounded to 250" is not the same as "bounded
-            // in time" — a huge repo with a narrow regex can still chew
-            // through tens of thousands of files before hitting the cap.
             if ctx.cancel.is_cancelled() {
                 return Err(CcError::tool("tool", "Grep cancelled"));
             }
             let path = entry.path();
 
-            // Apply glob filter
             if let Some(glob_pat) = glob_filter {
                 let file_name = path.file_name().unwrap_or_default().to_string_lossy();
                 let full_path = path.to_string_lossy();
                 let pat = glob::Pattern::new(glob_pat)
                     .unwrap_or_else(|_| glob::Pattern::new("*").unwrap());
                 if !pat.matches(&file_name) && !pat.matches(&full_path) {
-                    // Also try matching against just the path relative to search root
                     let rel = path.strip_prefix(search_path).unwrap_or(path);
                     if !pat.matches(&rel.to_string_lossy()) {
                         continue;
                     }
                 }
             }
+            candidates.push(path.to_path_buf());
+        }
 
-            // Skip binary files by checking for null bytes in first 8KB
+        // Batch-check git-ignore in a single `git check-ignore --stdin`
+        // subprocess. Outside a repo, on timeout, or when git is missing,
+        // `filter_git_ignored` returns all-false so no files get dropped
+        // by accident (P0 #3).
+        let borrow: Vec<&Path> = candidates.iter().map(|p| p.as_path()).collect();
+        let ignored_flags = cc_git::filter_git_ignored(&borrow, search_path).await;
+        let survivors: Vec<std::path::PathBuf> = candidates
+            .into_iter()
+            .zip(ignored_flags)
+            .filter_map(|(p, ignored)| (!ignored).then_some(p))
+            .collect();
+
+        'outer: for path in &survivors {
+            if ctx.cancel.is_cancelled() {
+                return Err(CcError::tool("tool", "Grep cancelled"));
+            }
+            let path: &Path = path.as_path();
+
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -306,5 +325,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("regex"));
+    }
+
+    /// P0 #3: Grep must drop files git-ignores before reading them.
+    /// Sets up a real git repo with `*.log` ignored, then greps for a
+    /// token that only appears in the ignored file → expect no hits.
+    #[tokio::test]
+    async fn grep_skips_gitignored_files() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git binary not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(repo.join("visible.txt"), "has UNIQUE_TOKEN\n").unwrap();
+        std::fs::write(repo.join("secret.log"), "UNIQUE_TOKEN is here\n").unwrap();
+
+        let tool = GrepTool;
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let result = tool
+            .execute(
+                json!({
+                    "pattern": "UNIQUE_TOKEN",
+                    "path": repo.to_string_lossy(),
+                    "output_mode": "files_with_matches",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let body = result.content;
+        assert!(
+            body.contains("visible.txt"),
+            "non-ignored hit missing: {body}"
+        );
+        assert!(
+            !body.contains("secret.log"),
+            "git-ignored file leaked into grep result: {body}"
+        );
     }
 }

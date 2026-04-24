@@ -60,6 +60,26 @@ impl Tool for ReadTool {
 
         let path = Path::new(file_path);
 
+        // Refuse reads of git-ignored paths (P0 #3). `is_git_ignored` is
+        // best-effort: if git is unavailable, the path is outside a repo,
+        // or the subprocess times out, it returns `false` and we proceed
+        // normally. Check against the *parent* directory when available
+        // (so `git check-ignore` walks up from the right place) and fall
+        // back to the process cwd otherwise.
+        let cwd = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| Path::new(".").to_path_buf());
+        if cc_git::is_git_ignored(path, &cwd).await {
+            return Ok(ToolResult::error(format!(
+                "{file_path} is git-ignored. If this is intentional, \
+                 use the Bash tool (e.g. `cat {file_path}`) to bypass \
+                 the privacy filter."
+            )));
+        }
+
         // Open the file ONCE and perform both the size probe and the read
         // through the same fd. A separate path-based `metadata()` followed by
         // `read_to_string(path)` is a TOCTOU: an attacker who swaps the path
@@ -380,5 +400,48 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         #[cfg(unix)]
         swapper.join().unwrap();
+    }
+
+    /// P0 #3: Read must refuse git-ignored paths with a structured
+    /// error pointing the caller to Bash for an explicit bypass.
+    #[tokio::test]
+    async fn read_refuses_gitignored_paths() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git binary not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join(".gitignore"), "*.env\n").unwrap();
+        let secret = repo.join(".env");
+        std::fs::write(&secret, "TOKEN=abc").unwrap();
+
+        let tool = ReadTool;
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let r = tool
+            .execute(json!({"file_path": secret.to_string_lossy()}), &ctx)
+            .await
+            .unwrap();
+        assert!(r.is_error, "read should refuse gitignored path");
+        assert!(
+            r.content.contains("git-ignored"),
+            "missing explanation: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("TOKEN=abc"),
+            "secret bytes leaked through refusal: {}",
+            r.content
+        );
     }
 }

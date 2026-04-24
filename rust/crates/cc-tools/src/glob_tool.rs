@@ -91,7 +91,74 @@ impl Tool for GlobTool {
             return Ok(ToolResult::ok("No files matched the pattern."));
         }
 
-        let paths: Vec<String> = matches.into_iter().map(|(_, p)| p).collect();
+        // Drop git-ignored matches so `**/*.log` doesn't surface
+        // committed-by-accident build detritus (P0 #3). `filter_git_ignored`
+        // batches to a single `git check-ignore --stdin` call; on timeout
+        // or outside a repo it returns all-false and we keep every match.
+        let path_bufs: Vec<std::path::PathBuf> = matches
+            .iter()
+            .map(|(_, p)| std::path::PathBuf::from(p))
+            .collect();
+        let borrow: Vec<&Path> = path_bufs.iter().map(|p| p.as_path()).collect();
+        let cwd = Path::new(&base_dir);
+        let ignored_flags = cc_git::filter_git_ignored(&borrow, cwd).await;
+        let paths: Vec<String> = matches
+            .into_iter()
+            .zip(ignored_flags)
+            .filter_map(|((_, p), ignored)| (!ignored).then_some(p))
+            .collect();
+
+        if paths.is_empty() {
+            return Ok(ToolResult::ok(
+                "No files matched the pattern (all matches were git-ignored).",
+            ));
+        }
+
         Ok(ToolResult::ok(paths.join("\n")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    /// P0 #3: Glob must drop git-ignored matches.
+    #[tokio::test]
+    async fn glob_drops_gitignored_matches() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git binary not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success());
+        };
+        run(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(repo.join("keep.rs"), "fn main(){}").unwrap();
+        std::fs::write(repo.join("drop.log"), "noise").unwrap();
+
+        let tool = GlobTool;
+        let ctx = ToolContext::for_test_bare(CancellationToken::new());
+        let result = tool
+            .execute(
+                json!({"pattern": "*", "path": repo.to_string_lossy()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.content.contains("keep.rs"), "{}", result.content);
+        assert!(!result.content.contains("drop.log"), "{}", result.content);
     }
 }
