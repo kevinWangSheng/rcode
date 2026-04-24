@@ -352,6 +352,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_writes_same_file_persist_distinct_backups() {
+        // Two successful Writes overwriting the same file MUST
+        // persist two distinct sidecars holding each Write's pre-
+        // mutation bytes. Regression guard for
+        // fix-file-history-backup-versioning — the `@v1`-fixed
+        // producer silently overwrote the first sidecar.
+        let work = tempfile::tempdir().unwrap();
+        let session_root = tempfile::tempdir().unwrap();
+        let file = work.path().join("versions.txt");
+        std::fs::write(&file, "a").unwrap();
+
+        let (ctx, session) = ctx_with_real_session(session_root.path(), Some("msg-two-writes"));
+        let tool = WriteTool;
+
+        let r1 = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "content": "b"}),
+                &ctx,
+            )
+            .await
+            .expect("first write returns");
+        assert!(!r1.is_error, "{}", r1.content);
+
+        let r2 = tool
+            .execute(
+                json!({"file_path": file.to_string_lossy(), "content": "c"}),
+                &ctx,
+            )
+            .await
+            .expect("second write returns");
+        assert!(!r2.is_error, "{}", r2.content);
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "c");
+
+        let snaps = session.file_history_snapshots().unwrap();
+        assert_eq!(
+            snaps.len(),
+            2,
+            "two successful overwrites must produce two snapshots"
+        );
+        let name0 = snaps[0]
+            .snapshot
+            .tracked_file_backups
+            .values()
+            .next()
+            .unwrap()
+            .backup_file_name
+            .clone()
+            .expect("sidecar ref");
+        let name1 = snaps[1]
+            .snapshot
+            .tracked_file_backups
+            .values()
+            .next()
+            .unwrap()
+            .backup_file_name
+            .clone()
+            .expect("sidecar ref");
+        assert_ne!(name0, name1, "sidecar names must differ");
+        assert!(
+            name0.ends_with("@v1") && name1.ends_with("@v2"),
+            "expected @v1/@v2, got {name0} and {name1}"
+        );
+        assert_eq!(
+            session.read_backup(&name0).unwrap(),
+            b"a",
+            "first sidecar must hold pre-write-1 bytes"
+        );
+        assert_eq!(
+            session.read_backup(&name1).unwrap(),
+            b"b",
+            "second sidecar must hold pre-write-2 bytes (= post-write-1)"
+        );
+    }
+
+    #[tokio::test]
     async fn write_new_file_does_not_snapshot() {
         // Target path does NOT exist. The Write must succeed but MUST NOT
         // emit a snapshot — matches TS which only snapshots pre-existing

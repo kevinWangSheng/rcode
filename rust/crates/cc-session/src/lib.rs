@@ -534,9 +534,20 @@ impl Session {
 
     /// Append a file-history snapshot entry that records the pre-
     /// mutation bytes of `relpath`. The bytes are persisted to a
-    /// content-addressable sidecar (`{backup_dir}/{sha256(relpath)[0..16]}@v1`)
-    /// so the JSONL stays small — this matches TS's out-of-band backup
-    /// layout where the JSONL only carries a pointer (`backupFileName`).
+    /// content-addressable sidecar
+    /// (`{backup_dir}/{sha256(relpath)[0..16]}@v{n}`) so the JSONL
+    /// stays small — this matches TS's out-of-band backup layout
+    /// where the JSONL only carries a pointer (`backupFileName`).
+    ///
+    /// `n` is `max(existing versions for this relpath) + 1` (or `1`
+    /// when no prior version exists). Per-path version selection
+    /// closes the repeat-edit sidecar-collision bug surfaced after
+    /// `fix-file-history-snapshot-producers` merged: a deterministic
+    /// `@v1` would let two successful edits clobber the first edit's
+    /// pre-image while both JSONL entries still pointed at the same
+    /// file, so replay/rewind to the first snapshot restored the
+    /// wrong bytes. See openspec
+    /// `fix-file-history-backup-versioning`.
     ///
     /// `message_id` is stamped onto the emitted `FileHistorySnapshot`;
     /// pass the assistant-turn id that produced the tool_use (or an
@@ -561,18 +572,18 @@ impl Session {
             ))
         })?;
 
-        // Content-addressable name so two successful edits of the same
-        // relpath share a backup slot. `@v1` keeps the naming compatible
-        // with TS `{hash}@v{n}` even though the Rust producer currently
-        // emits v1 only (per-turn version bookkeeping is deferred — see
-        // openspec `fix-file-history-snapshot-producers` §5).
         let hash = Sha256::digest(relpath.as_bytes());
         let hex = hash
             .iter()
             .take(8)
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        let backup_file_name = format!("{hex}@v1");
+        // Filesystem is the source of truth for prior versions — sidesteps
+        // any per-session in-memory state + `Arc<dyn SessionSink>` sharing
+        // question. `create_dir_all` above guarantees the scan sees a
+        // valid directory.
+        let version = next_backup_version(&backup_dir, &hex)?;
+        let backup_file_name = format!("{hex}@v{version}");
         let backup_path = backup_dir.join(&backup_file_name);
 
         // Atomic sidecar write: tempfile + rename. Same rationale as the
@@ -606,7 +617,7 @@ impl Session {
             relpath.to_string(),
             FileHistoryBackup {
                 backup_file_name: Some(backup_file_name),
-                version: 1,
+                version,
                 backup_time: now.clone(),
             },
         );
@@ -851,6 +862,48 @@ fn load_transcript_entries(path: &Path) -> CcResult<Vec<SessionEntry>> {
     }
 
     Ok(entries)
+}
+
+/// Pick the next version number for a file-history sidecar whose
+/// name prefix is `hex_prefix` (the first 16 hex chars of the
+/// SHA-256 of the relpath).
+///
+/// Scans `backup_dir` for entries matching `{hex_prefix}@v{n}` and
+/// returns `max(n) + 1`. Returns `1` when the directory is empty or
+/// missing — the caller creates the directory before this helper
+/// runs, so NotFound only happens on a deleted-between-mkdir-and-
+/// scan race and is still safe to treat as "no prior versions".
+///
+/// Unrelated entries (different hash prefix, `.DS_Store`, leftover
+/// `NamedTempFile` suffixes like `abc@v1.tmpXXXX`) are ignored via
+/// the `strip_prefix` + `parse::<u32>()` filter.
+fn next_backup_version(backup_dir: &Path, hex_prefix: &str) -> CcResult<u32> {
+    let read_dir = match fs::read_dir(backup_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(1),
+        Err(e) => {
+            return Err(CcError::io(format!(
+                "failed to scan backup dir {}: {e}",
+                backup_dir.display()
+            )))
+        }
+    };
+
+    let prefix = format!("{hex_prefix}@v");
+    let mut max_seen: u32 = 0;
+    for entry in read_dir.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Ok(n) = rest.parse::<u32>() {
+            if n > max_seen {
+                max_seen = n;
+            }
+        }
+    }
+    Ok(max_seen + 1)
 }
 
 /// Look for a TypeScript-version session file at
@@ -1662,5 +1715,115 @@ mod tests {
         // snapshots are filtered out, not mistakenly surfaced as messages.
         let messages = session.load_messages().unwrap();
         assert_eq!(messages.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // fix-file-history-backup-versioning §3:
+    // per-path version selection regression guards.
+    // ---------------------------------------------------------------
+
+    /// Build a `Session` whose `backup_dir()` lives under `root/{id}/file-history/`.
+    /// Matches the shape `Session::new` would create, without going
+    /// through the `HOME`-anchored layout that other tests rely on.
+    fn session_at(root: &Path) -> Session {
+        let id = "backup-ver";
+        let sdir = root.join(id);
+        fs::create_dir_all(&sdir).unwrap();
+        Session::from_parts(id.into(), sdir.join("transcript.jsonl"))
+    }
+
+    /// Two successful calls for the same relpath MUST produce two
+    /// distinct sidecars (`@v1` and `@v2`) holding the bytes passed
+    /// on each call, in order. This is the core invariant the
+    /// hard-coded-`@v1` producer violated.
+    #[test]
+    fn append_file_history_snapshot_for_path_versions_monotonically() {
+        let dir = tempdir().unwrap();
+        let session = session_at(dir.path());
+
+        session
+            .append_file_history_snapshot_for_path("foo.rs", "m1", b"bytes-v1", false)
+            .unwrap();
+        session
+            .append_file_history_snapshot_for_path("foo.rs", "m2", b"bytes-v2", false)
+            .unwrap();
+
+        let snaps = session.file_history_snapshots().unwrap();
+        assert_eq!(snaps.len(), 2, "two appends must produce two snapshots");
+
+        let (_, b0) = snaps[0]
+            .snapshot
+            .tracked_file_backups
+            .iter()
+            .next()
+            .unwrap();
+        let (_, b1) = snaps[1]
+            .snapshot
+            .tracked_file_backups
+            .iter()
+            .next()
+            .unwrap();
+
+        let name0 = b0.backup_file_name.clone().expect("sidecar ref");
+        let name1 = b1.backup_file_name.clone().expect("sidecar ref");
+        assert!(
+            name0.ends_with("@v1"),
+            "first append must get @v1, got {name0}"
+        );
+        assert!(
+            name1.ends_with("@v2"),
+            "second append must get @v2, got {name1}"
+        );
+        assert_ne!(name0, name1, "distinct sidecar names required");
+        assert_eq!(b0.version, 1);
+        assert_eq!(b1.version, 2);
+
+        assert_eq!(session.read_backup(&name0).unwrap(), b"bytes-v1");
+        assert_eq!(session.read_backup(&name1).unwrap(), b"bytes-v2");
+    }
+
+    /// `next_backup_version` SHALL ignore directory entries that do
+    /// not match the `{hex}@v{n}` shape — stray `.DS_Store`, a
+    /// leftover `tempfile::NamedTempFile` suffix, and entries with a
+    /// different hash prefix. Proves the scan is robust to real-
+    /// world backup-dir noise.
+    #[test]
+    fn next_backup_version_ignores_unrelated_entries() {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        // Target hash prefix we're scanning for.
+        fs::write(d.join("abc@v3"), b"x").unwrap();
+        // Different prefix — must NOT influence the result.
+        fs::write(d.join("def@v9"), b"x").unwrap();
+        // System noise.
+        fs::write(d.join(".DS_Store"), b"x").unwrap();
+        // Temp-file leftover from a crashed `NamedTempFile`; the name
+        // starts with `.tmp` which strip_prefix("abc@v") rejects.
+        fs::write(d.join(".tmpABCDEF"), b"x").unwrap();
+        // An entry that nearly matches but has a non-numeric tail.
+        fs::write(d.join("abc@vX"), b"x").unwrap();
+
+        let next = next_backup_version(d, "abc").unwrap();
+        assert_eq!(
+            next, 4,
+            "only abc@v3 should count; next must be max(n)+1 = 4"
+        );
+
+        // An unrelated prefix starts fresh at 1 regardless of sibling
+        // versions under other prefixes.
+        let fresh = next_backup_version(d, "newp").unwrap();
+        assert_eq!(fresh, 1);
+    }
+
+    /// A missing backup directory MUST yield `Ok(1)` rather than an
+    /// I/O error. Supports the mkdir-then-scan ordering in the
+    /// caller where a race could race a stat-after-mkdir.
+    #[test]
+    fn next_backup_version_returns_one_for_missing_dir() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(!missing.exists());
+        let n = next_backup_version(&missing, "abc").unwrap();
+        assert_eq!(n, 1);
     }
 }

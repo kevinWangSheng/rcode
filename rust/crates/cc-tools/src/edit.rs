@@ -748,6 +748,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_edits_same_file_persist_distinct_backups() {
+        // Two successful Edits of the same file MUST persist two
+        // distinct sidecars holding each Edit's pre-mutation bytes.
+        // Regression guard for fix-file-history-backup-versioning:
+        // the hard-coded `@v1` producer silently overwrote the
+        // first sidecar, so the JSONL had two snapshot entries both
+        // pointing at the same (second-edit-bytes) file.
+        let work = tempfile::tempdir().unwrap();
+        let session_root = tempfile::tempdir().unwrap();
+        let file = work.path().join("versions.rs");
+        std::fs::write(&file, "a").unwrap();
+
+        let (ctx, session) = ctx_with_real_session(session_root.path(), Some("msg-two-edits"));
+        let tool = EditTool;
+
+        let r1 = tool
+            .execute(
+                json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("first edit returns");
+        assert!(!r1.is_error, "{}", r1.content);
+
+        let r2 = tool
+            .execute(
+                json!({
+                    "file_path": file.to_string_lossy(),
+                    "old_string": "b",
+                    "new_string": "c",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("second edit returns");
+        assert!(!r2.is_error, "{}", r2.content);
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "c");
+
+        let snaps = session.file_history_snapshots().unwrap();
+        assert_eq!(
+            snaps.len(),
+            2,
+            "two successful edits must produce two snapshots"
+        );
+        let name0 = snaps[0]
+            .snapshot
+            .tracked_file_backups
+            .values()
+            .next()
+            .unwrap()
+            .backup_file_name
+            .clone()
+            .expect("sidecar ref");
+        let name1 = snaps[1]
+            .snapshot
+            .tracked_file_backups
+            .values()
+            .next()
+            .unwrap()
+            .backup_file_name
+            .clone()
+            .expect("sidecar ref");
+        assert_ne!(name0, name1, "sidecar names must differ");
+        assert!(
+            name0.ends_with("@v1") && name1.ends_with("@v2"),
+            "expected @v1/@v2, got {name0} and {name1}"
+        );
+        assert_eq!(
+            session.read_backup(&name0).unwrap(),
+            b"a",
+            "first sidecar must hold pre-edit-1 bytes"
+        );
+        assert_eq!(
+            session.read_backup(&name1).unwrap(),
+            b"b",
+            "second sidecar must hold pre-edit-2 bytes (= post-edit-1)"
+        );
+    }
+
+    #[tokio::test]
     async fn edit_cancel_does_not_snapshot() {
         // Cancel the token BEFORE execute() runs. The tool currently
         // does not poll cancel mid-execute, so the edit may still
