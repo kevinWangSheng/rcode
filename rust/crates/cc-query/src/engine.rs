@@ -84,6 +84,14 @@ pub struct QueryEngine {
     prompter: Arc<dyn PermissionPrompter>,
     usage: UsageTracker,
     events_tx: Option<mpsc::Sender<AppEvent>>,
+    /// Where to write a new "Allow always" rule when the user picks
+    /// `PromptDecision::AllowAlways`. `None` keeps the rule in
+    /// session memory only — useful for tests, agent driver tasks,
+    /// and the `--non-interactive` path that never prompts anyway.
+    /// Main typically threads
+    /// `cc_permissions::default_user_settings_path()` here so the
+    /// rule survives the next restart (P0 #15).
+    allow_persist_path: Option<std::path::PathBuf>,
     /// Set to `true` when auto-compact fires inside the most recent `run_turn`.
     compacted_last_turn: bool,
     /// Consecutive auto-compact attempts that did NOT recover enough
@@ -156,6 +164,7 @@ impl QueryEngine {
             prompter,
             usage: UsageTracker::default(),
             events_tx: None,
+            allow_persist_path: None,
             compacted_last_turn: false,
             consecutive_autocompact_failures: 0,
             pending_additional_contexts: Vec::new(),
@@ -167,6 +176,19 @@ impl QueryEngine {
     /// Set the TUI event channel for emitting `AppEvent`s.
     pub fn with_events(mut self, tx: mpsc::Sender<AppEvent>) -> Self {
         self.events_tx = Some(tx);
+        self
+    }
+
+    /// Wire up disk persistence for "Allow always" decisions. When
+    /// the user picks `PromptDecision::AllowAlways` mid-turn the
+    /// engine writes the matching rule to `path` (typically
+    /// `~/.claude/settings.json`) in addition to the in-memory
+    /// session allow. Pass `None` (the default) to keep rules
+    /// session-only — that's the right call for tests, agent
+    /// driver subtasks, and `--non-interactive` mode where no
+    /// dialog ever fires.
+    pub fn with_allow_persist(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.allow_persist_path = path;
         self
     }
 
@@ -756,7 +778,24 @@ impl QueryEngine {
                             ));
                         }
                         PromptDecision::AllowAlways => {
+                            // Update in-memory session rules so the
+                            // current turn doesn't re-ask, AND persist
+                            // to settings.json so a restart still
+                            // trusts the tool (P0 #15). The
+                            // `allow_persist_path` is `None` when
+                            // running inside tests / sandbox harnesses
+                            // that don't want disk side effects.
                             self.permissions.add_session_allow(tool_name);
+                            if let Some(path) = self.allow_persist_path.as_deref() {
+                                if let Err(e) = cc_permissions::persist_allow_rule(path, tool_name)
+                                {
+                                    tracing::warn!(
+                                        path = %path.display(),
+                                        error = %e,
+                                        "failed to persist allow-always rule; session rule still applies"
+                                    );
+                                }
+                            }
                         }
                         PromptDecision::Allow => {}
                     }

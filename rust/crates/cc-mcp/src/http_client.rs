@@ -834,15 +834,27 @@ mod tests {
         assert_eq!(parse_sse_last_event_id(body).as_deref(), Some("42"));
     }
 
+    /// Shared mutex for all mTLS tests in this binary — `TLS_CERT` /
+    /// `TLS_KEY` are process-global env vars, so without a single
+    /// shared lock the three tests race each other under cargo's
+    /// default parallel runner. Each test holds the guard for its
+    /// whole body and drops on return.
+    fn mtls_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("mTLS env lock poisoned")
+    }
+
     /// P0 #10: mTLS loader refuses a half-configured setup. Setting
     /// TLS_CERT without TLS_KEY (or vice versa) is almost always a
     /// typo / forgotten env var; silently falling back to no-mTLS
     /// would mean the first connection goes out unauthenticated.
     #[test]
     fn mtls_loader_refuses_partial_env() {
-        use std::sync::{Mutex, OnceLock};
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = mtls_env_lock();
 
         std::env::set_var("TLS_CERT", "/tmp/does-not-exist.pem");
         std::env::remove_var("TLS_KEY");
@@ -860,9 +872,7 @@ mod tests {
     /// P0 #10: neither env set → no mTLS, clean `Ok(None)`.
     #[test]
     fn mtls_loader_returns_none_when_unconfigured() {
-        use std::sync::{Mutex, OnceLock};
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = mtls_env_lock();
         std::env::remove_var("TLS_CERT");
         std::env::remove_var("TLS_KEY");
         assert!(load_mtls_identity().unwrap().is_none());
@@ -873,9 +883,7 @@ mod tests {
     #[test]
     fn mtls_loader_rejects_malformed_pem() {
         use std::io::Write;
-        use std::sync::{Mutex, OnceLock};
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = mtls_env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let cert = dir.path().join("cert.pem");

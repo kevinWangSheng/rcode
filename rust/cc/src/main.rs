@@ -511,7 +511,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             system_blocks,
             options,
             prompter: tui_prompter,
-        });
+        })
+        .with_allow_persist(cc_permissions::default_user_settings_path());
 
         // Discover skills and build the command registry.
         let config_dir = dirs::home_dir().unwrap_or_default().join(".claude");

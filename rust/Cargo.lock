@@ -380,8 +380,11 @@ name = "cc-permissions"
 version = "0.1.0"
 dependencies = [
  "cc-core",
+ "dirs",
  "glob",
  "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

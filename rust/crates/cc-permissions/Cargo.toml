@@ -7,3 +7,9 @@ edition.workspace = true
 cc-core.workspace = true
 serde_json.workspace = true
 glob.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

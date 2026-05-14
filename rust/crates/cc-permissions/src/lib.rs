@@ -1,6 +1,9 @@
 use cc_core::{PermissionResult, PermissionSource};
 use serde_json::Value;
 
+pub mod persistence;
+pub use persistence::{default_user_settings_path, persist_allow_rule, persist_rules};
+
 /// A single permission rule entry — may include a tool name and optional input glob.
 /// Formats:
 ///   "Bash"            — matches any Bash call
