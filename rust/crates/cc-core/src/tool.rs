@@ -1,6 +1,7 @@
 use crate::error::CcResult;
 use crate::file_history::FileHistorySnapshot;
 use crate::message::CacheControl;
+use crate::permission::PermissionResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -185,6 +186,21 @@ pub trait Tool: Send + Sync {
     /// cancellation. `ctx.session` lets the tool append side-effect
     /// entries (file-history snapshots, interrupt markers).
     async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult>;
+
+    /// Tool-specific permission opinion (P0 #14, Change B of the
+    /// 2026-04-24 parity-gaps roadmap; mirrors TS
+    /// `Tool.checkPermissions(input, context)`). Called by the engine
+    /// before the settings-level rules; returning `Some(result)` lets
+    /// the tool veto a write to `.git/` / `.claude/`, allow a known-
+    /// safe Bash subcommand (`ls`, `cat`, …) without re-prompting, or
+    /// raise an interrupt for the whole turn.
+    ///
+    /// The default implementation returns `None` (no opinion) so
+    /// existing tools without a safety story keep the pre-D-B
+    /// behaviour. New tools opt in by overriding this method.
+    async fn check_permissions(&self, _input: &Value) -> Option<PermissionResult> {
+        None
+    }
 
     /// Convert to API ToolDefinition.
     fn to_definition(&self) -> ToolDefinition {

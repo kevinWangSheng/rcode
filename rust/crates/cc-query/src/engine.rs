@@ -710,9 +710,61 @@ impl QueryEngine {
             return Err(tool_result_error(&tu.id, format!("Blocked by hook: {msg}")));
         }
 
+        // --- Tool-specific opinion (Change B, P0 #14) ---
+        //
+        // Each tool may carry its own permission opinion via
+        // `Tool::check_permissions`. The opinion runs BEFORE
+        // settings rules and BEFORE the bypass shortcut — so:
+        //
+        //   * Bash's `rm -rf /` deny survives `--bypass-permissions`.
+        //   * Edit's `.git/` safety check survives bypass too.
+        //   * Bash's `ls` fast-allow skips the dialog under default
+        //     mode (the user trusts what the tool's classifier
+        //     marks as read-only).
+        //
+        // `force_ask` lets the tool override into the dialog path
+        // even when bypass is on.
+        let mut force_ask = false;
+        let tool_for_check = self.tools.get_arc(tool_name).cloned();
+        if let Some(tool) = tool_for_check.as_ref() {
+            if let Some(opinion) = tool.check_permissions(input).await {
+                match opinion.behavior {
+                    PermissionBehavior::Deny => {
+                        fire_permission_denied(
+                            &self.hooks,
+                            &self.session.id,
+                            tu,
+                            "tool-check",
+                            cancel,
+                        )
+                        .await;
+                        let msg = opinion
+                            .message
+                            .or(opinion.reason)
+                            .unwrap_or_else(|| format!("Permission denied for tool '{tool_name}'"));
+                        return Err(tool_result_error(&tu.id, msg));
+                    }
+                    PermissionBehavior::Allow => {
+                        // Tool opted in to skip the dialog. Trust it.
+                        return Ok(Arc::clone(tool));
+                    }
+                    PermissionBehavior::Ask => {
+                        force_ask = true;
+                    }
+                }
+            }
+        }
+
         // --- Permission check ---
-        if !self.options.bypass_permissions {
-            let result = self.permissions.check(tool_name, input);
+        if !self.options.bypass_permissions || force_ask {
+            let mut result = self.permissions.check(tool_name, input);
+            // When the tool's own `check_permissions` returned Ask
+            // (force_ask=true) but settings rules would Allow, the
+            // tool wins — promote the result back to Ask. Tool
+            // opinions are bypass-immune by design.
+            if force_ask && result.behavior == PermissionBehavior::Allow {
+                result = cc_core::PermissionResult::ask();
+            }
             match result.behavior {
                 PermissionBehavior::Deny => {
                     fire_permission_denied(

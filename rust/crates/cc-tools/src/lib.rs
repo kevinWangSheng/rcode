@@ -1,6 +1,7 @@
 pub mod agent_tool;
 pub mod ask_user_question;
 pub mod bash;
+pub mod bash_classifier;
 pub mod edit;
 pub mod enter_plan_mode;
 pub mod enter_worktree;
@@ -9,6 +10,7 @@ pub mod exit_worktree;
 pub mod file_history;
 pub mod glob_tool;
 pub mod grep;
+pub mod path_safety;
 pub mod read;
 pub mod send_message;
 pub mod sleep_tool;

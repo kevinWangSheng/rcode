@@ -70,6 +70,11 @@ impl Tool for BashTool {
         false
     }
 
+    async fn check_permissions(&self, input: &Value) -> Option<cc_core::PermissionResult> {
+        let command = input.get("command")?.as_str()?;
+        crate::bash_classifier::classify(command)
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let command = input["command"]
             .as_str()

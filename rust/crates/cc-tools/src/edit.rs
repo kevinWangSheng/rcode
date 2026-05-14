@@ -57,6 +57,11 @@ impl Tool for EditTool {
         .unwrap()
     }
 
+    async fn check_permissions(&self, input: &Value) -> Option<cc_core::PermissionResult> {
+        let path = input.get("file_path")?.as_str()?;
+        crate::path_safety::safety_check_path(path)
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolContext) -> CcResult<ToolResult> {
         let file_path = input["file_path"]
             .as_str()
