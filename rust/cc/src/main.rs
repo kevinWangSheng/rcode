@@ -105,6 +105,38 @@ enum Commands {
     /// build; the doctor command will show the same reminder when a
     /// newer release has been announced.
     Update,
+    /// Manage MCP server entries in `~/.claude/settings.json`. Mirrors
+    /// the TS `claude mcp` subcommand group: list / get / add-json /
+    /// remove / serve.
+    #[command(subcommand)]
+    Mcp(McpSubcommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum McpSubcommand {
+    /// List configured MCP servers by name and transport.
+    List,
+    /// Print the raw JSON config for a single MCP server.
+    Get {
+        /// Server name (the key under `mcpServers`).
+        name: String,
+    },
+    /// Add an MCP server from a JSON blob. Body must be a single
+    /// JSON object with at minimum a `command` (stdio) or `url`
+    /// (HTTP/SSE) field. Overwrites any existing entry with the
+    /// same name; combine with `mcp remove` for a delete-then-add
+    /// flow if you want a confirmation.
+    AddJson {
+        /// Server name (the key under `mcpServers`).
+        name: String,
+        /// JSON object describing the server.
+        config: String,
+    },
+    /// Remove an MCP server by name. Errors if no such entry.
+    Remove { name: String },
+    /// Run this Claude Code binary as an MCP server itself (stdio
+    /// transport). Stub today; tracked for follow-up batch.
+    Serve,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -226,6 +258,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                  latest release from https://github.com/anthropics/claude-code and \n\
                  rebuild with `cargo install --path rust/cc`."
             );
+            return Ok(());
+        }
+        Some(Commands::Mcp(sub)) => {
+            run_mcp_subcommand(sub).await?;
             return Ok(());
         }
         None => {}
@@ -1236,6 +1272,85 @@ mod tests {
         assert!(hints[0].contains("doctor"));
     }
 
+    /// `mcp add-json` writes a new server entry and a follow-up
+    /// `mcp list` reads it back. Round-trip through the same
+    /// serde_json path covers both reading and writing.
+    #[test]
+    fn mcp_add_then_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        write_mcp_server(
+            &path,
+            "fs",
+            serde_json::json!({"command": "npx", "args": ["fs"]}),
+        )
+        .unwrap();
+
+        let servers = read_mcp_servers(&path).unwrap();
+        assert_eq!(servers.len(), 1);
+        let cfg = servers.get("fs").unwrap();
+        assert_eq!(cfg["command"], "npx");
+        let summary = summarise_mcp_server(cfg);
+        assert!(summary.starts_with("stdio:"), "{summary}");
+        assert!(summary.contains("npx fs"));
+    }
+
+    /// `mcp add-json` must NOT clobber unknown top-level keys. The
+    /// settings.json may carry user-managed fields cc-config doesn't
+    /// know about; a roundtrip through `write_mcp_server` must
+    /// preserve them.
+    #[test]
+    fn mcp_add_preserves_unknown_settings_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"theme": "dark", "permissions": {"allow": ["Bash"]}}"#,
+        )
+        .unwrap();
+        write_mcp_server(
+            &path,
+            "fs",
+            serde_json::json!({"command": "/usr/bin/fs-server"}),
+        )
+        .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["theme"], "dark");
+        assert_eq!(parsed["permissions"]["allow"][0], "Bash");
+        assert_eq!(parsed["mcpServers"]["fs"]["command"], "/usr/bin/fs-server");
+    }
+
+    #[test]
+    fn mcp_remove_returns_false_on_unknown_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Empty file → nothing to remove.
+        assert!(!remove_mcp_server(&path, "nope").unwrap());
+    }
+
+    #[test]
+    fn mcp_remove_drops_the_named_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        write_mcp_server(&path, "keep", serde_json::json!({"command": "a"})).unwrap();
+        write_mcp_server(&path, "drop", serde_json::json!({"command": "b"})).unwrap();
+        assert!(remove_mcp_server(&path, "drop").unwrap());
+        let remaining = read_mcp_servers(&path).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains_key("keep"));
+    }
+
+    #[test]
+    fn summarise_mcp_server_handles_http_url() {
+        let cfg = serde_json::json!({"url": "https://example.com/mcp"});
+        let s = summarise_mcp_server(&cfg);
+        assert_eq!(s, "http:https://example.com/mcp");
+
+        let cfg = serde_json::json!({"url": "https://x/", "transport": "sse"});
+        assert_eq!(summarise_mcp_server(&cfg), "sse:https://x/");
+    }
+
     /// P1 #38: every kept AppEvent variant serialises to a single
     /// self-contained JSONL line with a `"type"` discriminator.
     /// StreamToolUse / TaskUpdate intentionally drop (they're
@@ -1349,4 +1464,198 @@ async fn run_doctor() {
             "release"
         }
     );
+}
+
+/// `claude mcp <sub>` dispatcher. Each branch reads / mutates the
+/// `mcpServers` object in `~/.claude/settings.json` using
+/// `serde_json::Value` so unknown top-level keys survive a
+/// round-trip. Writes go through a NamedTempFile + persist for
+/// crash-safety (same pattern as `cc_permissions::persistence`).
+#[allow(clippy::items_after_test_module)]
+async fn run_mcp_subcommand(sub: &McpSubcommand) -> Result<(), Box<dyn std::error::Error>> {
+    let path = settings_path()?;
+    match sub {
+        McpSubcommand::List => {
+            let servers = read_mcp_servers(&path)?;
+            if servers.is_empty() {
+                println!(
+                    "No MCP servers configured.\n\nAdd one with `claude mcp add-json <name> '<json>'`."
+                );
+                return Ok(());
+            }
+            for (name, cfg) in &servers {
+                println!("{name}\t{}", summarise_mcp_server(cfg));
+            }
+        }
+        McpSubcommand::Get { name } => {
+            let servers = read_mcp_servers(&path)?;
+            match servers.get(name) {
+                Some(cfg) => println!("{}", serde_json::to_string_pretty(cfg)?),
+                None => {
+                    return Err(
+                        format!("no MCP server named '{name}' in {}", path.display()).into(),
+                    )
+                }
+            }
+        }
+        McpSubcommand::AddJson { name, config } => {
+            let parsed: serde_json::Value = serde_json::from_str(config).map_err(|e| {
+                format!("config is not valid JSON: {e}. Pass a quoted JSON object.")
+            })?;
+            if !parsed.is_object() {
+                return Err(
+                    "config must be a JSON object (e.g. '{\"command\":\"npx ...\"}')".into(),
+                );
+            }
+            write_mcp_server(&path, name, parsed)?;
+            println!("added MCP server '{name}' to {}", path.display());
+        }
+        McpSubcommand::Remove { name } => {
+            let removed = remove_mcp_server(&path, name)?;
+            if removed {
+                println!("removed MCP server '{name}' from {}", path.display());
+            } else {
+                return Err(format!("no MCP server named '{name}' in {}", path.display()).into());
+            }
+        }
+        McpSubcommand::Serve => {
+            eprintln!(
+                "`claude mcp serve` (stdio MCP server) is not yet wired on the Rust\n\
+                 build. Tracked for a follow-up batch; meanwhile use the TS CLI's\n\
+                 `claude mcp serve` or call Claude Code directly via its tools."
+            );
+            return Err("mcp serve unimplemented".into());
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the user-level settings path. Honours
+/// `CC_SETTINGS_PATH` so tests can target a temp file.
+fn settings_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(p) = std::env::var("CC_SETTINGS_PATH") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    let home = dirs::home_dir().ok_or("cannot determine home directory")?;
+    Ok(home.join(".claude").join("settings.json"))
+}
+
+/// Read the `mcpServers` object out of `path` as a name → value map.
+/// Returns an empty map if the file or section is absent — those
+/// are normal startup states, not errors.
+fn read_mcp_servers(
+    path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, Box<dyn std::error::Error>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display()).into()),
+    };
+    let root: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+    let servers = root
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    Ok(servers.into_iter().collect())
+}
+
+/// One-line server description for `mcp list`. Prefers `command`
+/// (stdio) → `url` (HTTP / SSE) → opaque.
+fn summarise_mcp_server(cfg: &serde_json::Value) -> String {
+    if let Some(cmd) = cfg.get("command").and_then(|v| v.as_str()) {
+        let args: Vec<String> = cfg
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if args.is_empty() {
+            format!("stdio:{cmd}")
+        } else {
+            format!("stdio:{cmd} {}", args.join(" "))
+        }
+    } else if let Some(url) = cfg.get("url").and_then(|v| v.as_str()) {
+        let kind = cfg
+            .get("transport")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http");
+        format!("{kind}:{url}")
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Read / append / write back. Existing keys with the same name are
+/// overwritten; unknown top-level settings keys survive.
+fn write_mcp_server(
+    path: &std::path::Path,
+    name: &str,
+    config: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut root = read_settings_root(path)?;
+    let entry = root
+        .as_object_mut()
+        .ok_or("settings root must be an object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let map = entry
+        .as_object_mut()
+        .ok_or("mcpServers must be an object")?;
+    map.insert(name.to_string(), config);
+    write_settings_atomically(path, &root)?;
+    Ok(())
+}
+
+fn remove_mcp_server(
+    path: &std::path::Path,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut root = read_settings_root(path)?;
+    let removed = root
+        .as_object_mut()
+        .and_then(|o| o.get_mut("mcpServers"))
+        .and_then(|v| v.as_object_mut())
+        .map(|map| map.remove(name).is_some())
+        .unwrap_or(false);
+    if removed {
+        write_settings_atomically(path, &root)?;
+    }
+    Ok(removed)
+}
+
+fn read_settings_root(
+    path: &std::path::Path,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(serde_json::from_str(&text)
+            .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(serde_json::Value::Object(Default::default()))
+        }
+        Err(e) => Err(format!("failed to read {}: {e}", path.display()).into()),
+    }
+}
+
+fn write_settings_atomically(
+    path: &std::path::Path,
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let text = serde_json::to_string_pretty(value)?;
+    tmp.write_all(text.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.persist(path)?;
+    Ok(())
 }
