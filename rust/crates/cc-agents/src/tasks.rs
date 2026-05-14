@@ -271,44 +271,217 @@ pub async fn run_in_process_teammate(
     })
 }
 
-/// Remote agent task type: delegate to a remote Claude Code instance via HTTP API.
+/// Metadata persisted for a remote-agent task across resumes.
+/// Mirrors TS `RemoteAgentMetadata` in `services/agents/teleport.ts`:
+/// the session id lets the next session reconnect to a running
+/// remote turn instead of starting a fresh one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemoteAgentMetadata {
+    pub session_id: String,
+    pub endpoint: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Callback invoked once the remote server hands back a session id
+/// — wired by the engine to persist the metadata in cc-session so
+/// `--resume` can reconnect to the running turn.
+pub type RemoteAgentMetadataSink = Box<dyn Fn(&RemoteAgentMetadata) + Send + Sync + 'static>;
+
+/// Poll interval for `run_remote_agent`. Matches TS
+/// `REMOTE_AGENT_POLL_INTERVAL_MS = 1500`.
+const REMOTE_AGENT_POLL_MS: u64 = 1500;
+/// Overall ceiling. After this, the task errors with a timeout so
+/// the leader can decide whether to restart or surface the failure.
+/// Matches TS `REMOTE_AGENT_TIMEOUT_MS = 10 * 60_000`.
+const REMOTE_AGENT_TIMEOUT_MS: u64 = 10 * 60_000;
+
+/// Remote agent task type: delegate to a remote Claude Code instance.
+///
+/// Two-phase protocol:
+///   1. `POST {endpoint}/sessions` with `{prompt}` → response carries
+///      `{session_id, status}` and optionally `{content}` if the
+///      server completed synchronously (small jobs).
+///   2. Otherwise enter a `GET {endpoint}/sessions/{session_id}` poll
+///      loop. Server replies with `{status, content?}` where status
+///      ∈ `{queued, running, completed, failed}`. Loop exits on a
+///      terminal status, the overall timeout, or cancel.
+///
+/// If the server responds with a plain-text body (legacy / sync-only
+/// servers), the function preserves the pre-change behaviour: treat
+/// the body as the final content and return immediately. New servers
+/// gain async polling without breaking old ones.
+///
+/// `metadata_sink` (optional) is invoked once after the create
+/// response is parsed so cc-session can persist
+/// [`RemoteAgentMetadata`] for resume.
 pub async fn run_remote_agent(
     prompt: String,
     endpoint: String,
     http: reqwest::Client,
     cancel: CancellationToken,
+    metadata_sink: Option<RemoteAgentMetadataSink>,
 ) -> CcResult<TaskOutput> {
-    let body = json!({
-        "prompt": prompt,
-    });
+    let body = json!({ "prompt": prompt });
+    let create_url = format!("{}/sessions", endpoint.trim_end_matches('/'));
 
-    tokio::select! {
+    let resp = tokio::select! {
         biased;
-        _ = cancel.cancelled() => {
-            Err(CcError::Cancelled)
-        }
-        result = http.post(&endpoint)
+        _ = cancel.cancelled() => return Err(CcError::Cancelled),
+        result = http.post(&create_url)
             .header("content-type", "application/json")
             .json(&body)
             .send() => {
-            let response = result
-                .map_err(|e| CcError::Other(format!("remote agent request failed: {e}")))?;
+            result.map_err(|e| CcError::Other(format!("remote agent request failed: {e}")))?
+        }
+    };
 
-            if !response.status().is_success() {
+    if !resp.status().is_success() {
+        return Err(CcError::Other(format!(
+            "remote agent returned status {}",
+            resp.status()
+        )));
+    }
+
+    // Prefer JSON when the server advertises it; fall back to the
+    // legacy plain-text path so older servers still work.
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/plain")
+        .to_ascii_lowercase();
+
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| CcError::Other(format!("remote agent response read failed: {e}")))?;
+
+    if !ctype.contains("json") {
+        // Legacy one-shot server: body IS the answer.
+        return Ok(TaskOutput {
+            summary: "remote agent completed".into(),
+            content: body_text,
+        });
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+        CcError::Other(format!(
+            "remote agent returned malformed JSON: {e}; body was {body_text}"
+        ))
+    })?;
+
+    let session_id = parsed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CcError::Other("remote agent response missing session_id".into()))?
+        .to_string();
+
+    if let Some(sink) = metadata_sink.as_ref() {
+        sink(&RemoteAgentMetadata {
+            session_id: session_id.clone(),
+            endpoint: endpoint.clone(),
+            started_at: chrono::Utc::now(),
+        });
+    }
+
+    // Synchronous completion path.
+    let status = parsed
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("running");
+    if is_terminal_status(status) {
+        return finalise(&parsed, status);
+    }
+
+    // Poll loop.
+    let poll_url = format!("{}/sessions/{session_id}", endpoint.trim_end_matches('/'));
+    let started = std::time::Instant::now();
+    let interval = std::time::Duration::from_millis(REMOTE_AGENT_POLL_MS);
+    let timeout = std::time::Duration::from_millis(REMOTE_AGENT_TIMEOUT_MS);
+
+    loop {
+        if started.elapsed() > timeout {
+            return Err(CcError::Other(format!(
+                "remote agent timed out after {}s (session {session_id})",
+                timeout.as_secs()
+            )));
+        }
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(CcError::Cancelled),
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        let poll_resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(CcError::Cancelled),
+            result = http.get(&poll_url).send() => result,
+        }
+        .map_err(|e| CcError::Other(format!("remote agent poll failed: {e}")))?;
+
+        if !poll_resp.status().is_success() {
+            // Transient failure: warn and retry until the timeout
+            // fires. A 5xx that lingers eventually surfaces via the
+            // ceiling above; 4xx (session gone) should be terminal.
+            if poll_resp.status().is_client_error() {
                 return Err(CcError::Other(format!(
-                    "remote agent returned status {}",
-                    response.status()
+                    "remote agent poll returned {}; session may have been evicted",
+                    poll_resp.status()
                 )));
             }
-
-            let text = response.text().await
-                .map_err(|e| CcError::Other(format!("remote agent response read failed: {e}")))?;
-
-            Ok(TaskOutput {
-                summary: "remote agent completed".into(),
-                content: text,
-            })
+            tracing::warn!(
+                "remote agent poll {} returned {}; retrying",
+                poll_url,
+                poll_resp.status()
+            );
+            continue;
         }
+
+        let raw = poll_resp
+            .text()
+            .await
+            .map_err(|e| CcError::Other(format!("remote agent poll read failed: {e}")))?;
+        let snapshot: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("remote agent poll body unparseable: {e}; raw: {raw}");
+                continue;
+            }
+        };
+        let status = snapshot
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("running");
+        if is_terminal_status(status) {
+            return finalise(&snapshot, status);
+        }
+    }
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "error")
+}
+
+fn finalise(snapshot: &serde_json::Value, status: &str) -> CcResult<TaskOutput> {
+    let content = snapshot
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if status == "completed" {
+        Ok(TaskOutput {
+            summary: "remote agent completed".into(),
+            content,
+        })
+    } else {
+        let error_msg = snapshot
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("remote agent ended in non-success state");
+        Err(CcError::Other(format!(
+            "remote agent status={status}: {error_msg}"
+        )))
     }
 }
 
@@ -446,5 +619,191 @@ mod tests {
             rx.try_recv().is_err(),
             "watchdog should not fire while output is growing"
         );
+    }
+
+    /// P0 #18: a server that returns a synchronous `{session_id,
+    /// status:"completed", content}` response short-circuits the
+    /// poll loop and surfaces the content immediately. Also
+    /// verifies the metadata sink fires exactly once with the
+    /// session id the server handed back.
+    #[tokio::test]
+    async fn remote_agent_handles_synchronous_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"session_id":"rs-sync-1","status":"completed","content":"hello world"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let captured: Arc<Mutex<Vec<RemoteAgentMetadata>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let sink: RemoteAgentMetadataSink = Box::new(move |meta| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            captured_clone.lock().unwrap().push(meta.clone());
+        });
+
+        let result = run_remote_agent(
+            "hi".into(),
+            endpoint.clone(),
+            reqwest::Client::new(),
+            CancellationToken::new(),
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.summary, "remote agent completed");
+        assert_eq!(result.content, "hello world");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let snapshot: Vec<RemoteAgentMetadata> = captured.lock().unwrap().clone();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].session_id, "rs-sync-1");
+        assert_eq!(snapshot[0].endpoint, endpoint);
+        server.await.unwrap();
+    }
+
+    /// P0 #18: when the create response returns `status:"running"`,
+    /// the task polls `/sessions/{id}` until a terminal status
+    /// shows up. The metadata sink still fires exactly once at
+    /// session creation (not on every poll).
+    #[tokio::test]
+    async fn remote_agent_polls_until_terminal_status() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move {
+            // 1. POST /sessions → 200 { session_id, status: running }
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"session_id":"rs-poll-2","status":"running"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+
+            // 2. GET /sessions/rs-poll-2 → still running
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"status":"running"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+
+            // 3. GET /sessions/rs-poll-2 → completed with content
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"status":"completed","content":"final answer"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        // Tight poll interval for the test so we don't wait 1.5s
+        // between polls. We swap via a #[cfg(test)]-gated path,
+        // but the const is module-private — easier to just live
+        // with the default. Drop to a CancellationToken with a
+        // short timeout so flake budget stays sane.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let sink: RemoteAgentMetadataSink = Box::new(move |_meta| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let result = run_remote_agent(
+            "compute something".into(),
+            endpoint.clone(),
+            reqwest::Client::new(),
+            CancellationToken::new(),
+            Some(sink),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.summary, "remote agent completed");
+        assert_eq!(result.content, "final answer");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "metadata sink must fire exactly once per task"
+        );
+        server.await.unwrap();
+    }
+
+    /// P0 #18: cancel during the poll wait short-circuits with
+    /// `CcError::Cancelled` even if the server has been answering
+    /// running on every poll.
+    #[tokio::test]
+    async fn remote_agent_polling_honors_cancel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"session_id":"rs-cancel","status":"running"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+            // We accept further polls but never reply quickly — the
+            // cancel should fire during the inter-poll sleep before
+            // any poll completes.
+            let _ = listener.accept().await;
+        });
+
+        let cancel = CancellationToken::new();
+        let cancel_inner = cancel.clone();
+        // Fire cancel after the create response has been parsed and
+        // the function is sleeping inside the poll loop.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel_inner.cancel();
+        });
+        let err = run_remote_agent("x".into(), endpoint, reqwest::Client::new(), cancel, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CcError::Cancelled), "got: {err}");
+        server.abort();
     }
 }

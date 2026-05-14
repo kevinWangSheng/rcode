@@ -21,6 +21,12 @@ struct TaskEntry {
     state: TaskStateBase,
     handle: JoinHandle<CcResult<TaskOutput>>,
     cancel: CancellationToken,
+    /// If `Some`, this task was spawned by another task and a
+    /// cancel on the parent must cascade here too (P0 #17 of the
+    /// 2026-04-24 parity-gaps roadmap). Top-level tasks (Ctrl+C
+    /// originated from the main loop, leader agents spawned by
+    /// the user) leave this `None`.
+    parent_id: Option<TaskId>,
 }
 
 /// Central registry for all running/completed tasks.
@@ -66,6 +72,7 @@ impl TaskRegistry {
                 state,
                 handle,
                 cancel,
+                parent_id: None,
             },
         );
 
@@ -73,16 +80,74 @@ impl TaskRegistry {
         Ok(id)
     }
 
-    /// Cancel a specific task.
+    /// Spawn a task as a child of an existing one. The child's cancel
+    /// token is derived from the parent's so cancelling the parent
+    /// (either directly via [`cancel`] / [`cancel_all`] or because
+    /// the parent's own future returns) propagates to every child
+    /// transitively. Used for in-process teammate / leader-spawned
+    /// sub-agent workflows where Ctrl+C on the leader must reap the
+    /// whole tree (P0 #17 of the 2026-04-24 parity-gaps roadmap).
+    ///
+    /// `parent_id` must already be registered. Returns `CcError::Other`
+    /// if not.
+    pub fn spawn_child(
+        &mut self,
+        parent_id: &TaskId,
+        kind: TaskKind,
+        description: String,
+        future: impl Future<Output = CcResult<TaskOutput>> + Send + 'static,
+    ) -> CcResult<TaskId> {
+        let parent_cancel = self
+            .tasks
+            .get(parent_id)
+            .ok_or_else(|| {
+                CcError::Other(format!(
+                    "spawn_child: parent task {parent_id:?} is not registered"
+                ))
+            })?
+            .cancel
+            .clone();
+        let child_cancel = parent_cancel.child_token();
+        let id = self.spawn(kind, description, child_cancel, future)?;
+        if let Some(entry) = self.tasks.get_mut(&id) {
+            entry.parent_id = Some(parent_id.clone());
+        }
+        Ok(id)
+    }
+
+    /// Cancel a specific task and every descendant transitively.
+    /// Both the explicit `parent_id` link and the `child_token` derived
+    /// at spawn time enforce the cascade, so even a teammate whose
+    /// driver task forgot to poll `cancel.is_cancelled()` will get
+    /// reaped the next time it awaits anything cancel-aware.
     pub fn cancel(&mut self, id: &TaskId) {
-        if let Some(entry) = self.tasks.get_mut(id) {
-            entry.cancel.cancel();
-            entry.state.status = TaskStatus::Cancelled;
-            debug!("cancelled task {id:?}");
+        // BFS over the parent_id graph. The graph is shallow in
+        // practice (one or two levels) but the BFS keeps us safe
+        // against future fan-out without re-engineering this code.
+        let mut to_cancel: Vec<TaskId> = vec![id.clone()];
+        let mut i = 0;
+        while i < to_cancel.len() {
+            let cursor = to_cancel[i].clone();
+            for (tid, entry) in &self.tasks {
+                if entry.parent_id.as_ref() == Some(&cursor) && !to_cancel.contains(tid) {
+                    to_cancel.push(tid.clone());
+                }
+            }
+            i += 1;
+        }
+        for tid in &to_cancel {
+            if let Some(entry) = self.tasks.get_mut(tid) {
+                entry.cancel.cancel();
+                entry.state.status = TaskStatus::Cancelled;
+                debug!("cancelled task {tid:?}");
+            }
         }
     }
 
-    /// Cancel all running tasks.
+    /// Cancel all running tasks. Iterates the existing entries and
+    /// fires [`cancel`] on each; the cascade-through-parent_id logic
+    /// runs harmlessly on top of that (every descendant is already
+    /// in the same loop's snapshot).
     pub fn cancel_all(&mut self) {
         let ids: Vec<TaskId> = self.tasks.keys().cloned().collect();
         for id in ids {
@@ -331,6 +396,115 @@ mod tests {
         );
     }
 
+    /// P0 #17: cancelling a leader task cascades to every descendant
+    /// spawned via `spawn_child`. Both the cancellation-token tree
+    /// (so the child's await points observe the parent's cancel) AND
+    /// the registry's parent_id graph (so `status()` reads `Cancelled`
+    /// on the descendant) must reflect the cascade.
+    #[tokio::test]
+    async fn cancel_cascades_to_spawn_child_descendants() {
+        let mut registry = TaskRegistry::new(10);
+        let leader_cancel = CancellationToken::new();
+        let leader_cancel_inner = leader_cancel.clone();
+
+        let leader_id = registry
+            .spawn(
+                TaskKind::LocalBash,
+                "leader".into(),
+                leader_cancel,
+                async move {
+                    leader_cancel_inner.cancelled().await;
+                    Err::<TaskOutput, _>(CcError::Cancelled)
+                },
+            )
+            .unwrap();
+
+        // Two teammates spawned as direct children. A grandchild
+        // hangs off teammate1 to exercise the transitive descent.
+        let teammate1 = registry
+            .spawn_child(
+                &leader_id,
+                TaskKind::InProcessTeammate,
+                "mate1".into(),
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(TaskOutput {
+                        summary: "".into(),
+                        content: "".into(),
+                    })
+                },
+            )
+            .unwrap();
+        let teammate2 = registry
+            .spawn_child(
+                &leader_id,
+                TaskKind::InProcessTeammate,
+                "mate2".into(),
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(TaskOutput {
+                        summary: "".into(),
+                        content: "".into(),
+                    })
+                },
+            )
+            .unwrap();
+        let grandchild = registry
+            .spawn_child(
+                &teammate1,
+                TaskKind::InProcessTeammate,
+                "grandchild".into(),
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(TaskOutput {
+                        summary: "".into(),
+                        content: "".into(),
+                    })
+                },
+            )
+            .unwrap();
+
+        // Cancel only the leader. Every descendant must flip to
+        // Cancelled in the registry too.
+        registry.cancel(&leader_id);
+
+        for id in [&leader_id, &teammate1, &teammate2, &grandchild] {
+            let st = registry
+                .status(id)
+                .unwrap_or_else(|| panic!("task {id:?} fell out of registry"));
+            assert_eq!(
+                st.status,
+                TaskStatus::Cancelled,
+                "task {id:?} status was {:?}",
+                st.status
+            );
+        }
+    }
+
+    /// `spawn_child` errors loudly when the named parent isn't in the
+    /// registry — silently registering an orphan would defeat the
+    /// cascade contract.
+    #[tokio::test]
+    async fn spawn_child_rejects_unknown_parent() {
+        let mut registry = TaskRegistry::new(10);
+        let bogus_parent = TaskId::new();
+        let err = registry
+            .spawn_child(
+                &bogus_parent,
+                TaskKind::InProcessTeammate,
+                "x".into(),
+                async {
+                    Ok(TaskOutput {
+                        summary: "".into(),
+                        content: "".into(),
+                    })
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not registered"), "got: {err}");
+    }
+
     /// `evict_old(max_age)` MUST honour `max_age`. Before this fix the
     /// argument was ignored and every non-running task was evicted
     /// immediately, which surprised callers that expected a TTL.
@@ -375,6 +549,7 @@ mod tests {
                 state: old_state,
                 handle,
                 cancel: old_cancel,
+                parent_id: None,
             },
         );
 
