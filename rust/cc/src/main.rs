@@ -609,6 +609,38 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = final_text;
         }
         OutputFormat::Json => {
+            // JSONL streaming output (P1 #38 of the 2026-04-24 parity-
+            // gaps roadmap). Each line is a self-contained JSON object
+            // typed via the `"type"` field. Order: a session_start
+            // line, then live tool_use / tool_result / assistant_text
+            // / permission_request / hook event lines as the engine
+            // emits them, then a final turn_summary line. SDK
+            // consumers can parse line-by-line and react to events
+            // mid-turn instead of waiting for the whole reply.
+            let session_id = engine.session().id.clone();
+            let model = engine.model().to_string();
+            // Initial session_start record.
+            let header = json!({
+                "type": "session_start",
+                "session_id": session_id,
+                "model": model,
+            });
+            println!("{header}");
+
+            // Wire the event channel into the engine so it forwards
+            // streaming deltas + tool calls + permission requests +
+            // turn-complete to us. The text callback below also
+            // captures final assistant text for the summary line.
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<cc_core::AppEvent>(64);
+            let printer = tokio::spawn(async move {
+                while let Some(ev) = ev_rx.recv().await {
+                    if let Some(line) = event_to_jsonl(&ev) {
+                        println!("{line}");
+                    }
+                }
+            });
+            engine = engine.with_events(ev_tx);
+
             let mut full_text = String::new();
             let final_text = engine
                 .run_turn(
@@ -620,12 +652,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &cancel,
                 )
                 .await?;
-            let output = json!({
-                "session_id": engine.session().id,
-                "model": engine.model(),
-                "content": final_text,
+            // Dropping the engine closes its tx clone of the event
+            // channel; the printer drains and exits. Make sure the
+            // summary line lands AFTER every streamed event.
+            drop(engine);
+            printer.await.ok();
+            let summary = json!({
+                "type": "turn_summary",
+                "session_id": session_id,
+                "model": model,
+                "final_text": final_text,
             });
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            println!("{summary}");
         }
     }
 
@@ -641,6 +679,71 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 async fn fire_session_end(hook_runner: &HookRunner, session_id: &str) {
     let input = cc_core::hook::HookInput::base(session_id, "SessionEnd");
     hook_runner.run_session_end(&input).await;
+}
+
+/// Serialise an `AppEvent` for `--output json` streaming. Returns `None`
+/// for events that are internal lifecycle signals (StreamToolUse — the
+/// engine emits a richer `ToolStart` later; TaskUpdate — agent-task
+/// queue noise) so SDK consumers don't have to filter them out.
+///
+/// Each kept variant becomes a self-contained JSON object with a
+/// discriminating `"type"` field. Field names mirror TS
+/// `src/cli/print.ts` so JSONL parsers built for the TS CLI keep
+/// working against the Rust binary.
+fn event_to_jsonl(ev: &cc_core::AppEvent) -> Option<String> {
+    use cc_core::AppEvent::*;
+    let value = match ev {
+        StreamDelta(text) => json!({
+            "type": "assistant_text_delta",
+            "text": text,
+        }),
+        StreamThinking(text) => json!({
+            "type": "thinking_delta",
+            "text": text,
+        }),
+        StreamEnd(reason) => json!({
+            "type": "stream_end",
+            "stop_reason": format!("{reason:?}"),
+        }),
+        ToolStart { name, input } => json!({
+            "type": "tool_use",
+            "name": name,
+            "input": input,
+        }),
+        ToolEnd { name, result } => json!({
+            "type": "tool_result",
+            "name": name,
+            "is_error": result.is_error,
+            "content": result.content,
+        }),
+        PermissionRequest {
+            id,
+            tool_name,
+            tool_input,
+            ..
+        } => json!({
+            "type": "permission_request",
+            "id": id,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        }),
+        CompactBoundary => json!({"type": "compact_boundary"}),
+        TurnComplete { usage } => json!({
+            "type": "turn_complete",
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+            },
+        }),
+        Error(message) => json!({"type": "error", "message": message}),
+        // StreamToolUse is superseded by ToolStart; TaskUpdate is
+        // internal to the agent runtime and not part of the public
+        // JSONL contract.
+        StreamToolUse(_) | TaskUpdate(_) => return None,
+    };
+    Some(value.to_string())
 }
 
 async fn build_system_blocks(model: &str, add_dirs: &[String]) -> Vec<SystemBlock> {
@@ -1130,6 +1233,67 @@ mod tests {
         let hints = error_hints("something strange happened 42");
         assert_eq!(hints.len(), 1);
         assert!(hints[0].contains("doctor"));
+    }
+
+    /// P1 #38: every kept AppEvent variant serialises to a single
+    /// self-contained JSONL line with a `"type"` discriminator.
+    /// StreamToolUse / TaskUpdate intentionally drop (they're
+    /// internal noise that the public JSONL contract excludes).
+    #[test]
+    fn event_to_jsonl_covers_public_variants() {
+        use cc_core::message::Usage;
+        use cc_core::tool::ToolResult;
+        use cc_core::AppEvent;
+
+        let line = event_to_jsonl(&AppEvent::StreamDelta("hi".into())).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "assistant_text_delta");
+        assert_eq!(parsed["text"], "hi");
+
+        let line = event_to_jsonl(&AppEvent::ToolStart {
+            name: "Bash".into(),
+            input: json!({"command": "ls"}),
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "tool_use");
+        assert_eq!(parsed["name"], "Bash");
+        assert_eq!(parsed["input"]["command"], "ls");
+
+        let line = event_to_jsonl(&AppEvent::ToolEnd {
+            name: "Bash".into(),
+            result: ToolResult::error("exit 1"),
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "tool_result");
+        assert_eq!(parsed["is_error"], true);
+        assert_eq!(parsed["content"], "exit 1");
+
+        let line = event_to_jsonl(&AppEvent::CompactBoundary).unwrap();
+        assert!(line.contains("\"compact_boundary\""));
+
+        let line = event_to_jsonl(&AppEvent::TurnComplete {
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "turn_complete");
+        assert_eq!(parsed["usage"]["input_tokens"], 100);
+        assert_eq!(parsed["usage"]["output_tokens"], 50);
+
+        // Internal events drop.
+        let dropped = event_to_jsonl(&AppEvent::TaskUpdate(cc_core::task::TaskNotification {
+            task_id: cc_core::task::TaskId::new(),
+            status: cc_core::task::TaskStatus::Running,
+            summary: None,
+        }));
+        assert!(dropped.is_none(), "TaskUpdate must not leak to JSONL");
     }
 }
 
